@@ -185,7 +185,7 @@ uv run ww_manager.py -p "/home/user/Games/WW_Game" sync
 
 ### 启动游戏
 
-本脚本只提供游戏本体下载和快速切换功能，启动游戏需要参考 `LutheringLaves` 项目，下载最新的`Pronton` 兼容层，并在 `Steam` 中添加相关参数启动。
+本脚本只提供游戏本体下载和快速切换功能，启动游戏需要参考 `LutheringLaves` 项目，下载最新的`Proton` 兼容层，并在 `Steam` 中添加相关参数启动。
 
 ### 其他技巧
 
