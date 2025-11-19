@@ -4,23 +4,23 @@
 
 它结合了两种工具的优点：
 
-  * **完整的下载/校验功能**：可以从零开始下载、修复或更新任一服务器的客户端。
-  * **秒级的快速切换**：一旦“烘焙”完成（见推荐流程），即可在官服、B服、国际服之间瞬时切换。
+* **完整的下载/校验功能**：可以从零开始下载、修复或更新任一服务器的客户端。
+* **秒级的快速切换**：一旦“烘焙”完成（见推荐流程），即可在官服、B服、国际服之间瞬时切换。
 
 ## ✨ 功能
 
-  * **服务器支持**：支持国服 (cn)、Bilibili (bilibili) 和国际服 (global)。
-  * **`status`**：检查当前游戏目录的服务器类型和版本。
-  * **`download`**：[慢速] 从零开始下载一个完整的、纯净的服务器客户端。
-  * **`sync`**：[慢速] 校验当前服务器的所有文件，修复/下载缺失或损坏的文件，并自动处理差异文件（重命名备份）。**用于游戏版本更新或修复**。
-  * **`checkout`**：[快速] 在已“烘焙”的客户端之间**秒级切换**。它只重命名差异文件，不进行网络或MD5校验。
-  * **MD5 缓存**：`sync` 和 `download` 命令会自动缓存已校验文件的 MD5 值，极大提升后续校验速度。
-  * **路径记忆**：首次使用 `-p path` 后，会自动记忆游戏目录，下次使用更方便。
+* **服务器支持**：支持国服 (cn)、Bilibili (bilibili) 和国际服 (global)。
+* **`status`**：检查当前游戏目录的服务器类型和版本。
+* **`download`**：[慢速] 从零开始下载一个完整的、纯净的服务器客户端。
+* **`sync`**：[慢速] 校验当前服务器的所有文件，修复/下载缺失或损坏的文件，并自动处理差异文件（重命名备份）。**用于游戏版本更新或修复**。
+* **`checkout`**：[快速] 在已“烘焙”的客户端之间**秒级切换**。它只重命名差异文件，不进行网络或MD5校验。
+* **MD5 缓存**：`sync` 和 `download` 命令会自动缓存已校验文件的 MD5 值，极大提升后续校验速度。
+* **路径记忆**：首次使用 `-p path` 后，会自动记忆游戏目录，下次使用更方便。
 
 ## 🔧 依赖
 
-  * Python 3.8+
-  * Python 依赖包：`tqdm` (用于进度条)
+* Python 3.8+
+* Python 依赖包：`tqdm` (用于进度条)
 
 你可以使用 `pip` 或 `uv` (推荐) 来安装依赖：
 
@@ -34,8 +34,8 @@ uv pip install tqdm certifi
 
 所有命令都依赖一个**全局参数**：
 
-  * `-p, --path <游戏目录>`：**必须**指定。指向《鸣潮》的游戏根目录，即 `Wuthering Waves.exe` 所在的 `Wuthering Waves Game` 文件夹。
-  * `-h, --help`: 查看帮助命令
+* `-p, --path <游戏目录>`：**必须**指定。指向《鸣潮》的游戏根目录，即 `Wuthering Waves.exe` 所在的 `Wuthering Waves Game` 文件夹。
+* `-h, --help`: 查看帮助命令
 
 -----
 
@@ -62,9 +62,9 @@ uv run ww_manager.py -p "/path/to/Wuthering Waves Game" status
 
 [慢速] 下载一个全新的、完整的客户端。
 
-  * `<server>`: `cn`, `bilibili`, 或 `global`。
-  * 它会下载目标服务器的**所有**文件。
-  * 下载完成后，会自动执行一次 `sync` 来确保文件100%正确。
+* `<server>`: `cn`, `bilibili`, 或 `global`。
+* 它会下载目标服务器的**所有**文件。
+* 下载完成后，会自动执行一次 `sync` 来确保文件100%正确。
 
 <!-- end list -->
 
@@ -79,11 +79,11 @@ uv run ww_manager.py -p "/path/to/New Wuthering Waves Game" download bilibili
 
 [慢速] 同步、修复和更新。
 
-  * 这是工具的核心功能。
-  * 它会连接到当前配置的服务器API，获取完整的文件清单。
-  * 使用MD5缓存（如果存在）快速校验所有本地文件。
-  * 自动下载缺失、损坏或版本过时的文件。
-  * 自动将**不属于**当前服务器清单的已知差异文件（如 `pakchunk1-Kuro...pak`）重命名为 `.bak`。
+* 这是工具的核心功能。
+* 它会连接到当前配置的服务器API，获取完整的文件清单。
+* 使用MD5缓存（如果存在）快速校验所有本地文件。
+* 自动下载缺失、损坏或版本过时的文件。
+* 自动将**不属于**当前服务器清单的已知差异文件（如 `pakchunk1-Kuro...pak`）重命名为 `.bak`。
 
 **这是你每次游戏大版本更新后都应该执行的命令。**
 
@@ -98,12 +98,12 @@ uv run ww_manager.py -p "/path/to/Wuthering Waves Game" sync
 
 [快速] 瞬时切换服务器。
 
-  * 这是工具的核心快速功能。
-  * 它**不联网**，**不校验MD5**。
-  * 它只执行文件重命名：
-    1.  禁用当前服的差异文件 (例如 `...Kuro.pak` -\> `...Kuro.pak.bak`)。
-    2.  启用目标服的差异文件 (例如 `...Bilibili.pak.bak` -\> `...Bilibili.pak`)。
-    3.  重写 `launcherDownloadConfig.json` 指向新服务器。
+* 这是工具的核心快速功能。
+* 它**不联网**，**不校验MD5**。
+* 它只执行文件重命名：
+    1. 禁用当前服的差异文件 (例如 `...Kuro.pak` -\> `...Kuro.pak.bak`)。
+    2. 启用目标服的差异文件 (例如 `...Bilibili.pak.bak` -\> `...Bilibili.pak`)。
+    3. 重写 `launcherDownloadConfig.json` 指向新服务器。
 
 **重要**：此命令依赖一个“全家桶”式的游戏目录（即所有服务器的差异文件都已存在）。如果文件不存在，它会切换失败并提示你运行 `sync`。
 
@@ -145,9 +145,9 @@ uv run ww_manager.py -p "/home/user/Games/WW_Game" download cn
 uv run ww_manager.py -p "/home/user/Games/WW_Game" checkout bilibili --force-sync
 ```
 
-  * `checkout` 会秒级切换配置（并报告B服文件缺失）。
-  * `--force-sync` 会立即运行 `sync`。
-  * `sync` 会检测到B服，然后下载缺失的 `bilibili_sdk.dll` 和 `pakchunk1-Bilibili...pak`，并自动将官服的 `kuro_login.dll` 和 `pakchunk1-Kuro...pak` 备份为 `.bak`。
+* `checkout` 会秒级切换配置（并报告B服文件缺失）。
+* `--force-sync` 会立即运行 `sync`。
+* `sync` 会检测到B服，然后下载缺失的 `bilibili_sdk.dll` 和 `pakchunk1-Bilibili...pak`，并自动将官服的 `kuro_login.dll` 和 `pakchunk1-Kuro...pak` 备份为 `.bak`。
 
 *(烘焙完成！你的目录现在是B服，并包含了官服的备份文件。)*
 
@@ -191,18 +191,81 @@ uv run ww_manager.py -p "/home/user/Games/WW_Game" sync
 
 1. 成功运行后，脚本会自动记录 -p "your/path" 参数，下次无需带 -p 参数;
 2. 可以将脚本启动命令加入 `~/.bashrc` 中，方便快速启动，下面是一个简单示例:
+
 ```bash
 function ww() {
     /home/xingjian/Projects/Python/.venv/bin/python3.13 /home/xingjian/Projects/Python/wuwa_manager/wuwa_manager.py "$@"
 }
 ```
 
+3. 启动游戏可以不经过 steam，这样会更快一些，可以参考我的做法:
+(配置: Archlinux, Hyprland, Linux zen core, GE-Proton10-25)
+
+* 首先，创建一个启动脚本，例如:
+
+```bash
+#!/bin/bash
+
+# Proton 路径（修改成自己的）
+PROTON_BIN="$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton10-25/proton"
+
+# 游戏路径（修改成自己的）
+GAME_EXE="$HOME/share/WutheringWaves/Wuthering Waves bilibili/Wuthering Waves Game/Client/Binaries/Win64/Client-Win64-Shipping.exe"
+
+# 兼容层路径以及steam游戏目录(修改成自己的)
+export STEAM_COMPAT_DATA_PATH="$HOME/.local/share/Steam/steamapps/compatdata/3139039821"
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="$HOME/.local/share/Steam"
+
+# 环境变量
+export steamdeck=1
+# 用于帧率显示(sudo pacman -S mangohud 安装即可，不需要请注释)
+export MANGOHUD=1
+
+# Steam 内部自带的 Runtime 脚本路径
+STEAM_RUNTIME_SCRIPT="$HOME/.local/share/Steam/ubuntu12_32/steam-runtime/run.sh"
+
+echo "正在启动鸣潮 (使用 Steam Internal Runtime)..."
+
+# 检查脚本是否存在，存在则使用，不存在则裸奔
+if [ -f "$STEAM_RUNTIME_SCRIPT" ]; then
+  "$STEAM_RUNTIME_SCRIPT" gamemoderun "$PROTON_BIN" run "$GAME_EXE"
+else
+  echo "警告：未找到 Steam Runtime，过场动画可能黑屏"
+  gamemoderun "$PROTON_BIN" run "$GAME_EXE"
+fi
+```
+
+* 然后创建一个 `.desktop` 启动项，用于应用菜单识别
+
+```bash
+vim ~/.local/share/applications/WutheringWaves.desktop  
+```
+
+* 填入如下配置:
+
+```conf
+[Desktop Entry]
+Type=Application
+Name=WutheringWaves
+Comment=WutheringWaves, A OpenWorld Game of KuroGames.
+# 指向启动脚本的路径
+Exec=/home/xingjian/Projects/Python/wuwa_manager/run_ww.sh
+# 如果你有图标文件，可以把路径填在这里，否则可以留空
+Icon=wuwa
+Terminal=false
+Categories=Game;Adventure;
+StartupNotify=true
+StartupWMClass=steam_proton
+```
+
+配置好后，之间用应用菜单即可启动，无需启动 steam.
+
 ### 致谢
 
 感谢以下项目的灵感和工作！
 
-#### 参考项目:
+#### 参考项目
 
-1. https://github.com/leck995/WutheringWavesTool.git
-2. https://github.com/last-live/LutheringLaves.git
-3. https://github.com/Hurry1027/Wuthering-Waves-Official-Bilibili.git
+1. <https://github.com/leck995/WutheringWavesTool.git>
+2. <https://github.com/last-live/LutheringLaves.git>
+3. <https://github.com/Hurry1027/Wuthering-Waves-Official-Bilibili.git>
