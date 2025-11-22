@@ -151,8 +151,8 @@ uv tool uninstall ww-manager
 灵感来源于以下优秀项目：
 
 * [WutheringWavesTool](https://github.com/leck995/WutheringWavesTool)
-* [LutheringLaves](https://www.google.com/search?q=https://github.com/last-live/LutheringLaves)
-* [Wuthering-Waves-Official-Bilibili](https://www.google.com/search?q=https://github.com/Hurry1027/Wuthering-Waves-Official-Bilibili)
+* [LutheringLaves](https://github.com/last-live/LutheringLaves)
+* [Wuthering-Waves-Official-Bilibili](https://github.com/Hurry1027/Wuthering-Waves-Official-Bilibili)
 
 <!-- end list -->
 
