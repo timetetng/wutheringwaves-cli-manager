@@ -13,6 +13,7 @@ from urllib.parse import urljoin, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Any
 
+import random
 from rich.progress import (
     Progress,
     TextColumn,
@@ -21,6 +22,7 @@ from rich.progress import (
     TransferSpeedColumn,
     TimeRemainingColumn,
     TaskID,
+    Task,
 )
 from config import SERVER_CONFIGS, SERVER_DIFF_FILES
 
@@ -121,6 +123,38 @@ class MD5Cache:
             pass
 
 
+# 定义彩虹颜色列表
+RAINBOW_COLORS = [
+    "bright_red",
+    "orange1",
+    "gold1",
+    "yellow",
+    "chartreuse1",
+    "green",
+    "spring_green1",
+    "cyan1",
+    "deep_sky_blue1",
+    "dodger_blue1",
+    "blue",
+    "purple",
+    "magenta",
+    "hot_pink",
+    "deep_pink2",
+]
+
+
+class RainbowBarColumn(BarColumn):
+    """美化bar"""
+
+    def render(self, task: Task) -> Any:
+        # 根据 task.id 计算颜色，确保和文件名颜色一致
+        color = RAINBOW_COLORS[task.id % len(RAINBOW_COLORS)]
+        self.complete_style = color
+        self.finished_style = color
+        # 调用父类的 render
+        return super().render(task)
+
+
 # --- 核心管理器 ---
 class WGameManager:
     def __init__(self, game_folder: Path, server_type: str):
@@ -198,10 +232,12 @@ class WGameManager:
         """带重试的单文件下载，使用 Rich Progress"""
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-        # 注册单个文件的子任务
         task_id = None
         if progress:
+            # 注册任务
             task_id = progress.add_task(description=dest.name, total=expected_size)
+            color = RAINBOW_COLORS[task_id % len(RAINBOW_COLORS)]
+            progress.update(task_id, description=f"[{color}]{dest.name}[/{color}]")
 
         temp_file = dest.with_suffix(dest.suffix + ".temp")
         headers = {"User-Agent": "WW-Manager/2.0"}
@@ -289,10 +325,9 @@ class WGameManager:
 
         max_workers = 8
 
-        # 使用 Rich Progress 上下文
         progress = Progress(
-            TextColumn("[bold blue]{task.description}", justify="right"),
-            BarColumn(bar_width=None),
+            TextColumn("{task.description}", justify="right"),
+            RainbowBarColumn(bar_width=40),
             "[progress.percentage]{task.percentage:>3.1f}%",
             DownloadColumn(),
             TransferSpeedColumn(),
@@ -301,7 +336,6 @@ class WGameManager:
         )
 
         with progress:
-            # 总任务
             overall_task = progress.add_task("Total Download", total=total_size)
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
