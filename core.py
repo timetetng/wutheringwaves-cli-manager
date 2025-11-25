@@ -21,24 +21,31 @@ from rich.progress import (
     DownloadColumn,
     TransferSpeedColumn,
     TimeRemainingColumn,
-    TaskID
+    TaskID,
 )
 from config import SERVER_CONFIGS, SERVER_DIFF_FILES
 
 logger = logging.getLogger("WW_Manager")
 
+
 # --- 自定义异常 ---
 class WWError(Exception):
     """基础异常类"""
+
     pass
+
 
 class NetworkError(WWError):
     """网络相关错误"""
+
     pass
+
 
 class ConfigError(WWError):
     """配置或路径错误"""
+
     pass
+
 
 # --- MD5 缓存管理器 ---
 class MD5Cache:
@@ -47,7 +54,7 @@ class MD5Cache:
         self.game_root = game_root
         self.cache: Dict[str, Dict[str, Any]] = self._load()
         self._updated = False
-        self._lock = threading.Lock() 
+        self._lock = threading.Lock()
 
     def _load(self) -> Dict[str, Any]:
         if self.cache_path.exists():
@@ -71,7 +78,7 @@ class MD5Cache:
     def get(self, file_path: Path) -> Optional[str]:
         if not file_path.exists():
             return None
-        
+
         try:
             rel_path = str(file_path.relative_to(self.game_root)).replace("\\", "/")
         except ValueError:
@@ -114,18 +121,21 @@ class MD5Cache:
         except ValueError:
             pass
 
+
 # --- 核心管理器 ---
 class WGameManager:
     def __init__(self, game_folder: Path, server_type: str):
         if server_type not in SERVER_CONFIGS:
             raise ConfigError(f"无效的服务器类型: {server_type}")
-        
+
         self.game_folder = game_folder.resolve()
         self.server_type = server_type
         self.config = SERVER_CONFIGS[server_type]
-        
-        self.md5_cache = MD5Cache(self.game_folder / "wwm_md5_cache.json", self.game_folder)
-        
+
+        self.md5_cache = MD5Cache(
+            self.game_folder / "wwm_md5_cache.json", self.game_folder
+        )
+
         self._launcher_info = None
         self._cdn_node = None
         self._game_index = None
@@ -164,7 +174,9 @@ class WGameManager:
 
     def _http_get_json(self, url: str) -> Optional[Any]:
         try:
-            req = Request(url, headers={"User-Agent": "WW-Manager/2.0", "Accept-Encoding": "gzip"})
+            req = Request(
+                url, headers={"User-Agent": "WW-Manager/2.0", "Accept-Encoding": "gzip"}
+            )
             with urlopen(req, timeout=10) as rsp:
                 if rsp.status != 200:
                     return None
@@ -176,11 +188,17 @@ class WGameManager:
             logger.error(f"HTTP 请求失败 {url}: {e}")
             return None
 
-    def _download_file(self, url: str, dest: Path, expected_size: int, 
-                       progress: Optional[Progress] = None, overall_task_id: Optional[TaskID] = None) -> bool:
+    def _download_file(
+        self,
+        url: str,
+        dest: Path,
+        expected_size: int,
+        progress: Optional[Progress] = None,
+        overall_task_id: Optional[TaskID] = None,
+    ) -> bool:
         """带重试的单文件下载，使用 Rich Progress"""
         dest.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # 注册单个文件的子任务
         task_id = None
         if progress:
@@ -188,7 +206,7 @@ class WGameManager:
 
         temp_file = dest.with_suffix(dest.suffix + ".temp")
         headers = {"User-Agent": "WW-Manager/2.0"}
-        
+
         retries = 3
         success = False
 
@@ -197,7 +215,7 @@ class WGameManager:
                 resume_byte = 0
                 if temp_file.exists():
                     resume_byte = temp_file.stat().st_size
-                
+
                 # 如果已完成，更新进度条并跳过
                 if resume_byte == expected_size:
                     if progress and task_id is not None:
@@ -205,30 +223,30 @@ class WGameManager:
                         if overall_task_id is not None:
                             # 注意：这里如果已经下载过了，不需要给 Total 加 resume_byte，因为 Total 初始化时是按需下载的总量
                             # 但如果是断点续传的一半，逻辑比较复杂。简单起见，这里假设 batch 计算时已经扣除了已完成文件
-                            pass 
+                            pass
                     success = True
-                    break 
-                
+                    break
+
                 if resume_byte > 0:
                     headers["Range"] = f"bytes={resume_byte}-"
                     # 更新子进度条到断点位置
                     if progress and task_id is not None:
                         progress.update(task_id, completed=resume_byte)
-                
+
                 mode = "ab" if resume_byte > 0 else "wb"
-                
+
                 req = Request(url, headers=headers)
                 with urlopen(req, timeout=15) as rsp:
                     if rsp.status not in (200, 206):
                         raise NetworkError(f"HTTP {rsp.status}")
-                    
+
                     with open(temp_file, mode) as f:
                         while True:
-                            chunk = rsp.read(1024 * 256) 
+                            chunk = rsp.read(1024 * 256)
                             if not chunk:
                                 break
                             f.write(chunk)
-                            
+
                             # 更新界面
                             if progress:
                                 chunk_len = len(chunk)
@@ -243,23 +261,23 @@ class WGameManager:
                 else:
                     # 大小不对，重试
                     pass
-                    
+
             except Exception as e:
                 if attempt == retries - 1:
                     # 只有最后一次失败才记录日志，避免进度条乱掉
-                    if progress: 
+                    if progress:
                         progress.console.log(f"[red]下载失败 {dest.name}: {e}[/red]")
                     return False
                 time.sleep(1 + attempt)
-        
+
         if success:
             shutil.move(temp_file, dest)
             self.md5_cache.clear(dest)
-        
+
         # 移除子任务，保持界面整洁
         if progress and task_id is not None:
             progress.remove_task(task_id)
-            
+
         return success
 
     def _batch_download(self, tasks: List[dict]):
@@ -268,10 +286,12 @@ class WGameManager:
             return
 
         total_size = sum(t["size"] for t in tasks)
-        logger.info(f"准备下载 {len(tasks)} 个文件，总大小: {total_size/1024/1024:.2f} MB")
-        
+        logger.info(
+            f"准备下载 {len(tasks)} 个文件，总大小: {total_size / 1024 / 1024:.2f} MB"
+        )
+
         max_workers = 8
-        
+
         # [修改] 使用 Rich Progress 上下文
         progress = Progress(
             TextColumn("[bold blue]{task.description}", justify="right"),
@@ -280,26 +300,26 @@ class WGameManager:
             DownloadColumn(),
             TransferSpeedColumn(),
             TimeRemainingColumn(),
-            expand=True
+            expand=True,
         )
 
         with progress:
             # 总任务
             overall_task = progress.add_task("Total Download", total=total_size)
-            
+
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 for task in tasks:
                     future = executor.submit(
-                        self._download_file, 
-                        task["url"], 
-                        task["path"], 
-                        task["size"], 
+                        self._download_file,
+                        task["url"],
+                        task["path"],
+                        task["size"],
                         progress,
-                        overall_task
+                        overall_task,
                     )
                     futures.append(future)
-                
+
                 for f in as_completed(futures):
                     if not f.result():
                         progress.console.log("[red]有文件下载失败，请重试 sync[/red]")
@@ -307,15 +327,15 @@ class WGameManager:
     def sync_files(self, force_check_md5=False):
         res_base = self.launcher_info["default"]["resourcesBasePath"]
         res_list = self.game_index["resource"]
-        
+
         tasks = []
-        
+
         logger.info("正在校验文件...")
         for item in res_list:
             dest_path = self.game_folder / item["dest"]
             expected_md5 = item["md5"]
             expected_size = int(item["size"])
-            
+
             need_download = False
             if not dest_path.exists():
                 need_download = True
@@ -324,14 +344,16 @@ class WGameManager:
                     need_download = True
             elif dest_path.stat().st_size != expected_size:
                 need_download = True
-            
+
             if need_download:
                 url = urljoin(self.cdn_node, f"{res_base}/{item['dest']}")
-                tasks.append({
-                    "url": quote(url, safe=":/"),
-                    "path": dest_path,
-                    "size": expected_size
-                })
+                tasks.append(
+                    {
+                        "url": quote(url, safe=":/"),
+                        "path": dest_path,
+                        "size": expected_size,
+                    }
+                )
 
         if tasks:
             self._batch_download(tasks)
@@ -357,7 +379,7 @@ class WGameManager:
         for f_rel in SERVER_DIFF_FILES.get(target_server, []):
             f = self.game_folder / f_rel
             bak = f.with_suffix(f.suffix + ".bak")
-            
+
             if bak.exists():
                 bak.rename(f)
                 self.md5_cache.clear(f)
@@ -380,11 +402,7 @@ class WGameManager:
 
     def _update_local_config(self):
         v = self.launcher_info["default"]["version"]
-        cfg = {
-            "version": v,
-            "appId": self.config["appId"],
-            "group": "default"
-        }
+        cfg = {"version": v, "appId": self.config["appId"], "group": "default"}
         self.game_folder.mkdir(parents=True, exist_ok=True)
         with open(self.game_folder / "launcherDownloadConfig.json", "w") as f:
             json.dump(cfg, f, indent=4)
