@@ -165,29 +165,32 @@ def log(
     """获取抽卡分析链接"""
     path = get_game_path(ctx)
     log_file = path / "Client/Saved/Logs/Client.log"
+
     if not log_file.exists():
         typer.secho("未找到日志文件", fg="red")
         return
 
-    pattern = re.compile(r'https?://[^"]+aki-gm-resources[^"]+')
-    found = None
+    pattern = re.compile(r'https?://[^"]+')
+    found: str | None = None
 
     try:
         with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
-                if "aki-gm-resources" in line:
+                if "aki-gm-resources.aki-game.com" in line:
                     m = pattern.search(line)
                     if m:
                         found = m.group(0)
     except Exception as e:
         logger.error(e)
+        typer.secho("读取日志时出现错误", fg="red")
+        return
 
     if found:
         typer.secho(found, fg="green")
         if open_browser:
             webbrowser.open(found)
     else:
-        typer.echo("未找到链接，请先在游戏中打开历史记录。")
+        typer.echo("未找到链接，请先在游戏中打开抽卡记录以更新日志文件。")
 
 
 if __name__ == "__main__":
