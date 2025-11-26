@@ -16,7 +16,7 @@
 
 结合了 **完整的下载/校验功能** 与 **秒级服务器切换** 技术。一旦完成“烘焙”，即可在国服 (CN)、B服 (Bilibili) 和国际服 (Global) 之间瞬时切换，无需重新下载庞大的游戏文件。
 
-> 最新版本经过测试，兼容 Windows11
+> 最新版本经过测试，兼容 Windows11。
 
 ## ✨ 核心功能
 
@@ -33,11 +33,26 @@
 
 ### 1. 安装 uv (如果尚未安装)
 
+- Linux
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ````
 
+- Windows (PowerShell)
+```pwsh
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+> 安装完需要**重启终端**应用环境变量。
+
+
 ### 2\. 安装本工具
+
+克隆仓库代码到本地
+```shell
+git clone https://github.com/timetetng/wutheringwaves-cli-manager.git
+cd wutheringwaves-cli-manager
+```
 
 在源码目录下执行：
 
