@@ -1,20 +1,14 @@
 # 鸣潮 (Wuthering Waves) CLI Manager
 
 <div align="center">
-
-  <a href="https://python.org">
-    <img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+">
-  </a>
-  <a href="https://github.com/astral-sh/uv">
-    <img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv">
-  </a>
-  <img src="https://img.shields.io/badge/Version-2.0-brightgreen.svg" alt="version 2.0">
-
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.0-brightgreen.svg" alt="version 2.0">
 </div>
 
 专为 Linux 用户打造的《鸣潮》客户端命令行管理工具。
 
-结合了 **完整的下载/校验功能** 与 **秒级服务器切换** 技术。一旦完成“烘焙”，即可在国服 (CN)、B服 (Bilibili) 和国际服 (Global) 之间瞬时切换，无需重新下载庞大的游戏文件。
+结合了 **完整的下载/校验功能** 与 **秒级服务器切换** 技术。一旦完成“烘焙”，即可在官服 (CN)、B服 (Bilibili) 之间瞬时切换，无需重新下载庞大的游戏文件。
+
+> **国际服因为包体差异不支持快速切换**。
 
 > 最新版本经过测试，兼容 Windows11。
 
@@ -90,16 +84,16 @@ ww status
 
 #### 2\. 快速切换服务器 (`checkout`)
 
-这是最常用的功能。在已下载好差异文件的情况下，**秒级**切换服务器。
+这是最常用的功能。**秒级**切换服务器（仅限官/b服）。
 
 ```bash
 # 切换到 Bilibili 服
 ww checkout bilibili
 
-# 切换到 国服
+# 切换到 官服
 ww checkout cn
 
-# 切换到 国际服
+# 切换到 国际服（需要完整下载）
 ww checkout global
 ```
 
@@ -120,7 +114,7 @@ ww sync
 如果你还没有游戏，可以使用此命令从零开始下载。
 
 ```bash
-# 下载完整的国服客户端到当前目录（或配置的默认目录）
+# 下载完整的官服客户端到当前目录（或配置的默认目录）
 ww download cn
 ```
 
@@ -137,10 +131,10 @@ ww log
 
 ## 💡 最佳实践：如何打造“全家桶”
 
-要实现完美的秒级切换，你需要将所有服务器的“差异文件”都下载到同一个目录中。
+要实现完美的秒级切换，你需要下载共用的游戏本体到一个目录中。
 
 1. **下载基础客户端**：
-    如果你还没有游戏，先下载一个完整的（例如国服）：
+    如果你还没有游戏，先下载一个完整的（例如官服）：
 
     ```bash
     ww --path "/path/to/Game" download cn
