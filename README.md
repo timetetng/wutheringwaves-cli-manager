@@ -21,7 +21,16 @@
 > 
 > 最新版本经过测试，兼容 Windows11。
 
+## 🔥 增量更新
 
+🚧 正在开发测试中
+
+如果您能接受可能存在的 **bug** 以及重新下载的**风险**，可以在 `feat/predownload` 和 `feat/predownload-patch` 分支中尝试预下载以及增量更新功能，由于现实原因，是否可行必须等待到版本正式更新才可验证，所以以上均为实验性功能，请**慎重尝试**。
+
+### ✨ New feats
+
+* `feat/predownload`: 实现全量预下载，约 120 GB 资源，相对安全，无需额外工具，本质上只是提前下载完整包体。
+* `feat/predownload-patch`: 实现增量下载，仅下载增量补丁，在版本更新后通过 [`hpatchz`](https://github.com/sisong/HDiffPatch/releases/tag/v4.12.0) 工具合并二进制文件，仅需下载约 40 GB 资源，功能实现相对复杂，无法验证可行性。
 
 ## ✨ 核心功能
 
