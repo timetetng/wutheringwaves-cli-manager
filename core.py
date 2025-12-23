@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -210,14 +211,13 @@ class WGameManager:
         if not pre_info:
             return None
 
-        # 构造预下载 index 的 URL
         config = pre_info.get("config", {})
         uri = config.get("indexFile")
         if not uri:
             return None
 
         url = urljoin(self.cdn_node, uri)
-        logger.info("下载预下载文件清单...")
+        logger.info("下载预下载文件清单 (全量)...")
         return self._http_get_json(url)
 
     def _http_get_json(self, url: str) -> Optional[Any]:
@@ -233,6 +233,14 @@ class WGameManager:
         except Exception as e:
             logger.error(f"HTTP 请求失败 {url}: {e}")
             return None
+
+    def _check_hpatchz_availability(self) -> bool:
+        """检查系统中是否有 hpatchz 命令"""
+        try:
+            subprocess.run(["hpatchz", "-v"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except FileNotFoundError:
+            return False
 
     def _download_file(
         self,
@@ -264,19 +272,16 @@ class WGameManager:
                 if temp_file.exists():
                     resume_byte = temp_file.stat().st_size
 
-                # 如果已完成，更新进度条并跳过
                 if resume_byte == expected_size:
                     if progress and task_id is not None:
                         progress.update(task_id, completed=expected_size)
                         if overall_task_id is not None:
-                            # 这里不更新总进度，因为会在外部循环控制，或者 update(advance=0)
                             pass
                     success = True
                     break
 
                 if resume_byte > 0:
                     headers["Range"] = f"bytes={resume_byte}-"
-                    # 更新子进度条到断点位置
                     if progress and task_id is not None:
                         progress.update(task_id, completed=resume_byte)
 
@@ -294,7 +299,6 @@ class WGameManager:
                                 break
                             f.write(chunk)
 
-                            # 更新界面
                             if progress:
                                 chunk_len = len(chunk)
                                 if task_id is not None:
@@ -306,12 +310,10 @@ class WGameManager:
                     success = True
                     break
                 else:
-                    # 大小不对，重试
                     pass
 
             except Exception as e:
                 if attempt == retries - 1:
-                    # 只有最后一次失败才记录日志，避免进度条乱掉
                     if progress:
                         progress.console.log(f"[red]下载失败 {dest.name}: {e}[/red]")
                     return False
@@ -321,7 +323,6 @@ class WGameManager:
             shutil.move(temp_file, dest)
             self.md5_cache.clear(dest)
 
-        # 移除子任务，保持界面整洁
         if progress and task_id is not None:
             progress.remove_task(task_id)
 
@@ -368,7 +369,6 @@ class WGameManager:
                         progress.console.log("[red]有文件下载失败，请重试 sync[/red]")
 
     def sync_files(self, force_check_md5=False):
-        # 确保获取的是当前版本的配置
         res_base = self.launcher_info["default"]["resourcesBasePath"]
         res_list = self.game_index["resource"]
 
@@ -409,59 +409,96 @@ class WGameManager:
     def download_full(self):
         self.sync_files(force_check_md5=False)
 
-    # 执行预下载
     def download_predownload(self):
-        # 1. 获取预下载配置
         pre_info = self.launcher_info.get("predownload")
         if not pre_info:
             logger.warning("当前服务器暂无预下载信息。")
             return
 
-        index = self.predownload_index
-        if not index:
-            logger.error("无法获取预下载清单。")
-            return
-
-        res_base = pre_info["resourcesBasePath"]
-        res_list = index["resource"]
         version = pre_info["version"]
 
+        # 1. 尝试增量更新逻辑
+        local_cfg = self.game_folder / "launcherDownloadConfig.json"
+        local_version = "0.0.0"
+        if local_cfg.exists():
+            try:
+                local_version = json.loads(local_cfg.read_text()).get("version", "0.0.0")
+            except Exception:
+                pass
+
+        patch_config_list = pre_info.get("config", {}).get("patchConfig", [])
+        patch_entry = next((p for p in patch_config_list if p["version"] == local_version), None)
+
+        has_hpatchz = self._check_hpatchz_availability()
+
+        use_patch_mode = False
+        res_list = []
+        global_res_base = ""
+
+        if patch_entry and has_hpatchz:
+            logger.info(f"检测到增量更新路径: {local_version} -> {version}")
+            logger.info("正在获取补丁清单...")
+
+            patch_index_url = urljoin(self.cdn_node, patch_entry["indexFile"])
+            patch_index = self._http_get_json(patch_index_url)
+
+            if patch_index:
+                use_patch_mode = True
+                res_list = patch_index["resource"]
+                global_res_base = patch_entry["baseUrl"]
+            else:
+                logger.warning("无法下载补丁清单，回退到全量预下载。")
+        elif patch_entry and not has_hpatchz:
+            logger.warning("发现增量更新，但未检测到 'hpatchz' 命令。将执行全量预下载。")
+            logger.info("提示: 安装 hpatchz 可节省大量下载流量。")
+
+        # 回退到全量逻辑
+        if not use_patch_mode:
+            index = self.predownload_index
+            if not index:
+                logger.error("无法获取预下载清单。")
+                return
+            global_res_base = pre_info["resourcesBasePath"]
+            res_list = index["resource"]
+            logger.info(f"执行全量预下载 (目标版本: {version})")
+
+        # 开始处理下载任务
         predownload_root = self.game_folder / ".predownload"
         predownload_root.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"发现预下载版本: {version}")
-        logger.info(f"预下载目录: {predownload_root}")
-        logger.info("正在对比本地文件MD5...")
-
         tasks = []
         skipped_size = 0
-        skipped_count = 0
 
-        # 2. 遍历新版本的文件列表
         for item in res_list:
-            # 路径处理
             rel_path = item["dest"].replace("\\", "/")
-            expected_md5 = item["md5"]
             expected_size = int(item["size"])
+            item_base = item.get("fromFolder", global_res_base)
 
-            target_dest = predownload_root / rel_path
-            current_game_file = self.game_folder / rel_path
+            if item_base.endswith("/"):
+                item_base = item_base[:-1]
 
-            # 情况 A: 预下载目录里已经下载好了
+            url_path = f"{item_base}/{rel_path}"
+            url = urljoin(self.cdn_node, url_path)
+
+            save_name = rel_path + ".hpatch" if use_patch_mode else rel_path
+            target_dest = predownload_root / save_name
+
+            # 全量模式跳过检测
+            if not use_patch_mode:
+                current_game_file = self.game_folder / rel_path
+                if current_game_file.exists() and current_game_file.stat().st_size == expected_size:
+                    local_md5 = self.md5_cache.get(current_game_file)
+                    if local_md5 == item["md5"]:
+                        skipped_size += expected_size
+                        continue
+
             if target_dest.exists() and target_dest.stat().st_size == expected_size:
                 continue
 
-            # 情况 B: 当前游戏目录里已经有这个文件，且 MD5 没变 (无需下载)
-            if current_game_file.exists() and current_game_file.stat().st_size == expected_size:
-                # 只有大小一致时才去查 MD5，利用缓存加速
-                local_md5 = self.md5_cache.get(current_game_file)
-                if local_md5 == expected_md5:
-                    skipped_size += expected_size
-                    skipped_count += 1
-                    continue
+            # 调试
+            if len(tasks) == 0:
+                logger.debug(f"First Task URL: {url}")
 
-            # 情况 C: 需要下载
-            url = urljoin(self.cdn_node, f"{res_base}/{item['dest']}")  # URL 保持原样
             tasks.append(
                 {
                     "url": quote(url, safe=":/"),
@@ -472,14 +509,21 @@ class WGameManager:
 
         if tasks:
             self._batch_download(tasks)
-            # 保存版本标记
-            with open(predownload_root / "predownload_version.json", "w") as f:
-                json.dump({"version": version, "server": self.server_type}, f)
-            logger.info("预下载完成！")
-        else:
-            logger.info("所有文件校验一致，无需下载。")
 
-    # 应用预下载
+        # 保存版本标记
+        meta = {
+            "version": version,
+            "server": self.server_type,
+            "is_patch": use_patch_mode,
+            "base_version": local_version if use_patch_mode else None,
+        }
+        with open(predownload_root / "predownload_version.json", "w") as f:
+            json.dump(meta, f)
+
+        logger.info("预下载完成！")
+        if use_patch_mode:
+            logger.info("已下载增量补丁。请确保系统中有 hpatchz 工具以便在更新日进行合并。")
+
     def apply_predownload(self):
         predownload_root = self.game_folder / ".predownload"
         version_file = predownload_root / "predownload_version.json"
@@ -487,42 +531,75 @@ class WGameManager:
         if not predownload_root.exists() or not version_file.exists():
             raise ConfigError("未找到有效的预下载内容，请先执行预下载。")
 
-        # 读取版本信息
         try:
             with open(version_file, "r") as f:
                 info = json.load(f)
                 target_version = info["version"]
-                if info["server"] != self.server_type:
-                    raise ConfigError(f"预下载的服务器类型 ({info['server']}) 与当前不符。")
+                is_patch = info.get("is_patch", False)
         except Exception:
             raise ConfigError("预下载版本信息损坏。")
 
         logger.info(f"正在应用更新 (目标版本: {target_version})...")
 
-        # 1. 移动文件 (合并/覆盖)
-        # 遍历 .predownload 下的所有文件并移动到 game_folder
+        if is_patch:
+            if not self._check_hpatchz_availability():
+                raise ConfigError("应用增量补丁需要 'hpatchz' 工具，请先安装。")
+            logger.info("检测到增量补丁，开始合并资源 (这可能需要一些时间)...")
+
+        # 遍历 .predownload 下的文件
+        # 如果是 .hpatch，则执行合并；如果是普通文件，则直接覆盖
         count = 0
+        patch_count = 0
+
         for file_path in predownload_root.rglob("*"):
-            if file_path.is_file() and file_path.name != "predownload_version.json":
-                # 计算相对路径
-                rel_path = file_path.relative_to(predownload_root)
-                dest_path = self.game_folder / rel_path
+            if not file_path.is_file() or file_path.name == "predownload_version.json":
+                continue
 
-                # 确保目标文件夹存在
+            rel_path_str = str(file_path.relative_to(predownload_root))
+
+            # 处理补丁文件
+            if is_patch and rel_path_str.endswith(".hpatch"):
+                # 原始文件名 (去掉 .hpatch)
+                origin_rel = rel_path_str[:-7]
+                old_file = self.game_folder / origin_rel
+                new_file_tmp = self.game_folder / (origin_rel + ".new")
+
+                if not old_file.exists():
+                    logger.warning(f"缺失旧文件，无法打补丁: {origin_rel}")
+                    continue
+
+                # 执行 hpatchz old diff new
+                # 确保目标目录存在
+                new_file_tmp.parent.mkdir(parents=True, exist_ok=True)
+
+                cmd = ["hpatchz", "-f", str(old_file), str(file_path), str(new_file_tmp)]
+                logger.debug(f"Patching: {origin_rel}")
+                ret = subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+                if ret == 0:
+                    # 补丁成功，替换旧文件
+                    os.replace(new_file_tmp, old_file)
+                    self.md5_cache.clear(old_file)
+                    patch_count += 1
+                else:
+                    logger.error(f"补丁合并失败: {origin_rel}")
+                    if new_file_tmp.exists():
+                        new_file_tmp.unlink()
+
+            # 处理全量文件 (或降级下载的文件)
+            else:
+                dest_path = self.game_folder / rel_path_str
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-                # 移动文件 (如果存在则覆盖)
                 shutil.move(str(file_path), str(dest_path))
-                # 清除旧文件的 MD5 缓存
                 self.md5_cache.clear(dest_path)
                 count += 1
 
-        logger.info(f"已合并 {count} 个文件。")
+        logger.info(f"处理完成: 合并补丁 {patch_count} 个，移动文件 {count} 个。")
 
-        # 2. 清理预下载目录
+        # 清理
         shutil.rmtree(predownload_root)
 
-        # 3. 更新本地配置文件版本号
+        # 更新版本号
         cfg_path = self.game_folder / "launcherDownloadConfig.json"
         if cfg_path.exists():
             with open(cfg_path, "r+") as f:
@@ -532,10 +609,7 @@ class WGameManager:
                 json.dump(data, f, indent=4)
                 f.truncate()
 
-        logger.info("预下载资源已合并。正在进行最终完整性校验...")
-
-        # 4. 强制执行一次 Sync 以确保万无一失
-        # 我们需要刷新一下 self._launcher_info 和 self._game_index，因为版本变了
+        logger.info("正在进行最终完整性校验...")
         self._launcher_info = None
         self._game_index = None
         self.sync_files(force_check_md5=False)
@@ -580,7 +654,6 @@ class WGameManager:
             self.sync_files(force_check_md5=True)
 
     def _update_local_config(self):
-        # 优先使用 launcher_info 中的版本，如果获取不到则保持原状或报错
         if self._launcher_info:
             v = self.launcher_info["default"]["version"]
             cfg = {"version": v, "appId": self.config["appId"], "group": "default"}
