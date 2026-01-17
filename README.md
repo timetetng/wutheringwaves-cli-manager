@@ -130,7 +130,7 @@ mkdir -p "$HOME/Games/WutheringWaves"
 ww -p "$HOME/Games/WutheringWaves" status
 ```
 
-》`-p`、`--path` 参数用于指定安装路径。
+> `-p`、`--path` 参数用于指定安装路径。
 
 ### 常用命令
 
