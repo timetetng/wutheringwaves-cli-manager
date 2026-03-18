@@ -59,6 +59,7 @@ def main(
     ctx: typer.Context,
     path: Annotated[Optional[Path], typer.Option("--path", "-p", help="游戏安装目录")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="显示详细调试日志")] = False,
+    apply: Annotated[bool, typer.Option("--apply", help="应用预下载资源")] = False,
 ):
     """
     鸣潮 (Wuthering Waves) CLI 管理器
@@ -102,7 +103,7 @@ def status(ctx: typer.Context):
 
 @app.command()
 def sync(ctx: typer.Context):
-    """[慢速] 全量校验并修复文件"""
+    """全量校验并修复文件"""
     path = get_game_path(ctx)
     # 尝试自动探测服务器
     cfg_file = path / "launcherDownloadConfig.json"
@@ -140,7 +141,7 @@ def checkout(
     server: ServerType,
     force_sync: Annotated[bool, typer.Option("--force-sync", help="切换后强制同步")] = False,
 ):
-    """[快速] 切换服务器"""
+    """切换服务器"""
     path = get_game_path(ctx)
     try:
         mgr = WGameManager(path, server.value)
@@ -150,13 +151,13 @@ def checkout(
         raise typer.Exit(1)
 
 
-predownload_app = typer.Typer(help="预下载管理 (尚未支持增量更新)")
-app.add_typer(predownload_app, name="predownload")
-
-
-@predownload_app.command("install")
-def predownload_install(ctx: typer.Context):
-    """下载新版本资源 (存放在 .predownload 目录)"""
+@app.command()
+def predownload(
+    ctx: typer.Context,
+    action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用预下载资源")] = None,
+    apply_flag: Annotated[bool, typer.Option("--apply", help="应用预下载资源")] = False,
+):
+    """预下载管理"""
     path = get_game_path(ctx)
     # 自动探测服务器
     cfg_file = path / "launcherDownloadConfig.json"
@@ -168,38 +169,28 @@ def predownload_install(ctx: typer.Context):
         except Exception:
             pass
 
-    try:
-        mgr = WGameManager(path, server)
-        mgr.download_predownload()
-    except WWError as e:
-        typer.secho(f"预下载失败: {e}", fg="red")
+    # 如果有任一方式指定了 apply，则执行应用逻辑
+    is_apply = (action == "apply") or apply_flag
+
+    # 如果输入了 apply 之外的未知参数，抛出提示
+    if action and action != "apply":
+        typer.secho(f"未知的参数: {action}。直接运行进行预下载，应用更新请使用 'apply'。", fg="red")
         raise typer.Exit(1)
 
-
-@predownload_app.command("apply")
-def predownload_apply(ctx: typer.Context):
-    """[尚未验证] 应用预下载资源 (版本更新后使用)"""
-    path = get_game_path(ctx)
-    # 自动探测服务器
-    cfg_file = path / "launcherDownloadConfig.json"
-    server = "cn"
-    if cfg_file.exists():
-        try:
-            d = json.loads(cfg_file.read_text(encoding="utf-8"))
-            server = APPID_TO_SERVER.get(d.get("appId"), "cn")
-        except Exception:
-            pass
-
-    typer.confirm(
-        "确定要应用预下载资源吗？\n这将会覆盖现有的游戏文件，请确保游戏目前已关闭且官方已开启版本更新。",
-        abort=True,
-    )
-
     try:
         mgr = WGameManager(path, server)
-        mgr.apply_predownload()
+
+        if is_apply:
+            typer.confirm(
+                "确定要应用预下载资源吗？\n这将会覆盖现有的游戏文件，请确保游戏目前已维护或更新完毕（至少为版本更新当天凌晨4点之后）。",
+                abort=True,
+            )
+            mgr.apply_predownload()
+        else:
+            mgr.download_predownload()
+
     except WWError as e:
-        typer.secho(f"应用更新失败: {e}", fg="red")
+        typer.secho(f"预下载操作失败: {e}", fg="red")
         raise typer.Exit(1)
 
 
