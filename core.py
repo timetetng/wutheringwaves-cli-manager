@@ -442,6 +442,16 @@ class WGameManager:
         else:
             logger.info("所有文件校验通过，无需下载。")
 
+    def download_full(self):
+        """下载完整客户端"""
+        logger.info(f"准备下载 {self.server_type} 服完整客户端到: {self.game_folder}")
+
+        # 确保游戏根目录存在
+        self.game_folder.mkdir(parents=True, exist_ok=True)
+        self.sync_files(force_check_md5=False)
+
+        logger.info(f"{self.server_type} 服完整客户端下载完毕！")
+
     def download_predownload(self):
         """执行预下载逻辑，将资源下载到 .predownload 临时目录"""
         index = self.predownload_index
