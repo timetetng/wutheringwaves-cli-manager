@@ -345,6 +345,7 @@ class WGameManager:
             TransferSpeedColumn(),
             TimeRemainingColumn(),
             expand=True,
+            transient=True,  # 进度条完成后自动消失
         )
 
         with progress:
@@ -387,6 +388,7 @@ class WGameManager:
             "[progress.percentage]{task.percentage:>3.1f}%",
             TimeRemainingColumn(),
             expand=True,
+            transient=True,  # 进度条完成后自动消失
         ) as progress:
             # 添加总校验任务
             verify_task = progress.add_task("[cyan]准备校验...", total=len(res_list))
