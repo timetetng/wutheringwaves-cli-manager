@@ -1,6 +1,6 @@
 
 <div align="center"><h1>WutheringWaves CLI Manager</h1><h3>鸣潮命令行管理器</h3><div align="center">
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.0-brightgreen.svg" alt="version 2.0">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.1-brightgreen.svg" alt="version 2.1">
 </div>
 </div>
 
@@ -29,88 +29,75 @@
 * **👯 并行下载**: 使用多线程并行下载，避免 CDN 节点降速，支持断点续传。
 
 
-
 ## 🔧 安装指南
 
-本工具推荐使用 [uv](https://github.com/astral-sh/uv) 进行安装和管理。
+本工具支持通过多种方式安装，推荐使用 [**uv**](https://github.com/astral-sh/uv) 进行管理。
 
-### 1. 安装 uv (如果尚未安装)
-
-- Linux
+###  AUR
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-````
-
-- Windows
-```pwsh
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+yay -S ww-manager
 ```
 
-> 安装完需要**重启终端**应用环境变量。
+---
 
+### 🚀 使用 uv
 
-### 2\. 安装本工具
+#### 1. 安装 uv
 
-- **方式一: 从本地源码构建**
-
-  克隆仓库代码到本地
-  ```shell
-  git clone https://github.com/timetetng/wutheringwaves-cli-manager.git
-  cd wutheringwaves-cli-manager
-  ```
-
-  在源码目录下执行：
-
-  ```bash
-  uv tool install .
-  ```
-
-- **方式二: 从远程构建**
-
-  终端直接输入:
-
-  ```bash
-  uv tool install git+https://github.com/timetetng/wutheringwaves-cli-manager
-  ```
-
-- **方式三: 从 PyPI 源安装**
-
-  ```bash
-  uv tool install ww-manager
-  ```
-
-安装完成后，你就可以在终端的任意位置直接使用 **`ww`** 命令了！
-
-### 3\. 更新/卸载
-
-- **更新工具**
-
-  - 从本地源码构建安装:
+* **Linux / macOS:**
     ```bash
-    # 从本地源码构建，更新时需拉取最新源码
-    git pull
-    # 在源码目录下执行，重新构建工具
-    uv tool install . --force
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    ```
+* **Windows:**
+    ```pwsh
+    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
     ```
 
-  - 远程或 PyPI 安装:
+>  **提示**：安装完成后，请**重启终端**以使环境变量生效。
 
+#### 2. 安装工具
+
+* 方式一：从 PyPI 安装 (推荐)
+```bash
+uv tool install ww-manager
+```
+
+* 方式二：从本地源码构建
+```bash
+git clone https://github.com/timetetng/wutheringwaves-cli-manager.git
+cd wutheringwaves-cli-manager
+
+# 在源码目录下执行安装
+uv tool install .
+```
+
+### 🔄 更新/卸载
+
+#### 1. 更新工具
+
+* **PyPI 安装**:
     ```bash
     uv tool upgrade ww-manager
     ```
 
-- **卸载工具**
+* **源码安装**:
+    ```bash
+    git pull
+    uv tool install . --force
+    ```
 
-  ```bash
-  uv tool uninstall ww-manager
-  ```
+#### 2. 卸载工具
+
+```bash
+uv tool uninstall ww-manager
+```
 
 
 ## 📖 使用说明
 
 ### 首次运行
 
-第一次运行时，你需要指定游戏路径（只需指定一次，后续会自动记忆）：
+首次运行时，需要指定游戏路径（只需指定一次，后续会自动记忆）：
 
 ```bash
 # 创建安装目录(如果你还没有创建游戏目录)
@@ -133,7 +120,7 @@ ww status
 
 #### 2\. 快速切换服务器 (`checkout`)
 
-这是最常用的功能。**秒级**切换服务器（仅限官/b服）。
+**秒级**切换服务器（仅限官/b服）。
 
 ```bash
 # 切换到 Bilibili 服
@@ -160,10 +147,10 @@ ww sync
 
 #### 4\. 下载完整客户端 (`download`)
 
-如果你还没有游戏，可以使用此命令从零开始下载。
+使用此命令从零开始下载。
 
 ```bash
-# 下载完整的官服客户端到当前目录（或配置的默认目录）
+# 下载完整的官服客户端到配置的目录
 ww download cn
 ```
 
@@ -216,7 +203,7 @@ ww log
 ## 🛠️ 常见问题 (FAQ)
 
 > [!TIP]
-> 由于 Linux 用户环境各异，以下解决方案均来自社区贡献，仅供参考。
+> 由于 Linux 用户环境各异，以下解决方案均来自社区，仅供参考。
 
 ---
 
@@ -246,9 +233,8 @@ ww log
 
 ---
 
-### 📢 贡献与反馈
-* **遇到新问题？** 请提交 Issue 并附带详细日志。
-* **有更好的方案？** 强烈欢迎提交 **PR** 帮助完善！
+### 📢 反馈
+任何问题请在 **Issue** 中提出，也欢迎 **PR**。
 
 ## 致谢
 
