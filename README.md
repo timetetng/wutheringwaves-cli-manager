@@ -71,31 +71,19 @@ cd wutheringwaves-cli-manager
 uv tool install .
 ```
 
-### 🔄 更新/卸载
+#### 3. 更新工具
 
-#### 1. 更新工具
+```bash
+ww update
+```
 
-* **PyPI 安装**:
-    ```bash
-    uv tool upgrade ww-manager
-    ```
-
-* **源码安装**:
-    ```bash
-    git pull
-    uv tool install . --force
-    ```
-
-#### 2. 卸载工具
+#### 4. 卸载工具
 
 ```bash
 uv tool uninstall ww-manager
 ```
 
-
 ## 📖 使用说明
-
-### 首次运行
 
 首次运行时，需要指定游戏路径（只需指定一次，后续会自动记忆）：
 
@@ -125,18 +113,11 @@ ww status
 ```bash
 # 切换到 Bilibili 服
 ww checkout bilibili
-
 # 切换到 官服
 ww checkout cn
-
 # 切换到 国际服（需要完整下载）
 ww checkout global
 ```
-
-> **注意**：如果切换后提示“文件缺失”，请运行 `ww sync` 进行下载修复。
->
-> v2.0 开始，将会自动校验并补全文件, `--force-sync` 仅用于需要时，手动强制同步。
-
 #### 3\. 同步与修复 (`sync`)
 
 **每次游戏版本更新后**，或者切换服务器后发现文件缺失时使用。它会联网校验所有文件并下载更新。
@@ -181,6 +162,12 @@ ww log
 
 > `-o`、`--open`: 获取链接并跳转打开。
 
+#### 7\. 更新工具本身（`update`）
+自动检查安装方式并尝试更新
+
+```bash
+ww upadate
+```
 
 ## 🎮 启动游戏 (Linux)
 
