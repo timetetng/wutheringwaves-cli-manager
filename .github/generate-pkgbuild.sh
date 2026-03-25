@@ -20,8 +20,7 @@ license=('MIT')
 depends=(
   'python'
   'python-typer'
-  'python-rich'
-  'python-tqdm'
+'python-rich'
   'python-certifi'
   'python-typing_extensions'
 )
