@@ -70,7 +70,8 @@ clean:
 	find . -type d -name "__pycache__" -exec rm -rf {} +
 	find . -type f -name "*.py[co]" -delete
 	@echo "=> 清理 Arch 打包残留..."
-	rm -rf pkg/ src/
+	rm -rf pkg/
+	rm -rf src/wutheringwaves-cli-manager-* src/*.tar.gz
 	rm -f PKGBUILD source.tar.gz
 	rm -f *.pkg.tar.zst
 	rm -f *.tar.gz

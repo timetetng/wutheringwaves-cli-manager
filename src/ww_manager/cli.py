@@ -14,8 +14,8 @@ from urllib.request import Request, urlopen
 import typer
 from typing_extensions import Annotated
 
-from config import APPID_TO_SERVER, load_app_config, save_app_config
-from core import WGameManager, WWError
+from ww_manager.config import APPID_TO_SERVER, load_app_config, save_app_config
+from ww_manager.core import WGameManager, WWError
 
 __version__ = metadata.version("ww-manager")
 

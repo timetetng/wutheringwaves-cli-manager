@@ -24,7 +24,7 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
-from config import SERVER_CONFIGS, SERVER_DIFF_FILES
+from ww_manager.config import SERVER_CONFIGS, SERVER_DIFF_FILES
 
 logger = logging.getLogger("WW_Manager")
 

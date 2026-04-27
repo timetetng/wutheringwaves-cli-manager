@@ -3,3 +3,11 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+dist/
+pkg/
+src/wutheringwaves-cli-manager-*/
+*.pkg.tar.zst
+source.tar.gz
+*.tar.gz
+PKGBUILD

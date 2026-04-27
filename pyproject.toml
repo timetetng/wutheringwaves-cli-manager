@@ -12,14 +12,14 @@ dependencies = [
 ]
 
 [project.scripts]
-ww = "cli:app"
+ww = "ww_manager.cli:app"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-[tool.hatch.build.targets.wheel]
-packages = ["."]
+[tool.hatch.build]
+sources = { "ww_manager" = "src/ww_manager" }
 
 [tool.ruff]
 line-length = 120
