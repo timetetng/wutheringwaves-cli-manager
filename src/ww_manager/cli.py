@@ -274,12 +274,16 @@ def checkout(
 
 
 @app.command()
-def predownload(
+def incremental(
     ctx: typer.Context,
-    action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用预下载资源")] = None,
-    apply_flag: Annotated[bool, typer.Option("--apply", help="应用预下载资源")] = False,
+    action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
+    apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
 ):
-    """预下载管理"""
+    """
+    增量更新管理（节省约100GB流量）
+
+    需要在新版本预下载开放期间先执行下载，之后在维护时应用。
+    """
     path = get_game_path(ctx)
     cfg_file = path / "launcherDownloadConfig.json"
     server = "cn"
@@ -289,73 +293,35 @@ def predownload(
             server = APPID_TO_SERVER.get(d.get("appId"), "cn")
         except Exception:
             pass
-    is_apply = (action == "apply") or apply_flag
-    if action and action != "apply":
-        typer.secho(f"未知的参数: {action}。直接运行进行预下载，应用更新请使用 'apply'。", fg="red")
-        raise typer.Exit(1)
+
     try:
         mgr = WGameManager(path, server)
+        is_apply = (action == "apply") or apply_flag
+
+        if action and action != "apply":
+            typer.secho(f"未知的参数: {action}。直接运行进行下载，应用更新请使用 'apply'。", fg="red")
+            raise typer.Exit(1)
+
         if is_apply:
             typer.confirm(
-                "确定要应用预下载资源吗？\n这将会覆盖现有的游戏文件，请确保游戏目前已维护或更新完毕。", abort=True
+                "确定要应用增量更新吗？\n这将会修改现有的游戏文件，请确保游戏目前已维护或更新完毕。", abort=True
             )
-            mgr.apply_predownload()
-        else:
-            mgr.download_predownload()
-    except WWError as e:
-        typer.secho(f"预下载操作失败: {e}", fg="red")
-        raise typer.Exit(1)
-
-
-@app.command()
-def patch(
-    ctx: typer.Context,
-    check_only: Annotated[bool, typer.Option("--check", help="仅检查环境是否满足增量更新要求")] = False,
-    fallback: Annotated[bool, typer.Option("--fallback", help="增量更新失败时自动回退到全量下载")] = True,
-):
-    """应用增量更新（节省流量）"""
-    path = get_game_path(ctx)
-    cfg_file = path / "launcherDownloadConfig.json"
-    server = "cn"
-    if cfg_file.exists():
-        try:
-            d = json.loads(cfg_file.read_text(encoding="utf-8"))
-            server = APPID_TO_SERVER.get(d.get("appId"), "cn")
-        except Exception:
-            pass
-
-    try:
-        mgr = WGameManager(path, server)
-
-        if check_only:
-            from ww_manager.incremental import check_hpatchz_requirements
-
-            is_ok, error_msg = check_hpatchz_requirements()
-            if is_ok:
-                typer.secho("环境检查通过，可以使用增量更新", fg="green")
+            success = mgr.apply_incremental()
+            if success:
+                typer.secho("增量更新应用成功！", fg="green")
             else:
-                typer.secho(f"环境检查失败:\n{error_msg}", fg="yellow")
-            return
-
-        success = mgr.apply_incremental_update(dry_run=False)
-
-        if success:
-            typer.secho("增量更新成功！", fg="green")
+                typer.secho("增量更新应用失败", fg="red")
+                raise typer.Exit(1)
         else:
-            if fallback:
-                typer.secho("增量更新失败，尝试回退到全量同步...", fg="yellow")
-                try:
-                    mgr.sync_files(force_check_md5=True)
-                    typer.secho("全量同步完成", fg="green")
-                except WWError as e:
-                    typer.secho(f"全量同步也失败了: {e}", fg="red")
-                    raise typer.Exit(1)
+            success = mgr.download_incremental()
+            if success:
+                typer.secho("增量包下载完成！之后可使用 'ww incremental --apply' 命令应用更新。", fg="green")
             else:
-                typer.secho("增量更新失败（已禁用自动回退）。可以尝试 'ww sync' 进行全量同步。", fg="red")
+                typer.secho("增量包下载失败", fg="red")
                 raise typer.Exit(1)
 
     except WWError as e:
-        typer.secho(f"更新失败: {e}", fg="red")
+        typer.secho(f"增量更新操作失败: {e}", fg="red")
         raise typer.Exit(1)
 
 
