@@ -1,0 +1,58 @@
+name: Release hpatchz.exe
+
+on:
+  push:
+    tags:
+      - 'hpatchz-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v4.8.0)'
+        required: true
+        default: 'v4.8.0'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download official installer
+        run: |
+          mkdir -p test-scripts
+          curl -L -o test-scripts/WutheringWaves_official_setup_2.6.0.0.exe \
+            "https://github.com/nicepingfootball/ww-test/releases/download/test/WutheringWaves_official_setup_2.6.0.0.exe"
+          ls -la test-scripts/
+
+      - name: Extract hpatchz.exe
+        run: |
+          mkdir -p extracted
+          7z x -oextracted test-scripts/WutheringWaves_official_setup_2.6.0.0.exe '\$PLUGINSDIR/KRLauncher.zip' -y
+          7z x -oextracted extracted/\$PLUGINSDIR/KRLauncher.zip '2.6.0.0/hpatchz.exe' -y
+          ls -la extracted/2.6.0.0/hpatchz.exe
+          file extracted/2.6.0.0/hpatchz.exe
+
+      - name: Determine tag
+        id: get_tag
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+          echo "Tag: ${{ steps.get_tag.outputs.tag }}"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: extracted/2.6.0.0/hpatchz.exe
+          tag_name: ${{ steps.get_tag.outputs.tag }}
+          name: hpatchz.exe ${{ steps.get_tag.outputs.tag }}
+          body: |
+            hpatchz.exe v${{ steps.get_tag.outputs.tag }}
+            Extracted from official Wuthering Waves installer.
+            Used for incremental patch application in ww-manager.
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
