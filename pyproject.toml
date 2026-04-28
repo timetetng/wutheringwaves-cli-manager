@@ -9,6 +9,7 @@ dependencies = [
     "certifi",
     "rich",
     "typing-extensions>=4.15.0",
+    "requests>=2.31.0",
 ]
 
 [project.scripts]

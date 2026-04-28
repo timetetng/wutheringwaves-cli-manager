@@ -25,6 +25,12 @@ from rich.progress import (
 )
 
 from ww_manager.config import SERVER_CONFIGS, SERVER_DIFF_FILES
+from ww_manager.incremental import (
+    BilibiliIncrementalManager,
+    IncrementalError,
+    OfficialIncrementalManager,
+    check_hpatchz_requirements,
+)
 
 logger = logging.getLogger("WW_Manager")
 
@@ -617,3 +623,67 @@ class WGameManager:
             with open(self.game_folder / "launcherDownloadConfig.json", "w") as f:
                 json.dump(cfg, f, indent=4)
             logger.info(f"本地配置已更新: {self.server_type} ({v})")
+
+    def apply_incremental_update(self, dry_run: bool = False) -> bool:
+        """
+        应用增量更新
+
+        Args:
+            dry_run: 如果为 True，仅检查环境但不执行实际更新
+
+        Returns:
+            是否成功
+        """
+        is_ok, error_msg = check_hpatchz_requirements()
+        if not is_ok:
+            logger.warning(f"增量更新环境检查失败: {error_msg}")
+            return False
+
+        if dry_run:
+            logger.info("增量更新环境检查通过")
+            return True
+
+        if self.server_type == "bilibili":
+            manager = BilibiliIncrementalManager(
+                self.game_folder,
+                self.server_type,
+                self.launcher_info,
+                self.cdn_node,
+            )
+        elif self.server_type == "cn":
+            manager = OfficialIncrementalManager(
+                self.game_folder,
+                self.server_type,
+                self.launcher_info,
+                self.cdn_node,
+            )
+        else:
+            logger.error(f"服务器 {self.server_type} 暂不支持增量更新")
+            return False
+
+        try:
+            current_version = self._get_current_version()
+            target_version = self.launcher_info.get("predownload", {}).get("version", "")
+
+            if not current_version:
+                logger.error("无法获取当前版本")
+                return False
+
+            logger.info(f"开始增量更新: {current_version} -> {target_version}")
+
+            return manager.download_and_apply_incremental(current_version, target_version)
+
+        except IncrementalError as e:
+            logger.error(f"增量更新失败: {e}")
+            return False
+
+    def _get_current_version(self) -> Optional[str]:
+        """获取当前版本"""
+        cfg_file = self.game_folder / "launcherDownloadConfig.json"
+        if cfg_file.exists():
+            try:
+                data = json.loads(cfg_file.read_text())
+                return data.get("version")
+            except Exception:
+                pass
+        return None

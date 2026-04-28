@@ -308,6 +308,58 @@ def predownload(
 
 
 @app.command()
+def patch(
+    ctx: typer.Context,
+    check_only: Annotated[bool, typer.Option("--check", help="仅检查环境是否满足增量更新要求")] = False,
+    fallback: Annotated[bool, typer.Option("--fallback", help="增量更新失败时自动回退到全量下载")] = True,
+):
+    """应用增量更新（节省流量）"""
+    path = get_game_path(ctx)
+    cfg_file = path / "launcherDownloadConfig.json"
+    server = "cn"
+    if cfg_file.exists():
+        try:
+            d = json.loads(cfg_file.read_text(encoding="utf-8"))
+            server = APPID_TO_SERVER.get(d.get("appId"), "cn")
+        except Exception:
+            pass
+
+    try:
+        mgr = WGameManager(path, server)
+
+        if check_only:
+            from ww_manager.incremental import check_hpatchz_requirements
+
+            is_ok, error_msg = check_hpatchz_requirements()
+            if is_ok:
+                typer.secho("环境检查通过，可以使用增量更新", fg="green")
+            else:
+                typer.secho(f"环境检查失败:\n{error_msg}", fg="yellow")
+            return
+
+        success = mgr.apply_incremental_update(dry_run=False)
+
+        if success:
+            typer.secho("增量更新成功！", fg="green")
+        else:
+            if fallback:
+                typer.secho("增量更新失败，尝试回退到全量同步...", fg="yellow")
+                try:
+                    mgr.sync_files(force_check_md5=True)
+                    typer.secho("全量同步完成", fg="green")
+                except WWError as e:
+                    typer.secho(f"全量同步也失败了: {e}", fg="red")
+                    raise typer.Exit(1)
+            else:
+                typer.secho("增量更新失败（已禁用自动回退）。可以尝试 'ww sync' 进行全量同步。", fg="red")
+                raise typer.Exit(1)
+
+    except WWError as e:
+        typer.secho(f"更新失败: {e}", fg="red")
+        raise typer.Exit(1)
+
+
+@app.command()
 def log(
     ctx: typer.Context,
     open_browser: Annotated[bool, typer.Option("--open", "-o", help="使用默认浏览器打开链接")] = False,

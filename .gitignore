@@ -11,3 +11,11 @@ src/wutheringwaves-cli-manager-*/
 source.tar.gz
 *.tar.gz
 PKGBUILD
+
+# Test and development
+test-scripts/
+*.exe
+*.dll
+*.zip
+group_*_output/
+Client/
