@@ -27,7 +27,6 @@ from rich.progress import (
     BarColumn,
     DownloadColumn,
     Progress,
-    TaskID,
     TextColumn,
     TimeRemainingColumn,
     TransferSpeedColumn,
@@ -295,7 +294,6 @@ class IncrementalManager:
             logger.info("所有增量包已下载完成")
             return True
 
-        downloaded_size = sum(self._get_group_size(g) for g in group_infos) - total_size
         already_downloaded_count = len(group_infos) - len(pending_groups)
 
         progress = Progress(
@@ -486,8 +484,11 @@ class IncrementalManager:
             output_dir.mkdir(parents=True, exist_ok=True)
 
             if not self._run_hpatchz(krpdiff_path, output_dir, src_path):
-                logger.error(f"应用增量包失败: {krpdiff_name}")
-                return "failed"
+                logger.warning(f"hpatchz 应用失败，尝试下载完整文件: {src_path}")
+                if not self._download_full_file(dst_file_info, src_full_path):
+                    logger.error(f"应用增量包失败: {krpdiff_name}")
+                    return "failed"
+                return "success"
 
             output_file = output_dir / src_path
 
@@ -516,6 +517,24 @@ class IncrementalManager:
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _download_full_file(self, dst_info: Dict, dest_path: Path) -> bool:
+        """下载完整文件作为 hpatchz 失败的回退方案"""
+        dest = dst_info["dest"]
+        expected_md5 = dst_info["md5"]
+        expected_size = int(dst_info["size"])
+
+        res_base = self._find_resource_base()
+        if not res_base:
+            logger.error("无法获取资源路径")
+            return False
+
+        from urllib.parse import quote
+
+        url = f"{self.cdn_base}/{res_base}/{quote(dest, safe='/:')}"
+
+        logger.info(f"下载完整文件: {dest}")
+        return self._download_and_verify(url, dest_path, expected_size, expected_md5)
 
     def _run_hpatchz(self, krpdiff_path: Path, output_dir: Path, src_path: str) -> bool:
         """运行 hpatchz 应用增量包"""
@@ -570,6 +589,7 @@ class IncrementalManager:
         logger.info(f"正在校验 {len(game_files)} 个新版本文件...")
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
+
         from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 
         ok_count = 0
@@ -620,6 +640,7 @@ class IncrementalManager:
 
         if not inconsistent_files and not missing_files:
             logger.info("所有游戏文件状态正常")
+            self._update_local_version(index_data)
             return True
 
         repair_needed = inconsistent_files + missing_files
@@ -630,9 +651,17 @@ class IncrementalManager:
             logger.error("无法获取新版本资源路径")
             return False
 
-        from urllib.parse import quote
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from rich.progress import BarColumn, DownloadColumn, Progress, TaskID, TextColumn, TimeRemainingColumn, TransferSpeedColumn
+        from urllib.parse import quote
+
+        from rich.progress import (
+            BarColumn,
+            DownloadColumn,
+            Progress,
+            TextColumn,
+            TimeRemainingColumn,
+            TransferSpeedColumn,
+        )
 
         game_res_map = {r["dest"]: r for r in game_files}
         repair_count = 0
@@ -767,14 +796,30 @@ class IncrementalManager:
                 dest.unlink()
             return False
 
-    def _update_local_version(self, version: str):
-        """更新本地版本"""
+    def _update_local_version(self, version_or_data):
+        """更新本地版本，可接收版本字符串或 indexFile.json 数据"""
+        if isinstance(version_or_data, dict):
+            group_infos = version_or_data.get("groupInfos", [])
+            if not group_infos:
+                logger.warning("无法获取 groupInfos 信息")
+                return
+            krpdiff_name = group_infos[0]["dest"]
+            parts = krpdiff_name.split("_")
+            new_version = parts[1] if len(parts) >= 2 else None
+        else:
+            new_version = version_or_data
+
+        if not new_version:
+            logger.warning("无法获取新版本号")
+            return
+
         cfg_path = self.game_folder / "launcherDownloadConfig.json"
         if cfg_path.exists():
             try:
                 data = json.loads(cfg_path.read_text())
-                data["version"] = version
+                data["version"] = new_version
                 cfg_path.write_text(json.dumps(data, indent=4))
-                logger.info(f"本地版本已更新: {version}")
+                logger.info(f"本地版本已更新: {new_version}")
             except Exception as e:
+                logger.error(f"更新本地版本失败: {e}")
                 logger.error(f"更新本地版本失败: {e}")
