@@ -508,28 +508,38 @@ class IncrementalManager:
             logger.warning("没有增量更新组")
             return False
 
-        logger.info(f"开始应用 {len(group_infos)} 个增量包...")
+        logger.info(f"开始应用 {len(group_infos)} 个增量包...预计 5-10 分钟，请勿中断进程")
 
         max_workers = min(4, len(group_infos))
         results = {}
-        completed_count = 0
 
         def apply_wrapper(group):
-            try:
-                return group.get("dest"), self._apply_single_group(group, download_dir)
-            except Exception as e:
-                logger.error(f"应用增量包异常: {e}")
-                return group.get("dest"), "failed"
+            log_messages = []
 
-        from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
+            def log_info(msg):
+                log_messages.append(("info", msg))
+
+            def log_warning(msg):
+                log_messages.append(("warning", msg))
+
+            def log_error(msg):
+                log_messages.append(("error", msg))
+
+            try:
+                dest, result = self._apply_single_group(group, download_dir, log_info, log_warning, log_error)
+                return dest, result, log_messages
+            except Exception as e:
+                log_error(f"应用增量包异常: {e}")
+                return group.get("dest"), "failed", log_messages
+
+        from rich.progress import BarColumn, Progress, TextColumn
 
         progress = Progress(
             TextColumn("[bold cyan]{task.description}"),
             BarColumn(bar_width=40),
             "[progress.percentage]{task.percentage:>3.1f}%",
             TextColumn("({task.completed}/{task.total})"),
-            TimeRemainingColumn(),
-            transient=True,
+            transient=False,
         )
 
         with progress:
@@ -538,22 +548,36 @@ class IncrementalManager:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {executor.submit(apply_wrapper, group): group for group in group_infos}
                 for future in as_completed(futures):
-                    dest, result = future.result()
+                    dest, result, log_messages = future.result()
                     results[dest] = result
-                    completed_count += 1
-                    progress.update(task_id, advance=1, description=f"[bold cyan]应用增量包: {Path(dest).name[:30]}")
+                    for level, msg in log_messages:
+                        if level == "info":
+                            progress.console.print(f"[dim]{msg}[/dim]")
+                        elif level == "warning":
+                            progress.console.print(f"[yellow]WARNING[/yellow] {msg}")
+                        else:
+                            progress.console.print(f"[red]ERROR[/red] {msg}")
+                    progress.update(task_id, advance=1)
 
         success_count = sum(1 for r in results.values() if r == "success")
         skip_count = sum(1 for r in results.values() if r == "skipped")
         fail_count = sum(1 for r in results.values() if r == "failed")
         failed_groups = [dest for dest, r in results.items() if r == "failed"]
 
-        logger.info(f"增量更新应用完成: 成功={success_count}, 跳过={skip_count}, 失败={fail_count}")
+        logger.info(
+            f"增量更新应用完成: 成功={success_count}, 跳过={skip_count}, "
+            f"失败={fail_count}，建议运行 'ww sync' 校验确认。"
+        )
 
         if fail_count > 0:
             logger.warning(f"失败文件: {failed_groups}")
-            logger.warning(f"有 {fail_count} 个增量包应用失败。请运行 'ww sync' 修复或等待游戏修复工具。")
+            logger.warning(f"有 {fail_count} 个增量包应用失败。请运行 'ww sync' 修复。")
             return False
+
+        saved_index = self.cache_dir / "indexFile.json"
+        if index_file.exists():
+            shutil.copy2(index_file, saved_index)
+            logger.info("已保存索引到缓存")
 
         shutil.rmtree(download_dir)
         logger.info("已清理增量下载目录")
@@ -562,14 +586,14 @@ class IncrementalManager:
 
         return True
 
-    def _apply_single_group(self, group: Dict, download_dir: Path) -> str:
+    def _apply_single_group(self, group: Dict, download_dir: Path, log_info, log_warning, log_error) -> tuple:
         """应用单个增量更新组"""
         krpdiff_name = group.get("dest")
         src_files = group.get("srcFiles", [])
         dst_files = group.get("dstFiles", [])
 
         if not krpdiff_name or not src_files or not dst_files:
-            return "failed"
+            return krpdiff_name, "failed"
 
         src_file_info = src_files[0]
         dst_file_info = dst_files[0]
@@ -584,28 +608,28 @@ class IncrementalManager:
         if src_full_path.exists():
             local_md5 = _calculate_file_md5(src_full_path)
             if local_md5 == dst_md5:
-                logger.info(f"跳过已更新的文件: {src_path}")
-                return "success"
+                log_info(f"跳过已更新的文件: {src_path}")
+                return krpdiff_name, "success"
             if local_md5 != src_md5:
-                logger.warning(f"源文件 MD5 不匹配: {src_path} (期望 {src_md5}, 实际 {local_md5})")
-                return "failed"
+                log_warning(f"源文件 MD5 不匹配: {src_path} (期望 {src_md5}, 实际 {local_md5})")
+                return krpdiff_name, "failed"
         elif backup_path.exists():
             current_md5 = _calculate_file_md5(backup_path)
             if current_md5 == dst_md5:
                 shutil.move(backup_path, src_full_path)
-                logger.info(f"恢复中断的更新: {src_path}")
-                return "success"
+                log_info(f"恢复中断的更新: {src_path}")
+                return krpdiff_name, "success"
             elif current_md5 == src_md5:
-                logger.warning(f"检测到中断的更新，备份文件 MD5 不符合预期: {src_path}")
-                return "failed"
+                log_warning(f"检测到中断的更新，备份文件 MD5 不符合预期: {src_path}")
+                return krpdiff_name, "failed"
         else:
-            logger.warning(f"源文件不存在: {src_path}")
-            return "failed"
+            log_warning(f"源文件不存在: {src_path}")
+            return krpdiff_name, "failed"
 
         krpdiff_path = download_dir / krpdiff_name
         if not krpdiff_path.exists():
-            logger.error(f"增量包不存在: {krpdiff_name}")
-            return "failed"
+            log_error(f"增量包不存在: {krpdiff_name}")
+            return krpdiff_name, "failed"
 
         patch_temp_dir = self.cache_dir / "patch_temp"
         patch_temp_dir.mkdir(parents=True, exist_ok=True)
@@ -616,22 +640,22 @@ class IncrementalManager:
                 output_dir.mkdir(parents=True, exist_ok=True)
 
                 if not self._run_hpatchz(krpdiff_path, output_dir, src_path):
-                    logger.warning(f"hpatchz 应用失败，尝试下载完整文件: {src_path}")
+                    log_warning(f"hpatchz 应用失败，尝试下载完整文件: {src_path}")
                     if not self._download_full_file(dst_file_info, src_full_path):
-                        logger.error(f"应用增量包失败: {krpdiff_name}")
-                        return "failed"
-                    return "success"
+                        log_error(f"应用增量包失败: {krpdiff_name}")
+                        return krpdiff_name, "failed"
+                    return krpdiff_name, "success"
 
                 output_file = output_dir / src_path
 
                 if not output_file.exists():
-                    logger.error(f"输出文件未生成: {output_file}")
-                    return "failed"
+                    log_error(f"输出文件未生成: {output_file}")
+                    return krpdiff_name, "failed"
 
                 output_md5 = _calculate_file_md5(output_file)
                 if output_md5 != dst_md5:
-                    logger.error(f"输出文件 MD5 不匹配: {src_path} (期望 {dst_md5}, 实际 {output_md5})")
-                    return "failed"
+                    log_error(f"输出文件 MD5 不匹配: {src_path} (期望 {dst_md5}, 实际 {output_md5})")
+                    return krpdiff_name, "failed"
 
                 if src_full_path.exists():
                     shutil.move(src_full_path, backup_path)
@@ -639,12 +663,12 @@ class IncrementalManager:
                 output_file.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(output_file, src_full_path)
 
-                logger.info(f"成功更新: {src_path} -> {output_md5}")
+                log_info(f"成功更新: {src_path} -> {output_md5}")
 
                 if backup_path.exists():
                     backup_path.unlink()
 
-                return "success"
+                return krpdiff_name, "success"
 
         finally:
             pass
@@ -700,10 +724,13 @@ class IncrementalManager:
         """校验新版本文件状态，用于增量更新后的检查"""
         download_dir = self.game_folder / ".incremental_download"
         index_file = download_dir / "indexFile.json"
+        cache_index_file = self.cache_dir / "indexFile.json"
 
-        if not index_file.exists():
+        if not index_file.exists() and not cache_index_file.exists():
             logger.error("未找到增量更新的 indexFile.json，请先执行 'ww incremental' 下载")
             return False
+
+        index_file = index_file if index_file.exists() else cache_index_file
 
         try:
             index_data = json.loads(index_file.read_text())
@@ -819,7 +846,7 @@ class IncrementalManager:
                 expected_size = int(item["size"])
                 url = f"{self.cdn_base}/{res_base}/{quote(dest, safe='/:')}"
 
-                task_id = progress.add_task(description=f"[cyan]{dest.name[:40]}[/cyan]", total=expected_size)
+                task_id = progress.add_task(description=f"[cyan]{Path(dest).name[:40]}[/cyan]", total=expected_size)
 
                 try:
                     headers = {"User-Agent": "WW-Manager/2.0"}
@@ -879,18 +906,20 @@ class IncrementalManager:
         """从 indexFile.json 获取资源路径前缀"""
         download_dir = self.game_folder / ".incremental_download"
         index_file = download_dir / "indexFile.json"
-        if not index_file.exists():
-            return None
+        cache_index_file = self.cache_dir / "indexFile.json"
 
-        try:
-            data = json.loads(index_file.read_text())
-            resources = data.get("resource", [])
-            if resources:
-                from_folder = resources[0].get("fromFolder", "")
-                if from_folder:
-                    return from_folder.rstrip("/")
-        except Exception:
-            pass
+        if index_file.exists() or cache_index_file.exists():
+            if not index_file.exists():
+                index_file = cache_index_file
+            try:
+                data = json.loads(index_file.read_text())
+                resources = data.get("resource", [])
+                if resources:
+                    from_folder = resources[0].get("fromFolder", "")
+                    if from_folder:
+                        return from_folder.rstrip("/")
+            except Exception:
+                pass
 
         return "launcher/game/G152/10003/3.3.0/LwvQueHvaDihmfrFKvPkzsBMsZoMxIAD/zip"
 
