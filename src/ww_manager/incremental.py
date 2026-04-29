@@ -508,25 +508,26 @@ class IncrementalManager:
             logger.warning("没有增量更新组")
             return False
 
-        success_count = 0
-        fail_count = 0
-        skip_count = 0
-        failed_groups = []
+        max_workers = min(4, len(group_infos))
+        results = {}
 
-        for group in group_infos:
+        def apply_wrapper(group):
             try:
-                result = self._apply_single_group(group, download_dir)
+                return group.get("dest"), self._apply_single_group(group, download_dir)
             except Exception as e:
                 logger.error(f"应用增量包异常: {e}")
-                result = "failed"
+                return group.get("dest"), "failed"
 
-            if result == "success":
-                success_count += 1
-            elif result == "skipped":
-                skip_count += 1
-            else:
-                fail_count += 1
-                failed_groups.append(group.get("dest"))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(apply_wrapper, group): group for group in group_infos}
+            for future in as_completed(futures):
+                dest, result = future.result()
+                results[dest] = result
+
+        success_count = sum(1 for r in results.values() if r == "success")
+        skip_count = sum(1 for r in results.values() if r == "skipped")
+        fail_count = sum(1 for r in results.values() if r == "failed")
+        failed_groups = [dest for dest, r in results.items() if r == "failed"]
 
         logger.info(f"增量更新应用完成: 成功={success_count}, 跳过={skip_count}, 失败={fail_count}")
 
@@ -577,45 +578,48 @@ class IncrementalManager:
             logger.error(f"增量包不存在: {krpdiff_name}")
             return "failed"
 
-        temp_dir = tempfile.mkdtemp(prefix="ww_patch_")
-        try:
-            output_dir = Path(temp_dir) / "output"
-            output_dir.mkdir(parents=True, exist_ok=True)
+        patch_temp_dir = self.cache_dir / "patch_temp"
+        patch_temp_dir.mkdir(parents=True, exist_ok=True)
 
-            if not self._run_hpatchz(krpdiff_path, output_dir, src_path):
-                logger.warning(f"hpatchz 应用失败，尝试下载完整文件: {src_path}")
-                if not self._download_full_file(dst_file_info, src_full_path):
-                    logger.error(f"应用增量包失败: {krpdiff_name}")
+        try:
+            with tempfile.TemporaryDirectory(prefix="ww_patch_", dir=patch_temp_dir) as temp_dir:
+                output_dir = Path(temp_dir) / "output"
+                output_dir.mkdir(parents=True, exist_ok=True)
+
+                if not self._run_hpatchz(krpdiff_path, output_dir, src_path):
+                    logger.warning(f"hpatchz 应用失败，尝试下载完整文件: {src_path}")
+                    if not self._download_full_file(dst_file_info, src_full_path):
+                        logger.error(f"应用增量包失败: {krpdiff_name}")
+                        return "failed"
+                    return "success"
+
+                output_file = output_dir / src_path
+
+                if not output_file.exists():
+                    logger.error(f"输出文件未生成: {output_file}")
                     return "failed"
+
+                output_md5 = _calculate_file_md5(output_file)
+                if output_md5 != dst_md5:
+                    logger.error(f"输出文件 MD5 不匹配: {src_path} (期望 {dst_md5}, 实际 {output_md5})")
+                    return "failed"
+
+                backup_path = src_full_path.with_suffix(src_full_path.suffix + ".bak")
+                if src_full_path.exists():
+                    shutil.move(src_full_path, backup_path)
+
+                output_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(output_file, src_full_path)
+
+                logger.info(f"成功更新: {src_path} -> {output_md5}")
+
+                if backup_path.exists():
+                    backup_path.unlink()
+
                 return "success"
 
-            output_file = output_dir / src_path
-
-            if not output_file.exists():
-                logger.error(f"输出文件未生成: {output_file}")
-                return "failed"
-
-            output_md5 = _calculate_file_md5(output_file)
-            if output_md5 != dst_md5:
-                logger.error(f"输出文件 MD5 不匹配: {src_path} (期望 {dst_md5}, 实际 {output_md5})")
-                return "failed"
-
-            backup_path = src_full_path.with_suffix(src_full_path.suffix + ".bak")
-            if src_full_path.exists():
-                shutil.move(src_full_path, backup_path)
-
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(output_file, src_full_path)
-
-            logger.info(f"成功更新: {src_path} -> {output_md5}")
-
-            if backup_path.exists():
-                backup_path.unlink()
-
-            return "success"
-
         finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            pass
 
     def _download_full_file(self, dst_info: Dict, dest_path: Path) -> bool:
         """下载完整文件作为 hpatchz 失败的回退方案"""
