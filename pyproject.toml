@@ -1,10 +1,6 @@
 [project]
 name = "ww-manager"
-<<<<<<< HEAD
-version = "2.1.12"
-=======
-version = "2.2.3"
->>>>>>> b0272b5 (暂停工作，解决issue)
+version = "2.2.4"
 description = "鸣潮命令行管理器"
 readme = "README.md"
 requires-python = ">=3.9"
