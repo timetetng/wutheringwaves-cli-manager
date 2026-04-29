@@ -18,10 +18,20 @@ import platform
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TaskID,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 
 logger = logging.getLogger("WW_Manager")
 
@@ -212,6 +222,15 @@ class IncrementalManager:
             return None
         return self._build_index_url(patch_info)
 
+    def _get_group_size(self, group: Dict) -> int:
+        """获取 group 的增量包大小"""
+        if group.get("size"):
+            return group["size"]
+        dst_files = group.get("dstFiles", [])
+        if dst_files:
+            return dst_files[0].get("size", 0)
+        return 0
+
     def download_incremental(self) -> bool:
         """下载增量更新包"""
         is_ok, error_msg = check_hpatchz_requirements()
@@ -258,34 +277,76 @@ class IncrementalManager:
         with open(download_dir / "version_info.json", "w", encoding="utf-8") as f:
             json.dump(version_info, f, indent=4)
 
-        downloaded = 0
-        failed = 0
-
-        for i, group in enumerate(group_infos):
+        pending_groups = []
+        total_size = 0
+        for group in group_infos:
             krpdiff_name = group.get("dest")
             if not krpdiff_name:
                 continue
-
-            krpdiff_url = self._build_krpdiff_url(krpdiff_name)
             krpdiff_path = download_dir / krpdiff_name
-
             if krpdiff_path.exists():
-                logger.debug(f"跳过已下载: {krpdiff_name}")
-                downloaded += 1
-                continue
+                logger.info(f"删除旧文件重新下载: {krpdiff_name}")
+                krpdiff_path.unlink()
+            size = self._get_group_size(group)
+            pending_groups.append((group, krpdiff_path))
+            total_size += size
 
-            logger.info(f"下载增量包 {i + 1}/{len(group_infos)}: {krpdiff_name}")
+        if not pending_groups:
+            logger.info("所有增量包已下载完成")
+            return True
 
-            if self._download_file(krpdiff_url, krpdiff_path):
-                downloaded += 1
-            else:
-                logger.error(f"下载失败: {krpdiff_name}")
-                failed += 1
+        downloaded_size = sum(self._get_group_size(g) for g in group_infos) - total_size
+        already_downloaded_count = len(group_infos) - len(pending_groups)
 
-        logger.info(f"增量包下载完成: 成功={downloaded}, 失败={failed}")
-        return failed == 0
+        progress = Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=40),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            transient=True,
+        )
 
-    def _download_file(self, url: str, dest: Path) -> bool:
+        max_workers = 8
+
+        with progress:
+            overall_task = progress.add_task(
+                f"增量包 ({already_downloaded_count}/{len(group_infos)} 已下载)",
+                total=total_size,
+            )
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {}
+                for group, krpdiff_path in pending_groups:
+                    krpdiff_name = group.get("dest")
+                    krpdiff_url = self._build_krpdiff_url(krpdiff_name)
+                    size = self._get_group_size(group)
+                    future = executor.submit(
+                        self._download_file,
+                        krpdiff_url,
+                        krpdiff_path,
+                        size,
+                    )
+                    futures[future] = (krpdiff_name, size)
+
+                failed = []
+                for future in as_completed(futures):
+                    krpdiff_name, size = futures[future]
+                    if future.result():
+                        progress.update(overall_task, advance=size)
+                    else:
+                        failed.append(krpdiff_name)
+                        progress.update(overall_task, advance=size)
+
+        if failed:
+            logger.error(f"下载失败: {failed}")
+            return False
+
+        logger.info(f"增量包下载完成: {len(group_infos)}/{len(group_infos)}")
+        return True
+
+    def _download_file(self, url: str, dest: Path, expected_size: int = 0) -> bool:
         """下载单个文件"""
         try:
             headers = {"User-Agent": "WW-Manager/2.0"}
@@ -293,9 +354,12 @@ class IncrementalManager:
             response.raise_for_status()
 
             dest.parent.mkdir(parents=True, exist_ok=True)
+            downloaded = 0
             with open(dest, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
+                for chunk in response.iter_content(chunk_size=1024 * 256):
                     f.write(chunk)
+                    downloaded += len(chunk)
+
             return True
         except Exception as e:
             logger.error(f"下载失败 {url}: {e}")
@@ -349,17 +413,29 @@ class IncrementalManager:
 
         success_count = 0
         fail_count = 0
+        skip_count = 0
+        failed_groups = []
 
         for group in group_infos:
-            result = self._apply_single_group(group, download_dir)
+            try:
+                result = self._apply_single_group(group, download_dir)
+            except Exception as e:
+                logger.error(f"应用增量包异常: {e}")
+                result = "failed"
+
             if result == "success":
                 success_count += 1
-            elif result == "failed":
+            elif result == "skipped":
+                skip_count += 1
+            else:
                 fail_count += 1
+                failed_groups.append(group.get("dest"))
 
-        logger.info(f"增量更新应用完成: 成功={success_count}, 失败={fail_count}")
+        logger.info(f"增量更新应用完成: 成功={success_count}, 跳过={skip_count}, 失败={fail_count}")
 
         if fail_count > 0:
+            logger.warning(f"失败文件: {failed_groups}")
+            logger.warning(f"有 {fail_count} 个增量包应用失败。请运行 'ww sync' 修复或等待游戏修复工具。")
             return False
 
         shutil.rmtree(download_dir)
@@ -392,6 +468,9 @@ class IncrementalManager:
             return "failed"
 
         local_md5 = _calculate_file_md5(src_full_path)
+        if local_md5 == dst_md5:
+            logger.info(f"跳过已更新的文件: {src_path}")
+            return "success"
         if local_md5 != src_md5:
             logger.warning(f"源文件 MD5 不匹配: {src_path} (期望 {src_md5}, 实际 {local_md5})")
             return "failed"
@@ -440,44 +519,253 @@ class IncrementalManager:
 
     def _run_hpatchz(self, krpdiff_path: Path, output_dir: Path, src_path: str) -> bool:
         """运行 hpatchz 应用增量包"""
-        old_dir = Path(tempfile.mkdtemp(prefix="ww_old_"))
+        if platform.system() == "Windows":
+            cmd = [
+                str(self.hpatchz_path),
+                "-f",
+                str(self.game_folder.absolute()) + "/",
+                str(krpdiff_path.absolute()),
+                str(output_dir.absolute()) + "/",
+            ]
+        else:
+            cmd = [
+                "wine",
+                str(self.hpatchz_path),
+                "-f",
+                str(self.game_folder.absolute()) + "/",
+                str(krpdiff_path.absolute()),
+                str(output_dir.absolute()) + "/",
+            ]
+
+        logger.debug(f"Running hpatchz: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+        if result.returncode != 0:
+            logger.error(f"hpatchz 运行失败: {result.stderr}")
+            return False
+
+        return True
+
+    def verify_new_version(self) -> bool:
+        """校验新版本文件状态，用于增量更新后的检查"""
+        download_dir = self.game_folder / ".incremental_download"
+        index_file = download_dir / "indexFile.json"
+
+        if not index_file.exists():
+            logger.error("未找到增量更新的 indexFile.json，请先执行 'ww incremental' 下载")
+            return False
+
         try:
-            src_name = os.path.basename(src_path)
-            src_full_path = self.game_folder / src_path
+            index_data = json.loads(index_file.read_text())
+        except Exception:
+            logger.error("无法解析 indexFile.json")
+            return False
 
-            old_file = old_dir / src_name
-            shutil.copy2(src_full_path, old_file)
+        resources = index_data.get("resource", [])
+        if not resources:
+            logger.error("indexFile.json 中没有 resource 列表")
+            return False
 
-            if platform.system() == "Windows":
-                cmd = [
-                    str(self.hpatchz_path),
-                    "-m",
-                    str(old_dir.absolute()) + "/",
-                    str(krpdiff_path.absolute()),
-                    str(output_dir.absolute()) + "/",
-                ]
-            else:
-                cmd = [
-                    "wine",
-                    str(self.hpatchz_path),
-                    "-m",
-                    str(old_dir.absolute()) + "/",
-                    str(krpdiff_path.absolute()),
-                    str(output_dir.absolute()) + "/",
-                ]
+        game_files = [r for r in resources if not r["dest"].endswith(".krpdiff")]
+        logger.info(f"正在校验 {len(game_files)} 个新版本文件...")
 
-            logger.debug(f"Running hpatchz: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 
-            if result.returncode != 0:
-                logger.error(f"hpatchz 运行失败: {result.stderr}")
-                return False
+        ok_count = 0
+        inconsistent_files = []
+        missing_files = []
 
+        with Progress(
+            TextColumn("[progress.description]{task.description}", justify="left"),
+            BarColumn(bar_width=40),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            TimeRemainingColumn(),
+            expand=True,
+            transient=True,
+        ) as progress:
+            verify_task = progress.add_task("[cyan]校验文件...", total=len(game_files))
+
+            def check_resource(item):
+                dest_path = self.game_folder / item["dest"]
+                expected_md5 = item["md5"]
+                expected_size = int(item["size"])
+
+                status = "ok"
+                if not dest_path.exists():
+                    status = "missing"
+                elif dest_path.stat().st_size != expected_size:
+                    status = "size_mismatch"
+                else:
+                    actual_md5 = _calculate_file_md5(dest_path)
+                    if actual_md5 != expected_md5:
+                        status = "md5_mismatch"
+                return status, item["dest"]
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(check_resource, item): item for item in game_files}
+
+                for future in as_completed(futures):
+                    status, dest = future.result()
+                    progress.advance(verify_task)
+
+                    if status == "ok":
+                        ok_count += 1
+                    elif status == "missing":
+                        missing_files.append(dest)
+                    else:
+                        inconsistent_files.append(dest)
+
+        logger.info(f"校验完成: 正常={ok_count}, 不一致={len(inconsistent_files)}, 缺失={len(missing_files)}")
+
+        if not inconsistent_files and not missing_files:
+            logger.info("所有游戏文件状态正常")
             return True
 
-        finally:
-            if old_dir.exists():
-                shutil.rmtree(old_dir, ignore_errors=True)
+        repair_needed = inconsistent_files + missing_files
+        logger.warning(f"需要修复的游戏文件: {repair_needed}")
+
+        res_base = self._find_resource_base()
+        if not res_base:
+            logger.error("无法获取新版本资源路径")
+            return False
+
+        from urllib.parse import quote
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from rich.progress import BarColumn, DownloadColumn, Progress, TaskID, TextColumn, TimeRemainingColumn, TransferSpeedColumn
+
+        game_res_map = {r["dest"]: r for r in game_files}
+        repair_count = 0
+        fail_count = 0
+        total_size = sum(int(game_res_map[d]["size"]) for d in repair_needed)
+
+        with Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(bar_width=40),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            DownloadColumn(),
+            TransferSpeedColumn(),
+            TimeRemainingColumn(),
+            transient=True,
+        ) as progress:
+            overall_task = progress.add_task("修复文件", total=total_size)
+
+            def download_repair(dest):
+                item = game_res_map.get(dest)
+                if not item:
+                    return False, dest, 0
+                dest_path = self.game_folder / dest
+                expected_md5 = item["md5"]
+                expected_size = int(item["size"])
+                url = f"{self.cdn_base}/{res_base}/{quote(dest, safe='/:')}"
+
+                task_id = progress.add_task(description=f"[cyan]{dest.name[:40]}[/cyan]", total=expected_size)
+
+                try:
+                    headers = {"User-Agent": "WW-Manager/2.0"}
+                    response = requests.get(url, headers=headers, timeout=60, stream=True)
+                    response.raise_for_status()
+
+                    dest_path.parent.mkdir(parents=True, exist_ok=True)
+                    downloaded = 0
+                    with open(dest_path, "wb") as f:
+                        for chunk in response.iter_content(chunk_size=1024 * 256):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            progress.update(task_id, advance=len(chunk))
+
+                    progress.remove_task(task_id)
+
+                    actual_size = dest_path.stat().st_size
+                    if actual_size != expected_size:
+                        logger.error(f"文件大小不匹配: {dest.name}")
+                        dest_path.unlink()
+                        return False, dest, expected_size
+
+                    actual_md5 = _calculate_file_md5(dest_path)
+                    if actual_md5 != expected_md5:
+                        logger.error(f"文件 MD5 不匹配: {dest.name}")
+                        dest_path.unlink()
+                        return False, dest, expected_size
+
+                    return True, dest, expected_size
+
+                except Exception as e:
+                    logger.error(f"下载失败 {dest.name}: {e}")
+                    if dest_path.exists():
+                        dest_path.unlink()
+                    try:
+                        progress.remove_task(task_id)
+                    except Exception:
+                        pass
+                    return False, dest, expected_size
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = {executor.submit(download_repair, d): d for d in repair_needed}
+                for future in as_completed(futures):
+                    success, dest, size = future.result()
+                    if success:
+                        repair_count += 1
+                        logger.info(f"修复成功: {dest}")
+                    else:
+                        fail_count += 1
+                        logger.error(f"修复失败: {dest}")
+                    progress.update(overall_task, advance=size)
+
+        logger.info(f"修复完成: 成功={repair_count}, 失败={fail_count}")
+        return fail_count == 0
+
+    def _find_resource_base(self) -> Optional[str]:
+        """从 indexFile.json 获取资源路径前缀"""
+        download_dir = self.game_folder / ".incremental_download"
+        index_file = download_dir / "indexFile.json"
+        if not index_file.exists():
+            return None
+
+        try:
+            data = json.loads(index_file.read_text())
+            resources = data.get("resource", [])
+            if resources:
+                from_folder = resources[0].get("fromFolder", "")
+                if from_folder:
+                    return from_folder.rstrip("/")
+        except Exception:
+            pass
+
+        return "launcher/game/G152/10003/3.3.0/LwvQueHvaDihmfrFKvPkzsBMsZoMxIAD/zip"
+
+    def _download_and_verify(self, url: str, dest: Path, expected_size: int, expected_md5: str) -> bool:
+        """下载文件并验证 MD5"""
+        try:
+            headers = {"User-Agent": "WW-Manager/2.0"}
+            response = requests.get(url, headers=headers, timeout=60, stream=True)
+            response.raise_for_status()
+
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    f.write(chunk)
+
+            actual_size = dest.stat().st_size
+            if actual_size != expected_size:
+                logger.error(f"文件大小不匹配: {dest.name} (期望 {expected_size}, 实际 {actual_size})")
+                dest.unlink()
+                return False
+
+            actual_md5 = _calculate_file_md5(dest)
+            if actual_md5 != expected_md5:
+                logger.error(f"文件 MD5 不匹配: {dest.name}")
+                dest.unlink()
+                return False
+
+            logger.info(f"修复成功: {dest.name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"下载失败 {dest.name}: {e}")
+            if dest.exists():
+                dest.unlink()
+            return False
 
     def _update_local_version(self, version: str):
         """更新本地版本"""
