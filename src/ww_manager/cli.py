@@ -288,7 +288,7 @@ def incremental(
     apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
 ):
     """
-    增量更新管理（节省约100GB流量）
+    增量更新
 
     需要在新版本预下载开放期间先执行下载，之后在维护时应用。
     """

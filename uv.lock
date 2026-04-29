@@ -554,11 +554,7 @@ wheels = [
 
 [[package]]
 name = "ww-manager"
-<<<<<<< HEAD
-version = "2.1.12b0"
-=======
-version = "2.2.5"
->>>>>>> 4abe6ca (fetch file sizes && modulize download bar)
+version = "2.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
