@@ -18,21 +18,27 @@ import platform
 import shutil
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.request import Request, urlopen
 
 import requests
 from rich.progress import (
     BarColumn,
     DownloadColumn,
     Progress,
+    TaskID,
     TextColumn,
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
 
+from ww_manager.download import RAINBOW_COLORS, NetworkError
+
 logger = logging.getLogger("WW_Manager")
+
 
 HPATCHZ_REPO = "timetetng/wutheringwaves-cli-manager"
 HPATCHZ_VERSION = "hpatchz-v4.8.0"
@@ -112,6 +118,19 @@ def _http_get_json(url: str) -> Optional[Any]:
     except Exception as e:
         logger.error(f"HTTP 请求失败 {url}: {e}")
         return None
+
+
+def _get_krpdiff_size(url: str) -> Optional[int]:
+    """通过 HEAD 请求获取 krpdiff 文件大小"""
+    try:
+        req = Request(url, method="HEAD", headers={"User-Agent": "WW-Manager/2.0"})
+        with urlopen(req, timeout=10) as rsp:
+            cl = rsp.headers.get("Content-Length")
+            if cl:
+                return int(cl)
+    except Exception as e:
+        logger.debug(f"HEAD 请求获取文件大小失败 {url}: {e}")
+    return None
 
 
 def _calculate_file_md5(file_path: Path) -> str:
@@ -277,24 +296,45 @@ class IncrementalManager:
             json.dump(version_info, f, indent=4)
 
         pending_groups = []
+        skipped_groups = []
         total_size = 0
+        pending_size = 0
+
         for group in group_infos:
             krpdiff_name = group.get("dest")
             if not krpdiff_name:
                 continue
             krpdiff_path = download_dir / krpdiff_name
-            if krpdiff_path.exists():
-                logger.info(f"删除旧文件重新下载: {krpdiff_name}")
-                krpdiff_path.unlink()
-            size = self._get_group_size(group)
-            pending_groups.append((group, krpdiff_path))
-            total_size += size
+            krpdiff_url = self._build_krpdiff_url(krpdiff_name)
+
+            expected_size = _get_krpdiff_size(krpdiff_url)
+
+            if krpdiff_path.exists() and expected_size:
+                local_size = krpdiff_path.stat().st_size
+                if local_size == expected_size:
+                    logger.debug(f"跳过已完成的增量包: {krpdiff_name}")
+                    skipped_groups.append(krpdiff_name)
+                    total_size += expected_size
+                    continue
+                elif local_size < expected_size:
+                    logger.info(f"检测到不完整的增量包，将重新下载: {krpdiff_name}")
+                    krpdiff_path.unlink()
+                else:
+                    logger.info(f"文件大小异常，重新下载: {krpdiff_name}")
+                    krpdiff_path.unlink()
+
+            pending_groups.append((group, krpdiff_path, krpdiff_url, expected_size or 0))
+            if expected_size:
+                pending_size += expected_size
+
+        total_size = total_size + pending_size
 
         if not pending_groups:
-            logger.info("所有增量包已下载完成")
+            logger.info(f"所有增量包已下载完成 ({len(skipped_groups)}/{len(group_infos)})")
             return True
 
-        already_downloaded_count = len(group_infos) - len(pending_groups)
+        already_downloaded_count = len(skipped_groups)
+        logger.info(f"待下载: {len(pending_groups)} 个增量包 ({pending_size / 1024 / 1024:.2f} MB)")
 
         progress = Progress(
             TextColumn("[bold blue]{task.description}"),
@@ -303,6 +343,7 @@ class IncrementalManager:
             DownloadColumn(),
             TransferSpeedColumn(),
             TimeRemainingColumn(),
+            expand=True,
             transient=True,
         )
 
@@ -316,15 +357,15 @@ class IncrementalManager:
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {}
-                for group, krpdiff_path in pending_groups:
+                for group, krpdiff_path, krpdiff_url, size in pending_groups:
                     krpdiff_name = group.get("dest")
-                    krpdiff_url = self._build_krpdiff_url(krpdiff_name)
-                    size = self._get_group_size(group)
                     future = executor.submit(
                         self._download_file,
                         krpdiff_url,
                         krpdiff_path,
                         size,
+                        progress,
+                        overall_task,
                     )
                     futures[future] = (krpdiff_name, size)
 
@@ -332,10 +373,9 @@ class IncrementalManager:
                 for future in as_completed(futures):
                     krpdiff_name, size = futures[future]
                     if future.result():
-                        progress.update(overall_task, advance=size)
+                        pass
                     else:
                         failed.append(krpdiff_name)
-                        progress.update(overall_task, advance=size)
 
         if failed:
             logger.error(f"下载失败: {failed}")
@@ -344,26 +384,85 @@ class IncrementalManager:
         logger.info(f"增量包下载完成: {len(group_infos)}/{len(group_infos)}")
         return True
 
-    def _download_file(self, url: str, dest: Path, expected_size: int = 0) -> bool:
-        """下载单个文件"""
-        try:
-            headers = {"User-Agent": "WW-Manager/2.0"}
-            response = requests.get(url, headers=headers, timeout=60, stream=True)
-            response.raise_for_status()
+    def _download_file(
+        self,
+        url: str,
+        dest: Path,
+        expected_size: int,
+        progress: Optional[Progress] = None,
+        overall_task_id: Optional[TaskID] = None,
+    ) -> bool:
+        """下载单个文件，支持断点续传和大小校验，使用 Rich Progress 显示进度"""
+        dest.parent.mkdir(parents=True, exist_ok=True)
 
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            downloaded = 0
-            with open(dest, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 256):
-                    f.write(chunk)
-                    downloaded += len(chunk)
+        task_id = None
+        if progress:
+            task_id = progress.add_task(description=dest.name, total=expected_size)
+            color = RAINBOW_COLORS[task_id % len(RAINBOW_COLORS)]
+            progress.update(task_id, description=f"[{color}]{dest.name}[/{color}]")
 
-            return True
-        except Exception as e:
-            logger.error(f"下载失败 {url}: {e}")
-            if dest.exists():
-                dest.unlink()
-            return False
+        temp_file = dest.with_suffix(dest.suffix + ".temp")
+        headers = {"User-Agent": "WW-Manager/2.0"}
+
+        retries = 3
+        success = False
+
+        for attempt in range(retries):
+            try:
+                resume_byte = 0
+                if temp_file.exists():
+                    resume_byte = temp_file.stat().st_size
+
+                if resume_byte == expected_size:
+                    if progress and task_id is not None:
+                        progress.update(task_id, completed=expected_size)
+                    success = True
+                    break
+
+                if resume_byte > 0:
+                    headers["Range"] = f"bytes={resume_byte}-"
+                    if progress and task_id is not None:
+                        progress.update(task_id, completed=resume_byte)
+
+                mode = "ab" if resume_byte > 0 else "wb"
+
+                req = Request(url, headers=headers)
+                with urlopen(req, timeout=15) as rsp:
+                    if rsp.status not in (200, 206):
+                        raise NetworkError(f"HTTP {rsp.status}")
+
+                    with open(temp_file, mode) as f:
+                        while True:
+                            chunk = rsp.read(1024 * 256)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+
+                            if progress:
+                                chunk_len = len(chunk)
+                                if task_id is not None:
+                                    progress.update(task_id, advance=chunk_len)
+                                if overall_task_id is not None:
+                                    progress.update(overall_task_id, advance=chunk_len)
+
+                if temp_file.stat().st_size == expected_size:
+                    success = True
+                    break
+
+            except Exception as e:
+                if attempt == retries - 1:
+                    if progress:
+                        progress.console.log(f"[red]下载失败 {dest.name}: {e}[/red]")
+                    return False
+                time.sleep(1 + attempt)
+
+        if success:
+            shutil.move(temp_file, dest)
+
+        if progress and task_id is not None:
+            progress.remove_task(task_id)
+
+        return success
 
     def apply_incremental(self) -> bool:
         """应用已下载的增量更新包"""
