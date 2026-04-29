@@ -22,6 +22,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 import requests
@@ -295,6 +296,14 @@ class IncrementalManager:
         with open(download_dir / "version_info.json", "w", encoding="utf-8") as f:
             json.dump(version_info, f, indent=4)
 
+        resources = index_data.get("resource", [])
+        complete_files = [r for r in resources if not r["dest"].endswith(".krpdiff")]
+        res_base = None
+        for r in resources:
+            if r.get("fromFolder"):
+                res_base = r["fromFolder"].rstrip("/")
+                break
+
         pending_groups = []
         skipped_groups = []
         total_size = 0
@@ -329,12 +338,37 @@ class IncrementalManager:
 
         total_size = total_size + pending_size
 
-        if not pending_groups:
+        if complete_files and res_base:
+            complete_tasks = []
+            for item in complete_files:
+                dest_path = self.game_folder / item["dest"]
+                expected_size = int(item["size"])
+                if dest_path.exists() and dest_path.stat().st_size == expected_size:
+                    actual_md5 = _calculate_file_md5(dest_path)
+                    if actual_md5 == item["md5"]:
+                        continue
+                url = f"{self.cdn_base}/{res_base}/{quote(item['dest'], safe='/:')}"
+                complete_tasks.append(
+                    {
+                        "url": url,
+                        "path": dest_path,
+                        "size": expected_size,
+                        "dest": item["dest"],
+                        "md5": item["md5"],
+                    }
+                )
+            if complete_tasks:
+                complete_total = sum(t["size"] for t in complete_tasks)
+                total_size += complete_total
+                logger.info(f"待下载完整文件: {len(complete_tasks)} 个 ({complete_total / 1024 / 1024:.2f} MB)")
+
+        if not pending_groups and not complete_tasks:
             logger.info(f"所有增量包已下载完成 ({len(skipped_groups)}/{len(group_infos)})")
             return True
 
+        if pending_groups:
+            logger.info(f"待下载: {len(pending_groups)} 个增量包 ({pending_size / 1024 / 1024:.2f} MB)")
         already_downloaded_count = len(skipped_groups)
-        logger.info(f"待下载: {len(pending_groups)} 个增量包 ({pending_size / 1024 / 1024:.2f} MB)")
 
         progress = Progress(
             TextColumn("[bold blue]{task.description}"),
@@ -348,6 +382,7 @@ class IncrementalManager:
         )
 
         max_workers = 8
+        failed = []
 
         with progress:
             overall_task = progress.add_task(
@@ -369,19 +404,34 @@ class IncrementalManager:
                     )
                     futures[future] = (krpdiff_name, size)
 
-                failed = []
                 for future in as_completed(futures):
                     krpdiff_name, size = futures[future]
-                    if future.result():
-                        pass
-                    else:
+                    if not future.result():
                         failed.append(krpdiff_name)
+
+                for task in complete_tasks:
+                    future = executor.submit(
+                        self._download_and_verify_complete,
+                        task["url"],
+                        task["path"],
+                        task["size"],
+                        task["md5"],
+                        progress,
+                        overall_task,
+                    )
+                    futures[future] = task["dest"]
+
+                for future in as_completed(futures):
+                    dest = futures[future]
+                    if not future.result() and dest not in failed:
+                        failed.append(dest)
 
         if failed:
             logger.error(f"下载失败: {failed}")
             return False
 
         logger.info(f"增量包下载完成: {len(group_infos)}/{len(group_infos)}")
+
         return True
 
     def _download_file(
@@ -922,6 +972,67 @@ class IncrementalManager:
                 pass
 
         return "launcher/game/G152/10003/3.3.0/LwvQueHvaDihmfrFKvPkzsBMsZoMxIAD/zip"
+
+    def _download_and_verify_complete(
+        self,
+        url: str,
+        dest: Path,
+        expected_size: int,
+        expected_md5: str,
+        progress: Optional[Progress] = None,
+        overall_task_id: Optional[TaskID] = None,
+    ) -> bool:
+        """下载完整文件并验证 MD5，支持进度条"""
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        task_id = None
+        if progress:
+            task_id = progress.add_task(description=dest.name, total=expected_size)
+            color = RAINBOW_COLORS[task_id % len(RAINBOW_COLORS)]
+            progress.update(task_id, description=f"[{color}]{dest.name}[/{color}]")
+
+        temp_file = dest.with_suffix(dest.suffix + ".temp")
+        headers = {"User-Agent": "WW-Manager/2.0"}
+
+        try:
+            response = requests.get(url, headers=headers, timeout=60, stream=True)
+            response.raise_for_status()
+
+            with open(temp_file, "wb") as f:
+                for chunk in response.iter_content(chunk_size=1024 * 256):
+                    f.write(chunk)
+                    if progress and task_id is not None:
+                        chunk_len = len(chunk)
+                        progress.update(task_id, advance=chunk_len)
+                        if overall_task_id is not None:
+                            progress.update(overall_task_id, advance=chunk_len)
+
+            if progress and task_id is not None:
+                progress.remove_task(task_id)
+
+            shutil.move(temp_file, dest)
+
+            actual_size = dest.stat().st_size
+            if actual_size != expected_size:
+                logger.error(f"文件大小不匹配: {dest.name}")
+                dest.unlink()
+                return False
+
+            actual_md5 = _calculate_file_md5(dest)
+            if actual_md5 != expected_md5:
+                logger.error(f"文件 MD5 不匹配: {dest.name}")
+                dest.unlink()
+                return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"下载失败 {dest.name}: {e}")
+            if temp_file.exists():
+                temp_file.unlink()
+            if progress and task_id is not None:
+                progress.remove_task(task_id)
+            return False
 
     def _download_and_verify(self, url: str, dest: Path, expected_size: int, expected_md5: str) -> bool:
         """下载文件并验证 MD5"""
