@@ -1,6 +1,6 @@
 
 <div align="center"><h1>WutheringWaves CLI Manager</h1><h3>鸣潮命令行管理器</h3><div align="center">
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.1-brightgreen.svg" alt="version 2.1">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.2-brightgreen.svg" alt="version 2.2">
 </div>
 </div>
 
@@ -151,7 +151,31 @@ ww predownload --apply
 > 2. **请确保使用和预下载相同的端服合并** ；
 > 3. **当前仅实现全量下载，请确保有足够磁盘空间**。
 
-#### 6\. 获取抽卡记录链接 (`log`)
+#### 6\. 增量更新 (`incremental`)
+**节省约 100GB 流量**。在新版本预下载开放期间提前下载增量包，维护时应用：
+
+```bash
+# 预下载增量包（8 并行下载，显示总进度）
+ww incremental
+
+# 维护时应用增量更新
+ww incremental --apply
+```
+
+> [!CAUTION]
+> 1. **仅在新版本预下载开放期间可用**；
+> 2. **应用前建议运行 `ww sync --new` 检查文件状态**；
+> 3. **如果应用中断，可重试 `ww incremental --apply`**；
+> 4. **支持 cn/global/bilibili 三个服务器**。
+
+#### 7\. 校验新版本文件 (`sync --new`)
+增量更新应用后，校验游戏文件状态并修复不一致的文件：
+
+```bash
+ww sync --new
+```
+
+#### 8\. 获取抽卡记录链接 (`log`)
 
 可以一键获取抽卡链接，用于导入小程序或者鸣潮机器人。
 

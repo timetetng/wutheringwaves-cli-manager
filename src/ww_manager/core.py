@@ -670,3 +670,17 @@ class WGameManager:
         except IncrementalError as e:
             logger.error(f"增量更新应用失败: {e}")
             return False
+
+    def verify_new_version(self) -> bool:
+        """校验新版本文件状态（用于增量更新前检查）"""
+        manager = IncrementalManager(
+            self.game_folder,
+            self.server_type,
+            self.launcher_info,
+            self.cdn_node,
+        )
+        try:
+            return manager.verify_new_version()
+        except IncrementalError as e:
+            logger.error(f"校验失败: {e}")
+            return False

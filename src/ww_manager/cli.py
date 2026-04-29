@@ -226,7 +226,10 @@ def status(ctx: typer.Context):
 
 
 @app.command()
-def sync(ctx: typer.Context):
+def sync(
+    ctx: typer.Context,
+    check_new: Annotated[bool, typer.Option("--new", help="校验并修复新版本文件状态（用于增量更新应用后）")] = False,
+):
     """全量校验并修复文件"""
     path = get_game_path(ctx)
     cfg_file = path / "launcherDownloadConfig.json"
@@ -239,7 +242,12 @@ def sync(ctx: typer.Context):
             pass
     try:
         mgr = WGameManager(path, server)
-        mgr.sync_files(force_check_md5=True)
+        if check_new:
+            success = mgr.verify_new_version()
+            if not success:
+                typer.secho("校验发现问题，请根据提示处理", fg="yellow")
+        else:
+            mgr.sync_files(force_check_md5=True)
     except WWError as e:
         typer.secho(f"执行失败: {e}", fg="red")
         raise typer.Exit(1)
