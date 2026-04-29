@@ -508,8 +508,11 @@ class IncrementalManager:
             logger.warning("没有增量更新组")
             return False
 
+        logger.info(f"开始应用 {len(group_infos)} 个增量包...")
+
         max_workers = min(4, len(group_infos))
         results = {}
+        completed_count = 0
 
         def apply_wrapper(group):
             try:
@@ -518,11 +521,27 @@ class IncrementalManager:
                 logger.error(f"应用增量包异常: {e}")
                 return group.get("dest"), "failed"
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(apply_wrapper, group): group for group in group_infos}
-            for future in as_completed(futures):
-                dest, result = future.result()
-                results[dest] = result
+        from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
+
+        progress = Progress(
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=40),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            TextColumn("({task.completed}/{task.total})"),
+            TimeRemainingColumn(),
+            transient=True,
+        )
+
+        with progress:
+            task_id = progress.add_task("[bold cyan]应用增量包", total=len(group_infos))
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(apply_wrapper, group): group for group in group_infos}
+                for future in as_completed(futures):
+                    dest, result = future.result()
+                    results[dest] = result
+                    completed_count += 1
+                    progress.update(task_id, advance=1, description=f"[bold cyan]应用增量包: {Path(dest).name[:30]}")
 
         success_count = sum(1 for r in results.values() if r == "success")
         skip_count = sum(1 for r in results.values() if r == "skipped")
@@ -560,17 +579,27 @@ class IncrementalManager:
         dst_md5 = dst_file_info["md5"]
 
         src_full_path = self.game_folder / src_path
+        backup_path = src_full_path.with_suffix(src_full_path.suffix + ".bak")
 
-        if not src_full_path.exists():
+        if src_full_path.exists():
+            local_md5 = _calculate_file_md5(src_full_path)
+            if local_md5 == dst_md5:
+                logger.info(f"跳过已更新的文件: {src_path}")
+                return "success"
+            if local_md5 != src_md5:
+                logger.warning(f"源文件 MD5 不匹配: {src_path} (期望 {src_md5}, 实际 {local_md5})")
+                return "failed"
+        elif backup_path.exists():
+            current_md5 = _calculate_file_md5(backup_path)
+            if current_md5 == dst_md5:
+                shutil.move(backup_path, src_full_path)
+                logger.info(f"恢复中断的更新: {src_path}")
+                return "success"
+            elif current_md5 == src_md5:
+                logger.warning(f"检测到中断的更新，备份文件 MD5 不符合预期: {src_path}")
+                return "failed"
+        else:
             logger.warning(f"源文件不存在: {src_path}")
-            return "failed"
-
-        local_md5 = _calculate_file_md5(src_full_path)
-        if local_md5 == dst_md5:
-            logger.info(f"跳过已更新的文件: {src_path}")
-            return "success"
-        if local_md5 != src_md5:
-            logger.warning(f"源文件 MD5 不匹配: {src_path} (期望 {src_md5}, 实际 {local_md5})")
             return "failed"
 
         krpdiff_path = download_dir / krpdiff_name
@@ -604,7 +633,6 @@ class IncrementalManager:
                     logger.error(f"输出文件 MD5 不匹配: {src_path} (期望 {dst_md5}, 实际 {output_md5})")
                     return "failed"
 
-                backup_path = src_full_path.with_suffix(src_full_path.suffix + ".bak")
                 if src_full_path.exists():
                     shutil.move(src_full_path, backup_path)
 
