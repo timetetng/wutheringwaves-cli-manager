@@ -371,7 +371,10 @@ class WGameManager:
 
     def sync_files(self, force_check_md5=False):
         # 确保获取的是当前版本的配置
-        res_base = self.launcher_info["default"]["resourcesBasePath"]
+        default_info = self.launcher_info["default"]
+        res_base = default_info.get("resourcesBasePath") or default_info.get("baseUrl")
+        if not res_base:
+            raise WWError("无法获取资源路径配置 (resourcesBasePath 和 baseUrl 均为空)")
         res_list = self.game_index["resource"]
 
         tasks = []
@@ -460,7 +463,10 @@ class WGameManager:
             raise WWError("当前服务器未开放预下载，或未能获取到预下载配置。")
 
         pre_info = self.launcher_info.get("predownload", {})
-        res_base = pre_info.get("config", {}).get("resourcesBasePath", "")
+        pre_config = pre_info.get("config", {})
+        res_base = pre_config.get("resourcesBasePath") or pre_config.get("baseUrl")
+        if not res_base:
+            raise WWError("无法获取预下载资源路径配置 (resourcesBasePath 和 baseUrl 均为空)")
         res_list = index.get("resource", [])
 
         if not res_list:
