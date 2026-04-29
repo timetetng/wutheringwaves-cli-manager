@@ -554,7 +554,7 @@ wheels = [
 
 [[package]]
 name = "ww-manager"
-version = "2.2.0"
+version = "2.2.9"
 source = { editable = "." }
 dependencies = [
     { name = "certifi" },
