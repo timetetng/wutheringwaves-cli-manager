@@ -158,8 +158,13 @@ class IncrementalManager:
         self._index_file: Optional[Dict] = None
 
     @property
+    def default_config(self) -> Dict:
+        """获取默认配置（始终可用）"""
+        return self.api_data.get("default", {}).get("config", {})
+
+    @property
     def predownload_config(self) -> Dict:
-        """获取预下载配置"""
+        """获取预下载配置（仅在预下载开放期间存在）"""
         return self.api_data.get("predownload", {}).get("config", {})
 
     @property
@@ -181,37 +186,81 @@ class IncrementalManager:
 
         return _http_get_json(index_url)
 
+    def _get_all_patch_configs(self) -> List[Dict]:
+        """获取所有 patchConfig，合并 predownload 和 default 两个来源"""
+        configs = []
+        predownload_configs = self.predownload_config.get("patchConfig", [])
+        if predownload_configs:
+            configs.extend(predownload_configs)
+            logger.debug(f"从 predownload.config 获取 {len(predownload_configs)} 个 patchConfig: "
+                         f"{[p.get('version') for p in predownload_configs[:5]]}...")
+        default_configs = self.default_config.get("patchConfig", [])
+        if default_configs:
+            # 避免重复（以 predownload 的为准）
+            predownload_versions = {p.get("version") for p in predownload_configs}
+            new_from_default = [p for p in default_configs if p.get("version") not in predownload_versions]
+            configs.extend(new_from_default)
+            logger.debug(f"从 default.config 获取 {len(default_configs)} 个 patchConfig，"
+                         f"去重后新增 {len(new_from_default)} 个")
+        return configs
+
     def _find_matching_patch(self) -> Optional[Dict]:
-        """从 patchConfig 中找到匹配当前版本的增量配置"""
-        patch_configs = self.predownload_config.get("patchConfig", [])
+        """从 patchConfig 中找到匹配当前版本的增量配置（合并 predownload 和 default 来源）"""
+        patch_configs = self._get_all_patch_configs()
         if not patch_configs:
+            logger.debug("patchConfig 为空（predownload 和 default 均无 patchConfig）")
             return None
 
         current_version = self.get_current_version()
         if not current_version:
+            logger.debug("无法获取当前游戏版本（launcherDownloadConfig.json 不存在或无效）")
             return None
 
         for patch in patch_configs:
             if patch.get("version") == current_version:
+                logger.debug(
+                    f"匹配到增量配置: version={current_version}, "
+                    f"indexFile={patch.get('indexFile', 'N/A')[:80]}, "
+                    f"baseUrl={patch.get('baseUrl', 'N/A')}, "
+                    f"size={patch.get('size', 0) / 1024 / 1024:.0f}MB"
+                )
                 return patch
 
+        available = [p.get("version") for p in patch_configs]
+        logger.debug(
+            f"当前版本 {current_version} 不在 {len(available)} 个 patchConfig 中，"
+            f"可用版本范围: {available[0]} ~ {available[-1]}"
+        )
         return None
 
     def _build_index_url(self, patch_info: Dict) -> Optional[str]:
         """构建 indexFile URL"""
         index_file_path = patch_info.get("indexFile")
         if not index_file_path:
+            logger.debug("patch_info 中缺少 indexFile 字段")
             return None
-        return f"{self.cdn_base}/{index_file_path.lstrip('/')}"
+        url = f"{self.cdn_base}/{index_file_path.lstrip('/')}"
+        logger.debug(f"indexFile URL: {url}")
+        return url
 
     def _build_krpdiff_url(self, krpdiff_name: str) -> str:
         """构建 krpdiff 下载 URL"""
         patch_info = self._find_matching_patch()
-        if not patch_info:
-            return f"{self.cdn_base}/resources/{krpdiff_name}"
+        if patch_info:
+            base_url = patch_info.get("baseUrl", "")
+            if base_url:
+                url = f"{self.cdn_base}/{base_url.lstrip('/')}{krpdiff_name}"
+                logger.debug(f"krpdiff URL (patch): {url}")
+                return url
 
-        base_url = patch_info.get("baseUrl", "")
-        return f"{self.cdn_base}/{base_url.lstrip('/')}{krpdiff_name}"
+        # 回退到 default config 的 baseUrl
+        default_base = self.default_config.get("baseUrl", "")
+        if default_base:
+            url = f"{self.cdn_base}/{default_base.lstrip('/')}{krpdiff_name}"
+            logger.debug(f"krpdiff URL (default): {url}")
+            return url
+        logger.debug(f"krpdiff URL (fallback): {self.cdn_base}/resources/{krpdiff_name}")
+        return f"{self.cdn_base}/resources/{krpdiff_name}"
 
     def get_current_version(self) -> Optional[str]:
         """获取当前版本"""
@@ -225,8 +274,8 @@ class IncrementalManager:
         return None
 
     def get_target_version(self) -> str:
-        """获取目标版本"""
-        return self.predownload_config.get("version", "")
+        """获取目标版本（优先 predownload，回退 default）"""
+        return self.predownload_config.get("version") or self.default_config.get("version", "")
 
     def get_group_infos(self) -> List[Dict]:
         """获取 groupInfos 列表"""
@@ -264,7 +313,12 @@ class IncrementalManager:
 
         index_url = self.get_index_url()
         if not index_url:
-            logger.error("无法获取增量更新索引URL（可能预下载尚未开放）")
+            logger.error(
+                "无法获取增量更新索引URL。可能原因：\n"
+                "  1. 当前版本不在 patchConfig 中（版本太旧或太新）\n"
+                "  2. 网络连接异常\n"
+                "  请先运行 'ww sync' 更新到最新版本后再试。"
+            )
             return False
 
         logger.info(f"正在获取增量更新信息: {current_version}")
@@ -303,6 +357,13 @@ class IncrementalManager:
             if r.get("fromFolder"):
                 res_base = r["fromFolder"].rstrip("/")
                 break
+        if not res_base:
+            # 回退到 patch 或 default config 的 baseUrl
+            patch_info = self._find_matching_patch()
+            if patch_info and patch_info.get("baseUrl"):
+                res_base = patch_info["baseUrl"].rstrip("/")
+            elif self.default_config.get("baseUrl"):
+                res_base = self.default_config["baseUrl"].rstrip("/")
 
         pending_groups = []
         skipped_groups = []
@@ -953,7 +1014,7 @@ class IncrementalManager:
         return fail_count == 0
 
     def _find_resource_base(self) -> Optional[str]:
-        """从 indexFile.json 获取资源路径前缀"""
+        """从 indexFile.json 或 API 配置获取资源路径前缀"""
         download_dir = self.game_folder / ".incremental_download"
         index_file = download_dir / "indexFile.json"
         cache_index_file = self.cache_dir / "indexFile.json"
@@ -971,7 +1032,17 @@ class IncrementalManager:
             except Exception:
                 pass
 
-        return "launcher/game/G152/10003/3.3.0/LwvQueHvaDihmfrFKvPkzsBMsZoMxIAD/zip"
+        patch_info = self._find_matching_patch()
+        if patch_info:
+            base_url = patch_info.get("baseUrl", "")
+            if base_url:
+                return base_url.rstrip("/")
+
+        default_base = self.default_config.get("baseUrl", "")
+        if default_base:
+            return default_base.rstrip("/")
+
+        return None
 
     def _download_and_verify_complete(
         self,
@@ -1092,5 +1163,4 @@ class IncrementalManager:
                 cfg_path.write_text(json.dumps(data, indent=4))
                 logger.info(f"本地版本已更新: {new_version}")
             except Exception as e:
-                logger.error(f"更新本地版本失败: {e}")
                 logger.error(f"更新本地版本失败: {e}")
