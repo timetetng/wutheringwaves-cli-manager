@@ -158,8 +158,13 @@ class IncrementalManager:
         self._index_file: Optional[Dict] = None
 
     @property
+    def default_config(self) -> Dict:
+        """获取默认配置（始终可用）"""
+        return self.api_data.get("default", {}).get("config", {})
+
+    @property
     def predownload_config(self) -> Dict:
-        """获取预下载配置"""
+        """获取预下载配置（仅在预下载开放期间存在）"""
         return self.api_data.get("predownload", {}).get("config", {})
 
     @property
@@ -181,37 +186,81 @@ class IncrementalManager:
 
         return _http_get_json(index_url)
 
+    def _get_all_patch_configs(self) -> List[Dict]:
+        """获取所有 patchConfig，合并 predownload 和 default 两个来源"""
+        configs = []
+        predownload_configs = self.predownload_config.get("patchConfig", [])
+        if predownload_configs:
+            configs.extend(predownload_configs)
+            logger.debug(f"从 predownload.config 获取 {len(predownload_configs)} 个 patchConfig: "
+                         f"{[p.get('version') for p in predownload_configs[:5]]}...")
+        default_configs = self.default_config.get("patchConfig", [])
+        if default_configs:
+            # 避免重复（以 predownload 的为准）
+            predownload_versions = {p.get("version") for p in predownload_configs}
+            new_from_default = [p for p in default_configs if p.get("version") not in predownload_versions]
+            configs.extend(new_from_default)
+            logger.debug(f"从 default.config 获取 {len(default_configs)} 个 patchConfig，"
+                         f"去重后新增 {len(new_from_default)} 个")
+        return configs
+
     def _find_matching_patch(self) -> Optional[Dict]:
-        """从 patchConfig 中找到匹配当前版本的增量配置"""
-        patch_configs = self.predownload_config.get("patchConfig", [])
+        """从 patchConfig 中找到匹配当前版本的增量配置（合并 predownload 和 default 来源）"""
+        patch_configs = self._get_all_patch_configs()
         if not patch_configs:
+            logger.debug("patchConfig 为空（predownload 和 default 均无 patchConfig）")
             return None
 
         current_version = self.get_current_version()
         if not current_version:
+            logger.debug("无法获取当前游戏版本（launcherDownloadConfig.json 不存在或无效）")
             return None
 
         for patch in patch_configs:
             if patch.get("version") == current_version:
+                logger.debug(
+                    f"匹配到增量配置: version={current_version}, "
+                    f"indexFile={patch.get('indexFile', 'N/A')[:80]}, "
+                    f"baseUrl={patch.get('baseUrl', 'N/A')}, "
+                    f"size={patch.get('size', 0) / 1024 / 1024:.0f}MB"
+                )
                 return patch
 
+        available = [p.get("version") for p in patch_configs]
+        logger.debug(
+            f"当前版本 {current_version} 不在 {len(available)} 个 patchConfig 中，"
+            f"可用版本范围: {available[0]} ~ {available[-1]}"
+        )
         return None
 
     def _build_index_url(self, patch_info: Dict) -> Optional[str]:
         """构建 indexFile URL"""
         index_file_path = patch_info.get("indexFile")
         if not index_file_path:
+            logger.debug("patch_info 中缺少 indexFile 字段")
             return None
-        return f"{self.cdn_base}/{index_file_path.lstrip('/')}"
+        url = f"{self.cdn_base}/{index_file_path.lstrip('/')}"
+        logger.debug(f"indexFile URL: {url}")
+        return url
 
     def _build_krpdiff_url(self, krpdiff_name: str) -> str:
         """构建 krpdiff 下载 URL"""
         patch_info = self._find_matching_patch()
-        if not patch_info:
-            return f"{self.cdn_base}/resources/{krpdiff_name}"
+        if patch_info:
+            base_url = patch_info.get("baseUrl", "")
+            if base_url:
+                url = f"{self.cdn_base}/{base_url.lstrip('/')}{krpdiff_name}"
+                logger.debug(f"krpdiff URL (patch): {url}")
+                return url
 
-        base_url = patch_info.get("baseUrl", "")
-        return f"{self.cdn_base}/{base_url.lstrip('/')}{krpdiff_name}"
+        # 回退到 default config 的 baseUrl
+        default_base = self.default_config.get("baseUrl", "")
+        if default_base:
+            url = f"{self.cdn_base}/{default_base.lstrip('/')}{krpdiff_name}"
+            logger.debug(f"krpdiff URL (default): {url}")
+            return url
+        logger.debug(f"krpdiff URL (fallback): {self.cdn_base}/resources/{krpdiff_name}")
+        return f"{self.cdn_base}/resources/{krpdiff_name}"
 
     def get_current_version(self) -> Optional[str]:
         """获取当前版本"""
@@ -225,8 +274,8 @@ class IncrementalManager:
         return None
 
     def get_target_version(self) -> str:
-        """获取目标版本"""
-        return self.predownload_config.get("version", "")
+        """获取目标版本（优先 predownload，回退 default）"""
+        return self.predownload_config.get("version") or self.default_config.get("version", "")
 
     def get_group_infos(self) -> List[Dict]:
         """获取 groupInfos 列表"""
@@ -264,7 +313,12 @@ class IncrementalManager:
 
         index_url = self.get_index_url()
         if not index_url:
-            logger.error("无法获取增量更新索引URL（可能预下载尚未开放）")
+            logger.error(
+                "无法获取增量更新索引URL。可能原因：\n"
+                "  1. 当前版本不在 patchConfig 中（版本太旧或太新）\n"
+                "  2. 网络连接异常\n"
+                "  请先运行 'ww sync' 更新到最新版本后再试。"
+            )
             return False
 
         logger.info(f"正在获取增量更新信息: {current_version}")
@@ -303,6 +357,13 @@ class IncrementalManager:
             if r.get("fromFolder"):
                 res_base = r["fromFolder"].rstrip("/")
                 break
+        if not res_base:
+            # 回退到 patch 或 default config 的 baseUrl
+            patch_info = self._find_matching_patch()
+            if patch_info and patch_info.get("baseUrl"):
+                res_base = patch_info["baseUrl"].rstrip("/")
+            elif self.default_config.get("baseUrl"):
+                res_base = self.default_config["baseUrl"].rstrip("/")
 
         pending_groups = []
         skipped_groups = []
@@ -338,8 +399,8 @@ class IncrementalManager:
 
         total_size = total_size + pending_size
 
+        complete_tasks = []
         if complete_files and res_base:
-            complete_tasks = []
             for item in complete_files:
                 dest_path = self.game_folder / item["dest"]
                 expected_size = int(item["size"])
@@ -391,7 +452,7 @@ class IncrementalManager:
             )
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {}
+                patch_futures = {}
                 for group, krpdiff_path, krpdiff_url, size in pending_groups:
                     krpdiff_name = group.get("dest")
                     future = executor.submit(
@@ -402,13 +463,14 @@ class IncrementalManager:
                         progress,
                         overall_task,
                     )
-                    futures[future] = (krpdiff_name, size)
+                    patch_futures[future] = krpdiff_name
 
-                for future in as_completed(futures):
-                    krpdiff_name, size = futures[future]
+                for future in as_completed(patch_futures):
+                    krpdiff_name = patch_futures[future]
                     if not future.result():
                         failed.append(krpdiff_name)
 
+                complete_futures = {}
                 for task in complete_tasks:
                     future = executor.submit(
                         self._download_and_verify_complete,
@@ -419,10 +481,10 @@ class IncrementalManager:
                         progress,
                         overall_task,
                     )
-                    futures[future] = task["dest"]
+                    complete_futures[future] = task["dest"]
 
-                for future in as_completed(futures):
-                    dest = futures[future]
+                for future in as_completed(complete_futures):
+                    dest = complete_futures[future]
                     if not future.result() and dest not in failed:
                         failed.append(dest)
 
@@ -611,8 +673,8 @@ class IncrementalManager:
 
         success_count = sum(1 for r in results.values() if r == "success")
         skip_count = sum(1 for r in results.values() if r == "skipped")
-        fail_count = sum(1 for r in results.values() if r == "failed")
-        failed_groups = [dest for dest, r in results.items() if r == "failed"]
+        fail_count = sum(1 for r in results.values() if r in ("failed", "partial_failed"))
+        failed_groups = [dest for dest, r in results.items() if r in ("failed", "partial_failed")]
 
         logger.info(
             f"增量更新应用完成: 成功={success_count}, 跳过={skip_count}, "
@@ -620,8 +682,8 @@ class IncrementalManager:
         )
 
         if fail_count > 0:
-            logger.warning(f"失败文件: {failed_groups}")
-            logger.warning(f"有 {fail_count} 个增量包应用失败。请运行 'ww sync' 修复。")
+            logger.warning(f"失败组: {failed_groups}")
+            logger.warning(f"有 {fail_count} 个增量包应用存在失败。请运行 'ww sync' 修复。")
             return False
 
         saved_index = self.cache_dir / "indexFile.json"
@@ -645,36 +707,65 @@ class IncrementalManager:
         if not krpdiff_name or not src_files or not dst_files:
             return krpdiff_name, "failed"
 
-        src_file_info = src_files[0]
-        dst_file_info = dst_files[0]
-
-        src_path = src_file_info["dest"]
-        src_md5 = src_file_info["md5"]
-        dst_md5 = dst_file_info["md5"]
-
-        src_full_path = self.game_folder / src_path
-        backup_path = src_full_path.with_suffix(src_full_path.suffix + ".bak")
-
-        if src_full_path.exists():
-            local_md5 = _calculate_file_md5(src_full_path)
-            if local_md5 == dst_md5:
-                log_info(f"跳过已更新的文件: {src_path}")
+        # 检查是否所有 dst 文件都已经是最新版本（跳过已完成的分组）
+        dst_by_md5 = {d["md5"]: d for d in dst_files}
+        all_dst_done = True
+        for dst_info in dst_files:
+            dst_full = self.game_folder / dst_info["dest"]
+            if not dst_full.exists() or dst_full.stat().st_size != int(dst_info["size"]):
+                all_dst_done = False
+                break
+        if all_dst_done:
+            # 大小匹配，抽样第一个文件做 MD5 确认
+            first_dst_full = self.game_folder / dst_files[0]["dest"]
+            if _calculate_file_md5(first_dst_full) == dst_files[0]["md5"]:
+                log_info(f"所有文件已为目标版本，跳过 {len(dst_files)} 个文件")
                 return krpdiff_name, "success"
-            if local_md5 != src_md5:
-                log_warning(f"源文件 MD5 不匹配: {src_path} (期望 {src_md5}, 实际 {local_md5})")
-                return krpdiff_name, "failed"
+
+        # 检查第一个源文件的状态（决定运行 hpatchz 还是回退下载）
+        first_src = src_files[0]
+        first_src_path = first_src["dest"]
+        first_src_md5 = first_src["md5"]
+        first_src_full = self.game_folder / first_src_path
+        backup_path = first_src_full.with_suffix(first_src_full.suffix + ".bak")
+
+        # 只计算一次 MD5，缓存复用
+        first_local_md5 = None
+        if first_src_full.exists():
+            first_local_md5 = _calculate_file_md5(first_src_full)
         elif backup_path.exists():
-            current_md5 = _calculate_file_md5(backup_path)
-            if current_md5 == dst_md5:
-                shutil.move(backup_path, src_full_path)
-                log_info(f"恢复中断的更新: {src_path}")
-                return krpdiff_name, "success"
-            elif current_md5 == src_md5:
-                log_warning(f"检测到中断的更新，备份文件 MD5 不符合预期: {src_path}")
-                return krpdiff_name, "failed"
-        else:
-            log_warning(f"源文件不存在: {src_path}")
+            first_local_md5 = _calculate_file_md5(backup_path)
+
+        if first_local_md5 is None:
+            # 源文件不存在，回退下载所有 dst 文件
+            logger.debug(f"源文件不存在: {first_src_path}, 回退下载 {len(dst_files)} 个文件")
+            failed_count = 0
+            for dst_info in dst_files:
+                dst_path = self.game_folder / dst_info["dest"]
+                if not self._download_full_file(dst_info, dst_path):
+                    failed_count += 1
+                    log_error(f"下载失败: {dst_info['dest']}")
+                else:
+                    log_info(f"下载成功: {dst_info['dest']}")
+            return krpdiff_name, "failed" if failed_count > 0 else "success"
+
+        # 检查 MD5：必须是 src 版本或已经是 dst 版本
+        if first_local_md5 in dst_by_md5:
+            # 已经是目标版本，但其他 dst 文件可能缺失（多文件 group 场景）
+            # 仍需运行 hpatchz 来生成其他输出文件
+            pass
+        elif first_local_md5 != first_src_md5:
+            log_warning(
+                f"源文件 MD5 不匹配: {first_src_path} "
+                f"(期望 {first_src_md5[:16]}... 或 dst MD5, 实际 {first_local_md5[:16]}...)"
+            )
             return krpdiff_name, "failed"
+
+        # 从备份恢复
+        if backup_path.exists() and not first_src_full.exists():
+            shutil.move(backup_path, first_src_full)
+            log_info(f"恢复中断的更新: {first_src_path}")
+            first_local_md5 = _calculate_file_md5(first_src_full)
 
         krpdiff_path = download_dir / krpdiff_name
         if not krpdiff_path.exists():
@@ -689,34 +780,71 @@ class IncrementalManager:
                 output_dir = Path(temp_dir) / "output"
                 output_dir.mkdir(parents=True, exist_ok=True)
 
-                if not self._run_hpatchz(krpdiff_path, output_dir, src_path):
-                    log_warning(f"hpatchz 应用失败，尝试下载完整文件: {src_path}")
-                    if not self._download_full_file(dst_file_info, src_full_path):
-                        log_error(f"应用增量包失败: {krpdiff_name}")
+                if not self._run_hpatchz(krpdiff_path, output_dir, first_src_path):
+                    log_warning(f"hpatchz 应用失败，回退到完整下载: {first_src_path} 等 {len(dst_files)} 个文件")
+                    failed_count = 0
+                    for dst_info in dst_files:
+                        dst_path = self.game_folder / dst_info["dest"]
+                        if not self._download_full_file(dst_info, dst_path):
+                            failed_count += 1
+                            log_error(f"下载失败: {dst_info['dest']}")
+                        else:
+                            log_info(f"下载成功: {dst_info['dest']}")
+                    if failed_count > 0:
                         return krpdiff_name, "failed"
                     return krpdiff_name, "success"
 
-                output_file = output_dir / src_path
+                # hpatchz 成功，验证并移动所有输出文件
+                success_count = 0
+                fail_count = 0
+                for dst_info in dst_files:
+                    dst_rel_path = dst_info["dest"]
+                    dst_md5 = dst_info["md5"]
+                    output_file = output_dir / dst_rel_path
+                    dst_full_path = self.game_folder / dst_rel_path
 
-                if not output_file.exists():
-                    log_error(f"输出文件未生成: {output_file}")
-                    return krpdiff_name, "failed"
+                    if not output_file.exists():
+                        log_warning(f"输出文件未生成: {dst_rel_path}, 回退下载")
+                        if self._download_full_file(dst_info, dst_full_path):
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                            log_error(f"回退下载也失败: {dst_rel_path}")
+                        continue
 
-                output_md5 = _calculate_file_md5(output_file)
-                if output_md5 != dst_md5:
-                    log_error(f"输出文件 MD5 不匹配: {src_path} (期望 {dst_md5}, 实际 {output_md5})")
-                    return krpdiff_name, "failed"
+                    output_md5 = _calculate_file_md5(output_file)
+                    if output_md5 != dst_md5:
+                        log_warning(f"输出 MD5 不匹配: {dst_rel_path} (期望 {dst_md5[:16]}..., 实际 {output_md5[:16]}...), 回退下载")
+                        output_file.unlink()
+                        if self._download_full_file(dst_info, dst_full_path):
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                            log_error(f"回退下载也失败: {dst_rel_path}")
+                        continue
 
-                if src_full_path.exists():
-                    shutil.move(src_full_path, backup_path)
+                    # 备份旧文件并移动新文件
+                    dst_full_path.parent.mkdir(parents=True, exist_ok=True)
+                    if dst_full_path.exists():
+                        backup = dst_full_path.with_suffix(dst_full_path.suffix + ".bak")
+                        if backup.exists():
+                            backup.unlink()
+                        shutil.move(dst_full_path, backup)
 
-                output_file.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(output_file, src_full_path)
+                    shutil.move(output_file, dst_full_path)
 
-                log_info(f"成功更新: {src_path} -> {output_md5}")
+                    # 清理对应备份
+                    backup = dst_full_path.with_suffix(dst_full_path.suffix + ".bak")
+                    if backup.exists():
+                        backup.unlink()
 
-                if backup_path.exists():
-                    backup_path.unlink()
+                    success_count += 1
+
+                if success_count > 0:
+                    log_info(f"成功更新 {success_count}/{len(dst_files)} 个文件"
+                             f"{' (回退下载 ' + str(fail_count) + ' 个失败)' if fail_count else ''}")
+                if fail_count > 0:
+                    return krpdiff_name, "partial_failed"
 
                 return krpdiff_name, "success"
 
@@ -953,7 +1081,7 @@ class IncrementalManager:
         return fail_count == 0
 
     def _find_resource_base(self) -> Optional[str]:
-        """从 indexFile.json 获取资源路径前缀"""
+        """从 indexFile.json 或 API 配置获取资源路径前缀"""
         download_dir = self.game_folder / ".incremental_download"
         index_file = download_dir / "indexFile.json"
         cache_index_file = self.cache_dir / "indexFile.json"
@@ -971,7 +1099,17 @@ class IncrementalManager:
             except Exception:
                 pass
 
-        return "launcher/game/G152/10003/3.3.0/LwvQueHvaDihmfrFKvPkzsBMsZoMxIAD/zip"
+        patch_info = self._find_matching_patch()
+        if patch_info:
+            base_url = patch_info.get("baseUrl", "")
+            if base_url:
+                return base_url.rstrip("/")
+
+        default_base = self.default_config.get("baseUrl", "")
+        if default_base:
+            return default_base.rstrip("/")
+
+        return None
 
     def _download_and_verify_complete(
         self,
@@ -1092,5 +1230,4 @@ class IncrementalManager:
                 cfg_path.write_text(json.dumps(data, indent=4))
                 logger.info(f"本地版本已更新: {new_version}")
             except Exception as e:
-                logger.error(f"更新本地版本失败: {e}")
                 logger.error(f"更新本地版本失败: {e}")
