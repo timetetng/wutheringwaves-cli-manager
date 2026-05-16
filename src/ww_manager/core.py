@@ -261,7 +261,7 @@ class WGameManager:
         for attempt in range(retries):
             try:
                 resume_byte = 0
-                if temp_file.exists() and temp_file.stat().st_size < expected_size:
+                if temp_file.exists() and temp_file.stat().st_size <= expected_size:
                     resume_byte = temp_file.stat().st_size
 
                 # 如果已完成，更新进度条并跳过
