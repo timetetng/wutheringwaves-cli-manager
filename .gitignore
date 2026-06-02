@@ -19,3 +19,4 @@ test-scripts/
 *.zip
 group_*_output/
 Client/
+scripts/

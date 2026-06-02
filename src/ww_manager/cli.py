@@ -323,7 +323,7 @@ def log(
     try:
         with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
-                if "aki-gm-resources.aki-game.com" in line:
+                if "aki-gm-resources.aki-game.com/aki/gacha/index.html" in line:
                     m = pattern.search(line)
                     if m:
                         found = m.group(0)
