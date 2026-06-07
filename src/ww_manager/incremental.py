@@ -437,6 +437,8 @@ class IncrementalManager:
             elif self.default_config.get("baseUrl"):
                 res_base = self.default_config["baseUrl"].rstrip("/")
 
+        logger.info("正在检查本地增量更新资源缓存...")
+
         pending_groups = []
         skipped_groups = []
         total_size = 0
@@ -529,7 +531,20 @@ class IncrementalManager:
                 total_size += complete_total
                 logger.info(f"待下载完整文件: {len(complete_tasks)} 个 ({complete_total / 1024 / 1024:.2f} MB)")
 
+        if complete_total_count:
+            logger.info(
+                f"本地下载资源检查完成: 增量包 已就绪 {len(skipped_groups)}/{len(group_infos)}, "
+                f"待下载 {len(pending_groups)}; 完整文件 已就绪 {complete_ready_count}/{complete_total_count}, "
+                f"待下载 {len(complete_tasks)}"
+            )
+        else:
+            logger.info(
+                f"本地下载资源检查完成: 增量包 已就绪 {len(skipped_groups)}/{len(group_infos)}, "
+                f"待下载 {len(pending_groups)}"
+            )
+
         if not pending_groups and not complete_tasks:
+            logger.info("无需下载，所有增量更新资源已在本地就绪")
             if complete_total_count:
                 logger.info(
                     f"所有下载资源已就绪: 增量包 {len(skipped_groups)}/{len(group_infos)}, "
