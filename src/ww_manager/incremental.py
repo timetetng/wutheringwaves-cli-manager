@@ -230,16 +230,19 @@ class IncrementalManager:
         predownload_configs = self.predownload_config.get("patchConfig", [])
         if predownload_configs:
             configs.extend(predownload_configs)
-            logger.debug(f"从 predownload.config 获取 {len(predownload_configs)} 个 patchConfig: "
-                         f"{[p.get('version') for p in predownload_configs[:5]]}...")
+            logger.debug(
+                f"从 predownload.config 获取 {len(predownload_configs)} 个 patchConfig: "
+                f"{[p.get('version') for p in predownload_configs[:5]]}..."
+            )
         default_configs = self.default_config.get("patchConfig", [])
         if default_configs:
             # 避免重复（以 predownload 的为准）
             predownload_versions = {p.get("version") for p in predownload_configs}
             new_from_default = [p for p in default_configs if p.get("version") not in predownload_versions]
             configs.extend(new_from_default)
-            logger.debug(f"从 default.config 获取 {len(default_configs)} 个 patchConfig，"
-                         f"去重后新增 {len(new_from_default)} 个")
+            logger.debug(
+                f"从 default.config 获取 {len(default_configs)} 个 patchConfig，去重后新增 {len(new_from_default)} 个"
+            )
         return configs
 
     def _find_matching_patch(self) -> Optional[Dict]:
@@ -458,7 +461,9 @@ class IncrementalManager:
 
             if krpdiff_path.exists() and expected_size:
                 local_size = krpdiff_path.stat().st_size
-                if local_size == expected_size and (not expected_md5 or _calculate_file_md5(krpdiff_path) == expected_md5):
+                if local_size == expected_size and (
+                    not expected_md5 or _calculate_file_md5(krpdiff_path) == expected_md5
+                ):
                     logger.debug(f"跳过已完成的增量包: {krpdiff_name}")
                     skipped_groups.append(krpdiff_name)
                     continue
@@ -484,7 +489,9 @@ class IncrementalManager:
                     temp_size = temp_path.stat().st_size
                     if temp_size < expected_size:
                         resume_size = temp_size
-                    elif temp_size == expected_size and (not expected_md5 or _calculate_file_md5(temp_path) == expected_md5):
+                    elif temp_size == expected_size and (
+                        not expected_md5 or _calculate_file_md5(temp_path) == expected_md5
+                    ):
                         resume_size = temp_size
                     else:
                         logger.info(f"临时增量包大小或 MD5 异常，将重新下载: {krpdiff_name}")
@@ -1056,7 +1063,7 @@ class IncrementalManager:
                 output_dir = Path(temp_dir) / "output"
                 output_dir.mkdir(parents=True, exist_ok=True)
 
-                if not self._run_hpatchz(krpdiff_path, output_dir, first_src_path):
+                if not self._run_hpatchz(krpdiff_path, output_dir, src_files):
                     log_warning(f"hpatchz 应用失败，回退到完整下载: {first_src_path} 等 {len(dst_files)} 个文件")
                     failed_count = 0
                     for dst_info in dst_files:
@@ -1095,8 +1102,10 @@ class IncrementalManager:
                     success_count += 1
 
                 if success_count > 0:
-                    log_info(f"成功缓存 {success_count}/{len(dst_files)} 个文件"
-                             f"{' (回退下载 ' + str(fail_count) + ' 个失败)' if fail_count else ''}")
+                    log_info(
+                        f"成功缓存 {success_count}/{len(dst_files)} 个文件"
+                        f"{' (回退下载 ' + str(fail_count) + ' 个失败)' if fail_count else ''}"
+                    )
                 if fail_count > 0:
                     return krpdiff_name, "partial_failed"
 
@@ -1150,13 +1159,45 @@ class IncrementalManager:
 
         return _safe_replace_file(staged_path, dest_path)
 
-    def _run_hpatchz(self, krpdiff_path: Path, output_dir: Path, src_path: str) -> bool:
-        """运行 hpatchz 应用增量包"""
+    def _run_hpatchz(
+        self,
+        krpdiff_path: Path,
+        output_dir: Path,
+        src_files: List[Dict],
+        temp_olddir: Optional[Path] = None,
+    ) -> bool:
+        """运行 hpatchz 应用增量包
+
+        Args:
+            krpdiff_path: 增量包路径
+            output_dir: 输出目录
+            src_files: 源文件列表（包含 dest 和 md5）
+            temp_olddir: 预创建的临时源文件目录
+        """
+        if temp_olddir is None:
+            # 为当前 group 创建临时源文件目录
+            patch_temp_dir = self.cache_dir / "patch_temp"
+            patch_temp_dir.mkdir(parents=True, exist_ok=True)
+            temp_olddir = patch_temp_dir / f"olddir_{Path(krpdiff_path).stem}"
+            if temp_olddir.exists():
+                shutil.rmtree(temp_olddir)
+            temp_olddir.mkdir(parents=True)
+
+            # 复制所有源文件到临时目录
+            for src_file in src_files:
+                src_rel_path = _resource_rel_path(src_file["dest"])
+                src_full_path = self.game_folder / src_rel_path
+                dst_full_path = temp_olddir / src_rel_path
+
+                if src_full_path.exists():
+                    dst_full_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_full_path, dst_full_path)
+
         if platform.system() == "Windows":
             cmd = [
                 str(self.hpatchz_path),
                 "-f",
-                str(self.game_folder.absolute()) + "/",
+                str(temp_olddir.absolute()) + "/",
                 str(krpdiff_path.absolute()),
                 str(output_dir.absolute()) + "/",
             ]
@@ -1165,7 +1206,7 @@ class IncrementalManager:
                 "wine",
                 str(self.hpatchz_path),
                 "-f",
-                str(self.game_folder.absolute()) + "/",
+                str(temp_olddir.absolute()) + "/",
                 str(krpdiff_path.absolute()),
                 str(output_dir.absolute()) + "/",
             ]
