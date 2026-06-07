@@ -357,6 +357,10 @@ class IncrementalManager:
         """获取完整资源在增量下载目录中的缓存路径"""
         return download_dir / "resources" / _resource_rel_path(dest)
 
+    def _get_staged_patch_path(self, download_dir: Path, dest: str) -> Path:
+        """获取增量包输出或回退下载文件的缓存路径"""
+        return download_dir / "krpdiff_temp" / _resource_rel_path(dest)
+
     def _get_fallback_download_path(self, dest: str) -> Path:
         """获取回退完整下载使用的临时缓存路径"""
         return self.cache_dir / "full_download_temp" / _resource_rel_path(dest)
@@ -784,6 +788,48 @@ class IncrementalManager:
         logger.info(f"完整文件迁移完成: 更新={moved_count}, 已是目标版本={skipped_count}")
         return True
 
+    def _apply_staged_patch_files(self, download_dir: Path) -> bool:
+        """将已校验的增量输出文件统一迁移到游戏目录"""
+        resources = (self.index_file or {}).get("resource", [])
+        complete_dests = {r["dest"] for r in resources if r.get("dest") and not _is_diff_resource(r["dest"])}
+
+        moved_count = 0
+        skipped_count = 0
+        failed = []
+
+        for group in self.get_group_infos():
+            for dst_info in group.get("dstFiles", []):
+                dest = dst_info["dest"]
+                if dest in complete_dests:
+                    # 官方逻辑中普通资源文件优先，patch 输出不覆盖这些完整资源。
+                    continue
+
+                expected_size = int(dst_info["size"])
+                expected_md5 = dst_info["md5"]
+                game_path = self.game_folder / _resource_rel_path(dest)
+                staged_path = self._get_staged_patch_path(download_dir, dest)
+
+                if self._is_file_verified(game_path, expected_size, expected_md5):
+                    skipped_count += 1
+                    continue
+
+                if not self._is_file_verified(staged_path, expected_size, expected_md5):
+                    logger.error(f"增量输出缓存缺失或校验失败: {dest}")
+                    failed.append(dest)
+                    continue
+
+                if _safe_replace_file(staged_path, game_path):
+                    moved_count += 1
+                else:
+                    failed.append(dest)
+
+        if failed:
+            logger.error(f"增量输出迁移失败: {failed}")
+            return False
+
+        logger.info(f"增量输出迁移完成: 更新={moved_count}, 已是目标版本={skipped_count}")
+        return True
+
     def apply_incremental(self) -> bool:
         """应用已下载的增量更新包"""
         is_ok, error_msg = check_hpatchz_requirements()
@@ -830,7 +876,6 @@ class IncrementalManager:
 
         logger.info(f"开始应用 {len(group_infos)} 个增量包...预计 5-10 分钟，请勿中断进程")
 
-        max_workers = min(4, len(group_infos))
         results = {}
 
         def apply_wrapper(group):
@@ -865,7 +910,7 @@ class IncrementalManager:
         with progress:
             task_id = progress.add_task("[bold cyan]应用增量包", total=len(group_infos))
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            with ThreadPoolExecutor(max_workers=min(4, len(group_infos))) as executor:
                 futures = {executor.submit(apply_wrapper, group): group for group in group_infos}
                 for future in as_completed(futures):
                     dest, result, log_messages = future.result()
@@ -892,6 +937,10 @@ class IncrementalManager:
         if fail_count > 0:
             logger.warning(f"失败组: {failed_groups}")
             logger.warning(f"有 {fail_count} 个增量包应用存在失败。请运行 'ww sync' 修复。")
+            return False
+
+        if not self._apply_staged_patch_files(download_dir):
+            logger.warning("增量输出迁移失败，请运行 'ww sync' 修复。")
             return False
 
         if not self._apply_staged_complete_files(download_dir):
@@ -932,7 +981,7 @@ class IncrementalManager:
             first_dst_full = self.game_folder / _resource_rel_path(dst_files[0]["dest"])
             if _calculate_file_md5(first_dst_full) == dst_files[0]["md5"]:
                 log_info(f"所有文件已为目标版本，跳过 {len(dst_files)} 个文件")
-                return krpdiff_name, "success"
+                return krpdiff_name, "skipped"
 
         # 检查第一个源文件的状态（决定运行 hpatchz 还是回退下载）
         first_src = src_files[0]
@@ -953,12 +1002,12 @@ class IncrementalManager:
             logger.debug(f"源文件不存在: {first_src_path}, 回退下载 {len(dst_files)} 个文件")
             failed_count = 0
             for dst_info in dst_files:
-                dst_path = self.game_folder / dst_info["dest"]
-                if not self._download_full_file(dst_info, dst_path):
+                staged_path = self._get_staged_patch_path(download_dir, dst_info["dest"])
+                if not self._download_full_file_to_stage(dst_info, staged_path):
                     failed_count += 1
                     log_error(f"下载失败: {dst_info['dest']}")
                 else:
-                    log_info(f"下载成功: {dst_info['dest']}")
+                    log_info(f"已缓存完整文件: {dst_info['dest']}")
             return krpdiff_name, "failed" if failed_count > 0 else "success"
 
         # 检查 MD5：必须是 src 版本或已经是 dst 版本
@@ -996,64 +1045,42 @@ class IncrementalManager:
                     log_warning(f"hpatchz 应用失败，回退到完整下载: {first_src_path} 等 {len(dst_files)} 个文件")
                     failed_count = 0
                     for dst_info in dst_files:
-                        dst_path = self.game_folder / dst_info["dest"]
-                        if not self._download_full_file(dst_info, dst_path):
+                        staged_path = self._get_staged_patch_path(download_dir, dst_info["dest"])
+                        if not self._download_full_file_to_stage(dst_info, staged_path):
                             failed_count += 1
                             log_error(f"下载失败: {dst_info['dest']}")
                         else:
-                            log_info(f"下载成功: {dst_info['dest']}")
+                            log_info(f"已缓存完整文件: {dst_info['dest']}")
                     if failed_count > 0:
                         return krpdiff_name, "failed"
                     return krpdiff_name, "success"
 
-                # hpatchz 成功，验证并移动所有输出文件
+                # hpatchz 成功，缓存所有输出文件，最后统一校验并迁移到游戏目录
                 success_count = 0
                 fail_count = 0
                 for dst_info in dst_files:
                     dst_rel_path = dst_info["dest"]
-                    dst_md5 = dst_info["md5"]
-                    output_file = output_dir / dst_rel_path
-                    dst_full_path = self.game_folder / dst_rel_path
+                    output_file = output_dir / _resource_rel_path(dst_rel_path)
+                    staged_path = self._get_staged_patch_path(download_dir, dst_rel_path)
 
                     if not output_file.exists():
                         log_warning(f"输出文件未生成: {dst_rel_path}, 回退下载")
-                        if self._download_full_file(dst_info, dst_full_path):
+                        if self._download_full_file_to_stage(dst_info, staged_path):
                             success_count += 1
                         else:
                             fail_count += 1
                             log_error(f"回退下载也失败: {dst_rel_path}")
                         continue
 
-                    output_md5 = _calculate_file_md5(output_file)
-                    if output_md5 != dst_md5:
-                        log_warning(f"输出 MD5 不匹配: {dst_rel_path} (期望 {dst_md5[:16]}..., 实际 {output_md5[:16]}...), 回退下载")
-                        output_file.unlink()
-                        if self._download_full_file(dst_info, dst_full_path):
-                            success_count += 1
-                        else:
-                            fail_count += 1
-                            log_error(f"回退下载也失败: {dst_rel_path}")
-                        continue
-
-                    # 备份旧文件并移动新文件
-                    dst_full_path.parent.mkdir(parents=True, exist_ok=True)
-                    if dst_full_path.exists():
-                        backup = dst_full_path.with_suffix(dst_full_path.suffix + ".bak")
-                        if backup.exists():
-                            backup.unlink()
-                        shutil.move(dst_full_path, backup)
-
-                    shutil.move(output_file, dst_full_path)
-
-                    # 清理对应备份
-                    backup = dst_full_path.with_suffix(dst_full_path.suffix + ".bak")
-                    if backup.exists():
-                        backup.unlink()
+                    staged_path.parent.mkdir(parents=True, exist_ok=True)
+                    if staged_path.exists():
+                        staged_path.unlink()
+                    shutil.move(output_file, staged_path)
 
                     success_count += 1
 
                 if success_count > 0:
-                    log_info(f"成功更新 {success_count}/{len(dst_files)} 个文件"
+                    log_info(f"成功缓存 {success_count}/{len(dst_files)} 个文件"
                              f"{' (回退下载 ' + str(fail_count) + ' 个失败)' if fail_count else ''}")
                 if fail_count > 0:
                     return krpdiff_name, "partial_failed"
@@ -1062,6 +1089,25 @@ class IncrementalManager:
 
         finally:
             pass
+
+    def _download_full_file_to_stage(self, dst_info: Dict, staged_path: Path) -> bool:
+        """下载完整文件到指定缓存路径，不直接修改游戏目录"""
+        dest = dst_info["dest"]
+        expected_md5 = dst_info["md5"]
+        expected_size = int(dst_info["size"])
+
+        if self._is_file_verified(staged_path, expected_size, expected_md5):
+            return True
+        if staged_path.exists():
+            staged_path.unlink()
+
+        url = self._build_resource_url(dst_info)
+        if not url:
+            logger.error("无法获取资源路径")
+            return False
+
+        logger.info(f"下载完整文件到缓存: {dest}")
+        return self._download_and_verify(url, staged_path, expected_size, expected_md5)
 
     def _download_full_file(self, dst_info: Dict, dest_path: Path) -> bool:
         """下载完整文件作为 hpatchz 失败的回退方案，先写入缓存再替换游戏文件"""
