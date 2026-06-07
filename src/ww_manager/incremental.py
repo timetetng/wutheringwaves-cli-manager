@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 from urllib.request import Request, urlopen
@@ -141,6 +141,50 @@ def _calculate_file_md5(file_path: Path) -> str:
         for chunk in iter(lambda: f.read(4096 * 1024), b""):
             hash_md5.update(chunk)
     return hash_md5.hexdigest()
+
+
+def _is_diff_resource(dest: str) -> bool:
+    """判断资源路径是否是官方增量差分文件"""
+    return dest.lower().endswith((".krdiff", ".krpdiff"))
+
+
+def _resource_rel_path(dest: str) -> Path:
+    """将资源 dest 转为相对路径，避免意外的绝对路径拼接"""
+    normalized = dest.replace("\\", "/").lstrip("/")
+    rel_path = PurePosixPath(normalized)
+    if not normalized or ".." in rel_path.parts or (rel_path.parts and rel_path.parts[0].endswith(":")):
+        raise IncrementalError(f"非法资源路径: {dest}")
+    return Path(*rel_path.parts)
+
+
+def _backup_path(path: Path) -> Path:
+    """获取替换文件时使用的备份路径"""
+    return path.with_suffix(path.suffix + ".bak")
+
+
+def _safe_replace_file(src: Path, dest: Path) -> bool:
+    """用已校验文件替换目标文件，失败时尽量恢复原文件"""
+    backup = _backup_path(dest)
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if backup.exists():
+            backup.unlink()
+        if dest.exists():
+            shutil.move(dest, backup)
+        shutil.move(src, dest)
+        if backup.exists():
+            backup.unlink()
+        return True
+    except Exception as e:
+        logger.error(f"替换文件失败: {dest} ({e})")
+        try:
+            if dest.exists() and backup.exists():
+                dest.unlink()
+            if backup.exists() and not dest.exists():
+                shutil.move(backup, dest)
+        except Exception as restore_error:
+            logger.error(f"恢复备份失败: {dest} ({restore_error})")
+        return False
 
 
 class IncrementalManager:
@@ -299,6 +343,40 @@ class IncrementalManager:
             return dst_files[0].get("size", 0)
         return 0
 
+    def _get_resource_base_for_item(self, item: Dict, fallback_base: Optional[str] = None) -> Optional[str]:
+        """获取单个资源文件的下载路径前缀，优先使用资源自己的 fromFolder"""
+        item_base = item.get("fromFolder")
+        if item_base:
+            return item_base.rstrip("/")
+        if fallback_base:
+            return fallback_base.rstrip("/")
+        return self._find_resource_base()
+
+    def _build_resource_url(self, item: Dict, fallback_base: Optional[str] = None) -> Optional[str]:
+        """构建完整资源文件下载 URL"""
+        res_base = self._get_resource_base_for_item(item, fallback_base)
+        if not res_base:
+            return None
+        return f"{self.cdn_base}/{res_base}/{quote(item['dest'], safe='/:')}"
+
+    def _get_staged_complete_path(self, download_dir: Path, dest: str) -> Path:
+        """获取完整资源在增量下载目录中的缓存路径"""
+        return download_dir / "resources" / _resource_rel_path(dest)
+
+    def _get_fallback_download_path(self, dest: str) -> Path:
+        """获取回退完整下载使用的临时缓存路径"""
+        return self.cache_dir / "full_download_temp" / _resource_rel_path(dest)
+
+    def _get_repair_download_path(self, dest: str) -> Path:
+        """获取校验修复下载使用的临时缓存路径"""
+        return self.cache_dir / "repair_download_temp" / _resource_rel_path(dest)
+
+    def _is_file_verified(self, path: Path, expected_size: int, expected_md5: str) -> bool:
+        """检查本地文件是否符合预期大小和 MD5"""
+        if not path.exists() or path.stat().st_size != expected_size:
+            return False
+        return _calculate_file_md5(path) == expected_md5
+
     def download_incremental(self) -> bool:
         """下载增量更新包"""
         is_ok, error_msg = check_hpatchz_requirements()
@@ -351,7 +429,7 @@ class IncrementalManager:
             json.dump(version_info, f, indent=4)
 
         resources = index_data.get("resource", [])
-        complete_files = [r for r in resources if not r["dest"].endswith(".krpdiff")]
+        complete_files = [r for r in resources if not _is_diff_resource(r["dest"])]
         res_base = None
         for r in resources:
             if r.get("fromFolder"):
@@ -374,7 +452,7 @@ class IncrementalManager:
             krpdiff_name = group.get("dest")
             if not krpdiff_name:
                 continue
-            krpdiff_path = download_dir / krpdiff_name
+            krpdiff_path = download_dir / _resource_rel_path(krpdiff_name)
             krpdiff_url = self._build_krpdiff_url(krpdiff_name)
 
             expected_size = _get_krpdiff_size(krpdiff_url)
@@ -400,22 +478,32 @@ class IncrementalManager:
         total_size = total_size + pending_size
 
         complete_tasks = []
-        if complete_files and res_base:
+        if complete_files:
             for item in complete_files:
-                dest_path = self.game_folder / item["dest"]
                 expected_size = int(item["size"])
-                if dest_path.exists() and dest_path.stat().st_size == expected_size:
-                    actual_md5 = _calculate_file_md5(dest_path)
-                    if actual_md5 == item["md5"]:
-                        continue
-                url = f"{self.cdn_base}/{res_base}/{quote(item['dest'], safe='/:')}"
+                expected_md5 = item["md5"]
+                game_path = self.game_folder / _resource_rel_path(item["dest"])
+                staged_path = self._get_staged_complete_path(download_dir, item["dest"])
+
+                if self._is_file_verified(game_path, expected_size, expected_md5):
+                    continue
+                if self._is_file_verified(staged_path, expected_size, expected_md5):
+                    continue
+                if staged_path.exists():
+                    logger.info(f"缓存完整文件校验失败，将重新下载: {item['dest']}")
+                    staged_path.unlink()
+
+                url = self._build_resource_url(item, res_base)
+                if not url:
+                    logger.error(f"无法构建完整文件下载 URL: {item['dest']}")
+                    return False
                 complete_tasks.append(
                     {
                         "url": url,
-                        "path": dest_path,
+                        "path": staged_path,
                         "size": expected_size,
                         "dest": item["dest"],
-                        "md5": item["md5"],
+                        "md5": expected_md5,
                     }
                 )
             if complete_tasks:
@@ -576,6 +664,45 @@ class IncrementalManager:
 
         return success
 
+    def _apply_staged_complete_files(self, download_dir: Path) -> bool:
+        """将下载阶段缓存的完整资源文件迁移到游戏目录"""
+        resources = (self.index_file or {}).get("resource", [])
+        complete_files = [r for r in resources if not _is_diff_resource(r["dest"])]
+        if not complete_files:
+            return True
+
+        moved_count = 0
+        skipped_count = 0
+        failed = []
+
+        for item in complete_files:
+            dest = item["dest"]
+            expected_size = int(item["size"])
+            expected_md5 = item["md5"]
+            game_path = self.game_folder / _resource_rel_path(dest)
+            staged_path = self._get_staged_complete_path(download_dir, dest)
+
+            if self._is_file_verified(game_path, expected_size, expected_md5):
+                skipped_count += 1
+                continue
+
+            if not self._is_file_verified(staged_path, expected_size, expected_md5):
+                logger.error(f"完整文件缓存缺失或校验失败: {dest}")
+                failed.append(dest)
+                continue
+
+            if _safe_replace_file(staged_path, game_path):
+                moved_count += 1
+            else:
+                failed.append(dest)
+
+        if failed:
+            logger.error(f"完整文件迁移失败: {failed}")
+            return False
+
+        logger.info(f"完整文件迁移完成: 更新={moved_count}, 已是目标版本={skipped_count}")
+        return True
+
     def apply_incremental(self) -> bool:
         """应用已下载的增量更新包"""
         is_ok, error_msg = check_hpatchz_requirements()
@@ -686,6 +813,10 @@ class IncrementalManager:
             logger.warning(f"有 {fail_count} 个增量包应用存在失败。请运行 'ww sync' 修复。")
             return False
 
+        if not self._apply_staged_complete_files(download_dir):
+            logger.warning("完整文件迁移失败，请运行 'ww sync' 修复。")
+            return False
+
         saved_index = self.cache_dir / "indexFile.json"
         if index_file.exists():
             shutil.copy2(index_file, saved_index)
@@ -711,13 +842,13 @@ class IncrementalManager:
         dst_by_md5 = {d["md5"]: d for d in dst_files}
         all_dst_done = True
         for dst_info in dst_files:
-            dst_full = self.game_folder / dst_info["dest"]
+            dst_full = self.game_folder / _resource_rel_path(dst_info["dest"])
             if not dst_full.exists() or dst_full.stat().st_size != int(dst_info["size"]):
                 all_dst_done = False
                 break
         if all_dst_done:
             # 大小匹配，抽样第一个文件做 MD5 确认，避免在跳过路径上重复校验所有 dstFiles。
-            first_dst_full = self.game_folder / dst_files[0]["dest"]
+            first_dst_full = self.game_folder / _resource_rel_path(dst_files[0]["dest"])
             if _calculate_file_md5(first_dst_full) == dst_files[0]["md5"]:
                 log_info(f"所有文件已为目标版本，跳过 {len(dst_files)} 个文件")
                 return krpdiff_name, "success"
@@ -726,8 +857,8 @@ class IncrementalManager:
         first_src = src_files[0]
         first_src_path = first_src["dest"]
         first_src_md5 = first_src["md5"]
-        first_src_full = self.game_folder / first_src_path
-        backup_path = first_src_full.with_suffix(first_src_full.suffix + ".bak")
+        first_src_full = self.game_folder / _resource_rel_path(first_src_path)
+        backup_path = _backup_path(first_src_full)
 
         # 只计算一次 MD5，缓存复用
         first_local_md5 = None
@@ -767,7 +898,7 @@ class IncrementalManager:
             log_info(f"恢复中断的更新: {first_src_path}")
             first_local_md5 = _calculate_file_md5(first_src_full)
 
-        krpdiff_path = download_dir / krpdiff_name
+        krpdiff_path = download_dir / _resource_rel_path(krpdiff_name)
         if not krpdiff_path.exists():
             log_error(f"增量包不存在: {krpdiff_name}")
             return krpdiff_name, "failed"
@@ -852,22 +983,30 @@ class IncrementalManager:
             pass
 
     def _download_full_file(self, dst_info: Dict, dest_path: Path) -> bool:
-        """下载完整文件作为 hpatchz 失败的回退方案"""
+        """下载完整文件作为 hpatchz 失败的回退方案，先写入缓存再替换游戏文件"""
         dest = dst_info["dest"]
         expected_md5 = dst_info["md5"]
         expected_size = int(dst_info["size"])
 
-        res_base = self._find_resource_base()
-        if not res_base:
+        if self._is_file_verified(dest_path, expected_size, expected_md5):
+            logger.info(f"完整文件已是目标版本: {dest}")
+            return True
+
+        url = self._build_resource_url(dst_info)
+        if not url:
             logger.error("无法获取资源路径")
             return False
 
-        from urllib.parse import quote
-
-        url = f"{self.cdn_base}/{res_base}/{quote(dest, safe='/:')}"
+        staged_path = self._get_fallback_download_path(dest)
+        if staged_path.exists() and not self._is_file_verified(staged_path, expected_size, expected_md5):
+            staged_path.unlink()
 
         logger.info(f"下载完整文件: {dest}")
-        return self._download_and_verify(url, dest_path, expected_size, expected_md5)
+        if not self._is_file_verified(staged_path, expected_size, expected_md5):
+            if not self._download_and_verify(url, staged_path, expected_size, expected_md5):
+                return False
+
+        return _safe_replace_file(staged_path, dest_path)
 
     def _run_hpatchz(self, krpdiff_path: Path, output_dir: Path, src_path: str) -> bool:
         """运行 hpatchz 应用增量包"""
@@ -921,7 +1060,7 @@ class IncrementalManager:
             logger.error("indexFile.json 中没有 resource 列表")
             return False
 
-        game_files = [r for r in resources if not r["dest"].endswith(".krpdiff")]
+        game_files = [r for r in resources if not _is_diff_resource(r["dest"])]
         logger.info(f"正在校验 {len(game_files)} 个新版本文件...")
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -943,7 +1082,7 @@ class IncrementalManager:
             verify_task = progress.add_task("[cyan]校验文件...", total=len(game_files))
 
             def check_resource(item):
-                dest_path = self.game_folder / item["dest"]
+                dest_path = self.game_folder / _resource_rel_path(item["dest"])
                 expected_md5 = item["md5"]
                 expected_size = int(item["size"])
 
@@ -984,11 +1123,9 @@ class IncrementalManager:
 
         res_base = self._find_resource_base()
         if not res_base:
-            logger.error("无法获取新版本资源路径")
-            return False
+            logger.warning("无法获取全局新版本资源路径，将尝试使用单个资源的 fromFolder")
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        from urllib.parse import quote
 
         from rich.progress import (
             BarColumn,
@@ -1019,46 +1156,56 @@ class IncrementalManager:
                 item = game_res_map.get(dest)
                 if not item:
                     return False, dest, 0
-                dest_path = self.game_folder / dest
+                final_path = self.game_folder / _resource_rel_path(dest)
+                staged_path = self._get_repair_download_path(dest)
                 expected_md5 = item["md5"]
                 expected_size = int(item["size"])
-                url = f"{self.cdn_base}/{res_base}/{quote(dest, safe='/:')}"
+                file_name = Path(dest).name
 
-                task_id = progress.add_task(description=f"[cyan]{Path(dest).name[:40]}[/cyan]", total=expected_size)
+                if self._is_file_verified(final_path, expected_size, expected_md5):
+                    return True, dest, expected_size
+
+                if staged_path.exists() and not self._is_file_verified(staged_path, expected_size, expected_md5):
+                    staged_path.unlink()
+
+                url = self._build_resource_url(item, res_base)
+                if not url:
+                    logger.error(f"无法构建修复文件下载 URL: {dest}")
+                    return False, dest, expected_size
+
+                task_id = progress.add_task(description=f"[cyan]{file_name[:40]}[/cyan]", total=expected_size)
 
                 try:
-                    headers = {"User-Agent": "WW-Manager/2.0"}
-                    response = requests.get(url, headers=headers, timeout=60, stream=True)
-                    response.raise_for_status()
+                    if not self._is_file_verified(staged_path, expected_size, expected_md5):
+                        headers = {"User-Agent": "WW-Manager/2.0"}
+                        response = requests.get(url, headers=headers, timeout=60, stream=True)
+                        response.raise_for_status()
 
-                    dest_path.parent.mkdir(parents=True, exist_ok=True)
-                    downloaded = 0
-                    with open(dest_path, "wb") as f:
-                        for chunk in response.iter_content(chunk_size=1024 * 256):
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            progress.update(task_id, advance=len(chunk))
+                        staged_path.parent.mkdir(parents=True, exist_ok=True)
+                        with open(staged_path, "wb") as f:
+                            for chunk in response.iter_content(chunk_size=1024 * 256):
+                                f.write(chunk)
+                                progress.update(task_id, advance=len(chunk))
+                    else:
+                        progress.update(task_id, completed=expected_size)
 
                     progress.remove_task(task_id)
 
-                    actual_size = dest_path.stat().st_size
-                    if actual_size != expected_size:
-                        logger.error(f"文件大小不匹配: {dest.name}")
-                        dest_path.unlink()
+                    if not self._is_file_verified(staged_path, expected_size, expected_md5):
+                        logger.error(f"修复文件校验失败: {dest}")
+                        if staged_path.exists():
+                            staged_path.unlink()
                         return False, dest, expected_size
 
-                    actual_md5 = _calculate_file_md5(dest_path)
-                    if actual_md5 != expected_md5:
-                        logger.error(f"文件 MD5 不匹配: {dest.name}")
-                        dest_path.unlink()
+                    if not _safe_replace_file(staged_path, final_path):
                         return False, dest, expected_size
 
                     return True, dest, expected_size
 
                 except Exception as e:
-                    logger.error(f"下载失败 {dest.name}: {e}")
-                    if dest_path.exists():
-                        dest_path.unlink()
+                    logger.error(f"下载失败 {file_name}: {e}")
+                    if staged_path.exists():
+                        staged_path.unlink()
                     try:
                         progress.remove_task(task_id)
                     except Exception:
