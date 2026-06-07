@@ -323,9 +323,9 @@ def incremental(
         else:
             success = mgr.download_incremental()
             if success:
-                typer.secho("增量包下载完成！之后可使用 'ww incremental --apply' 命令应用更新。", fg="green")
+                typer.secho("增量更新资源下载完成！之后可使用 'ww incremental --apply' 命令应用更新。", fg="green")
             else:
-                typer.secho("增量包下载失败", fg="red")
+                typer.secho("增量更新资源下载失败", fg="red")
                 raise typer.Exit(1)
 
     except WWError as e:

@@ -1164,6 +1164,18 @@ class IncrementalManager:
 
         return True
 
+    def _get_cached_target_version(self, download_dir: Path) -> Optional[str]:
+        """从增量下载元信息或 API 配置获取目标版本"""
+        version_file = download_dir / "version_info.json"
+        if version_file.exists():
+            try:
+                target_version = json.loads(version_file.read_text()).get("to_version")
+                if target_version:
+                    return target_version
+            except Exception:
+                pass
+        return self.get_target_version() or None
+
     def verify_new_version(self) -> bool:
         """校验新版本文件状态，用于增量更新后的检查"""
         download_dir = self.game_folder / ".incremental_download"
@@ -1183,11 +1195,26 @@ class IncrementalManager:
             return False
 
         resources = index_data.get("resource", [])
-        if not resources:
-            logger.error("indexFile.json 中没有 resource 列表")
+        group_infos = index_data.get("groupInfos", [])
+        expected_files = {}
+
+        for group in group_infos:
+            for item in group.get("dstFiles", []):
+                dest = item.get("dest")
+                if dest and item.get("md5") and item.get("size") is not None and not _is_diff_resource(dest):
+                    expected_files[dest] = item
+
+        for item in resources:
+            dest = item.get("dest")
+            if dest and item.get("md5") and item.get("size") is not None and not _is_diff_resource(dest):
+                # resource 中的完整资源优先，贴近官方 BugFix File 使用 Resource File 的处理。
+                expected_files[dest] = item
+
+        game_files = list(expected_files.values())
+        if not game_files:
+            logger.error("indexFile.json 中没有可校验的新版本游戏文件")
             return False
 
-        game_files = [r for r in resources if not _is_diff_resource(r["dest"])]
         logger.info(f"正在校验 {len(game_files)} 个新版本文件...")
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1240,9 +1267,11 @@ class IncrementalManager:
 
         logger.info(f"校验完成: 正常={ok_count}, 不一致={len(inconsistent_files)}, 缺失={len(missing_files)}")
 
+        target_version = self._get_cached_target_version(download_dir)
+
         if not inconsistent_files and not missing_files:
             logger.info("所有游戏文件状态正常")
-            self._update_local_version(index_data)
+            self._update_local_version(target_version or index_data)
             return True
 
         repair_needed = inconsistent_files + missing_files
@@ -1352,7 +1381,10 @@ class IncrementalManager:
                     progress.update(overall_task, advance=size)
 
         logger.info(f"修复完成: 成功={repair_count}, 失败={fail_count}")
-        return fail_count == 0
+        if fail_count == 0:
+            self._update_local_version(target_version or index_data)
+            return True
+        return False
 
     def _find_resource_base(self) -> Optional[str]:
         """从 indexFile.json 或 API 配置获取资源路径前缀"""
@@ -1482,13 +1514,15 @@ class IncrementalManager:
     def _update_local_version(self, version_or_data):
         """更新本地版本，可接收版本字符串或 indexFile.json 数据"""
         if isinstance(version_or_data, dict):
-            group_infos = version_or_data.get("groupInfos", [])
-            if not group_infos:
-                logger.warning("无法获取 groupInfos 信息")
-                return
-            krpdiff_name = group_infos[0]["dest"]
-            parts = krpdiff_name.split("_")
-            new_version = parts[1] if len(parts) >= 2 else None
+            new_version = version_or_data.get("version") or version_or_data.get("to_version")
+            if not new_version:
+                group_infos = version_or_data.get("groupInfos", [])
+                if not group_infos:
+                    logger.warning("无法获取 groupInfos 信息")
+                    return
+                krpdiff_name = Path(group_infos[0]["dest"]).stem
+                parts = krpdiff_name.split("_")
+                new_version = parts[1] if len(parts) >= 2 else None
         else:
             new_version = version_or_data
 
