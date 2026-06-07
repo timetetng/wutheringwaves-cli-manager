@@ -9,7 +9,6 @@
 支持 cn、global、bilibili 三个服务器
 """
 
-import gzip
 import hashlib
 import json
 import logging
@@ -107,15 +106,10 @@ def get_hpatchz_path(cache_dir: Path) -> Path:
 def _http_get_json(url: str) -> Optional[Any]:
     """下载并解析 JSON"""
     try:
-        headers = {"User-Agent": "WW-Manager/2.0", "Accept-Encoding": "gzip"}
+        headers = {"User-Agent": "WW-Manager/2.0"}
         response = requests.get(url, headers=headers, timeout=30)
         response.raise_for_status()
-
-        data = response.content
-        if "gzip" in response.headers.get("Content-Encoding", "").lower():
-            data = gzip.decompress(data)
-
-        return json.loads(data)
+        return response.json()
     except Exception as e:
         logger.error(f"HTTP 请求失败 {url}: {e}")
         return None
@@ -293,18 +287,18 @@ class IncrementalManager:
         if patch_info:
             base_url = patch_info.get("baseUrl", "")
             if base_url:
-                url = f"{self.cdn_base}/{base_url.lstrip('/')}{krpdiff_name}"
+                url = f"{self.cdn_base}/{base_url.strip('/')}/{quote(krpdiff_name, safe='/:')}"
                 logger.debug(f"krpdiff URL (patch): {url}")
                 return url
 
         # 回退到 default config 的 baseUrl
         default_base = self.default_config.get("baseUrl", "")
         if default_base:
-            url = f"{self.cdn_base}/{default_base.lstrip('/')}{krpdiff_name}"
+            url = f"{self.cdn_base}/{default_base.strip('/')}/{quote(krpdiff_name, safe='/:')}"
             logger.debug(f"krpdiff URL (default): {url}")
             return url
         logger.debug(f"krpdiff URL (fallback): {self.cdn_base}/resources/{krpdiff_name}")
-        return f"{self.cdn_base}/resources/{krpdiff_name}"
+        return f"{self.cdn_base}/resources/{quote(krpdiff_name, safe='/:')}"
 
     def get_current_version(self) -> Optional[str]:
         """获取当前版本"""
@@ -379,11 +373,6 @@ class IncrementalManager:
 
     def download_incremental(self) -> bool:
         """下载增量更新包"""
-        is_ok, error_msg = check_hpatchz_requirements()
-        if not is_ok:
-            logger.warning(f"环境检查失败: {error_msg}")
-            return False
-
         current_version = self.get_current_version()
         if not current_version:
             logger.error("无法获取当前版本")
@@ -429,6 +418,7 @@ class IncrementalManager:
             json.dump(version_info, f, indent=4)
 
         resources = index_data.get("resource", [])
+        resource_by_dest = {r["dest"]: r for r in resources if r.get("dest")}
         complete_files = [r for r in resources if not _is_diff_resource(r["dest"])]
         res_base = None
         for r in resources:
@@ -454,30 +444,52 @@ class IncrementalManager:
                 continue
             krpdiff_path = download_dir / _resource_rel_path(krpdiff_name)
             krpdiff_url = self._build_krpdiff_url(krpdiff_name)
-
-            expected_size = _get_krpdiff_size(krpdiff_url)
+            krpdiff_info = resource_by_dest.get(krpdiff_name, {})
+            expected_size = int(krpdiff_info.get("size") or 0)
+            expected_md5 = krpdiff_info.get("md5")
+            if not expected_size:
+                expected_size = _get_krpdiff_size(krpdiff_url) or 0
 
             if krpdiff_path.exists() and expected_size:
                 local_size = krpdiff_path.stat().st_size
-                if local_size == expected_size:
+                if local_size == expected_size and (not expected_md5 or _calculate_file_md5(krpdiff_path) == expected_md5):
                     logger.debug(f"跳过已完成的增量包: {krpdiff_name}")
                     skipped_groups.append(krpdiff_name)
-                    total_size += expected_size
                     continue
                 elif local_size < expected_size:
                     logger.info(f"检测到不完整的增量包，将重新下载: {krpdiff_name}")
                     krpdiff_path.unlink()
                 else:
-                    logger.info(f"文件大小异常，重新下载: {krpdiff_name}")
+                    logger.info(f"文件大小或 MD5 异常，重新下载: {krpdiff_name}")
                     krpdiff_path.unlink()
+            elif krpdiff_path.exists() and expected_md5:
+                if _calculate_file_md5(krpdiff_path) == expected_md5:
+                    logger.debug(f"跳过已完成的增量包: {krpdiff_name}")
+                    skipped_groups.append(krpdiff_name)
+                    continue
+                logger.info(f"增量包 MD5 异常，重新下载: {krpdiff_name}")
+                krpdiff_path.unlink()
 
-            pending_groups.append((group, krpdiff_path, krpdiff_url, expected_size or 0))
+            pending_groups.append((group, krpdiff_path, krpdiff_url, expected_size, expected_md5))
             if expected_size:
-                pending_size += expected_size
+                resume_size = 0
+                temp_path = krpdiff_path.with_suffix(krpdiff_path.suffix + ".temp")
+                if temp_path.exists():
+                    temp_size = temp_path.stat().st_size
+                    if temp_size < expected_size:
+                        resume_size = temp_size
+                    elif temp_size == expected_size and (not expected_md5 or _calculate_file_md5(temp_path) == expected_md5):
+                        resume_size = temp_size
+                    else:
+                        logger.info(f"临时增量包大小或 MD5 异常，将重新下载: {krpdiff_name}")
+                        temp_path.unlink()
+                pending_size += expected_size - resume_size
 
         total_size = total_size + pending_size
 
         complete_tasks = []
+        complete_ready_count = 0
+        complete_total_count = len(complete_files)
         if complete_files:
             for item in complete_files:
                 expected_size = int(item["size"])
@@ -486,8 +498,10 @@ class IncrementalManager:
                 staged_path = self._get_staged_complete_path(download_dir, item["dest"])
 
                 if self._is_file_verified(game_path, expected_size, expected_md5):
+                    complete_ready_count += 1
                     continue
                 if self._is_file_verified(staged_path, expected_size, expected_md5):
+                    complete_ready_count += 1
                     continue
                 if staged_path.exists():
                     logger.info(f"缓存完整文件校验失败，将重新下载: {item['dest']}")
@@ -512,7 +526,13 @@ class IncrementalManager:
                 logger.info(f"待下载完整文件: {len(complete_tasks)} 个 ({complete_total / 1024 / 1024:.2f} MB)")
 
         if not pending_groups and not complete_tasks:
-            logger.info(f"所有增量包已下载完成 ({len(skipped_groups)}/{len(group_infos)})")
+            if complete_total_count:
+                logger.info(
+                    f"所有下载资源已就绪: 增量包 {len(skipped_groups)}/{len(group_infos)}, "
+                    f"完整文件 {complete_ready_count}/{complete_total_count}"
+                )
+            else:
+                logger.info(f"所有增量包已下载完成 ({len(skipped_groups)}/{len(group_infos)})")
             return True
 
         if pending_groups:
@@ -531,56 +551,94 @@ class IncrementalManager:
         )
 
         max_workers = 8
-        failed = []
+        failed_patches = []
+        failed_complete_files = []
+        downloaded_patch_count = already_downloaded_count
+        downloaded_complete_count = complete_ready_count
+
+        def overall_description() -> str:
+            parts = [f"增量包 {downloaded_patch_count}/{len(group_infos)}"]
+            if complete_total_count:
+                parts.append(f"完整文件 {downloaded_complete_count}/{complete_total_count}")
+            return f"下载资源 ({'，'.join(parts)})"
+
+        download_jobs = []
+        max_job_count = max(len(pending_groups), len(complete_tasks))
+        for i in range(max_job_count):
+            if i < len(pending_groups):
+                download_jobs.append(("patch", pending_groups[i]))
+            if i < len(complete_tasks):
+                download_jobs.append(("complete", complete_tasks[i]))
 
         with progress:
             overall_task = progress.add_task(
-                f"增量包 ({already_downloaded_count}/{len(group_infos)} 已下载)",
-                total=total_size,
+                overall_description(),
+                total=total_size if total_size > 0 else None,
             )
 
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                patch_futures = {}
-                for group, krpdiff_path, krpdiff_url, size in pending_groups:
-                    krpdiff_name = group.get("dest")
-                    future = executor.submit(
-                        self._download_file,
-                        krpdiff_url,
-                        krpdiff_path,
-                        size,
-                        progress,
-                        overall_task,
-                    )
-                    patch_futures[future] = krpdiff_name
+                futures = {}
+                for kind, payload in download_jobs:
+                    if kind == "patch":
+                        group, krpdiff_path, krpdiff_url, size, expected_md5 = payload
+                        krpdiff_name = group.get("dest")
+                        future = executor.submit(
+                            self._download_file,
+                            krpdiff_url,
+                            krpdiff_path,
+                            size,
+                            expected_md5,
+                            progress,
+                            overall_task,
+                        )
+                        futures[future] = ("patch", krpdiff_name)
+                    else:
+                        task = payload
+                        future = executor.submit(
+                            self._download_and_verify_complete,
+                            task["url"],
+                            task["path"],
+                            task["size"],
+                            task["md5"],
+                            progress,
+                            overall_task,
+                        )
+                        futures[future] = ("complete", task["dest"])
 
-                for future in as_completed(patch_futures):
-                    krpdiff_name = patch_futures[future]
-                    if not future.result():
-                        failed.append(krpdiff_name)
+                for future in as_completed(futures):
+                    kind, dest = futures[future]
+                    try:
+                        success = future.result()
+                    except Exception as e:
+                        logger.error(f"下载任务异常 {dest}: {e}")
+                        success = False
 
-                complete_futures = {}
-                for task in complete_tasks:
-                    future = executor.submit(
-                        self._download_and_verify_complete,
-                        task["url"],
-                        task["path"],
-                        task["size"],
-                        task["md5"],
-                        progress,
-                        overall_task,
-                    )
-                    complete_futures[future] = task["dest"]
+                    if success:
+                        if kind == "patch":
+                            downloaded_patch_count += 1
+                        else:
+                            downloaded_complete_count += 1
+                    elif kind == "patch":
+                        failed_patches.append(dest)
+                    else:
+                        failed_complete_files.append(dest)
 
-                for future in as_completed(complete_futures):
-                    dest = complete_futures[future]
-                    if not future.result() and dest not in failed:
-                        failed.append(dest)
+                    progress.update(overall_task, description=overall_description())
 
-        if failed:
-            logger.error(f"下载失败: {failed}")
+        if failed_patches or failed_complete_files:
+            if failed_patches:
+                logger.error(f"增量包下载失败: {failed_patches}")
+            if failed_complete_files:
+                logger.error(f"完整文件下载失败: {failed_complete_files}")
             return False
 
-        logger.info(f"增量包下载完成: {len(group_infos)}/{len(group_infos)}")
+        if complete_total_count:
+            logger.info(
+                f"下载完成: 增量包 {downloaded_patch_count}/{len(group_infos)}, "
+                f"完整文件 {downloaded_complete_count}/{complete_total_count}"
+            )
+        else:
+            logger.info(f"增量包下载完成: {downloaded_patch_count}/{len(group_infos)}")
 
         return True
 
@@ -589,6 +647,7 @@ class IncrementalManager:
         url: str,
         dest: Path,
         expected_size: int,
+        expected_md5: Optional[str] = None,
         progress: Optional[Progress] = None,
         overall_task_id: Optional[TaskID] = None,
     ) -> bool:
@@ -597,12 +656,11 @@ class IncrementalManager:
 
         task_id = None
         if progress:
-            task_id = progress.add_task(description=dest.name, total=expected_size)
+            task_id = progress.add_task(description=dest.name, total=expected_size if expected_size > 0 else None)
             color = RAINBOW_COLORS[task_id % len(RAINBOW_COLORS)]
             progress.update(task_id, description=f"[{color}]{dest.name}[/{color}]")
 
         temp_file = dest.with_suffix(dest.suffix + ".temp")
-        headers = {"User-Agent": "WW-Manager/2.0"}
 
         retries = 3
         success = False
@@ -612,13 +670,23 @@ class IncrementalManager:
                 resume_byte = 0
                 if temp_file.exists():
                     resume_byte = temp_file.stat().st_size
+                    if expected_size > 0 and resume_byte > expected_size:
+                        logger.info(f"临时文件大小异常，重新下载: {dest.name}")
+                        temp_file.unlink()
+                        resume_byte = 0
 
-                if resume_byte == expected_size:
-                    if progress and task_id is not None:
-                        progress.update(task_id, completed=expected_size)
-                    success = True
-                    break
+                if expected_size > 0 and resume_byte == expected_size:
+                    if expected_md5 and _calculate_file_md5(temp_file) != expected_md5:
+                        logger.info(f"临时文件 MD5 异常，重新下载: {dest.name}")
+                        temp_file.unlink()
+                        resume_byte = 0
+                    else:
+                        if progress and task_id is not None:
+                            progress.update(task_id, completed=expected_size)
+                        success = True
+                        break
 
+                headers = {"User-Agent": "WW-Manager/2.0"}
                 if resume_byte > 0:
                     headers["Range"] = f"bytes={resume_byte}-"
                     if progress and task_id is not None:
@@ -630,6 +698,12 @@ class IncrementalManager:
                 with urlopen(req, timeout=15) as rsp:
                     if rsp.status not in (200, 206):
                         raise NetworkError(f"HTTP {rsp.status}")
+                    if resume_byte > 0 and rsp.status == 200:
+                        # 服务器忽略 Range 时重新写临时文件，避免追加出损坏文件
+                        resume_byte = 0
+                        mode = "wb"
+                        if progress and task_id is not None:
+                            progress.update(task_id, completed=0)
 
                     with open(temp_file, mode) as f:
                         while True:
@@ -645,7 +719,7 @@ class IncrementalManager:
                                 if overall_task_id is not None:
                                     progress.update(overall_task_id, advance=chunk_len)
 
-                if temp_file.stat().st_size == expected_size:
+                if expected_size <= 0 or temp_file.stat().st_size == expected_size:
                     success = True
                     break
 
@@ -655,6 +729,13 @@ class IncrementalManager:
                         progress.console.log(f"[red]下载失败 {dest.name}: {e}[/red]")
                     return False
                 time.sleep(1 + attempt)
+
+        if success and expected_md5:
+            actual_md5 = _calculate_file_md5(temp_file)
+            if actual_md5 != expected_md5:
+                logger.error(f"文件 MD5 不匹配: {dest.name}")
+                temp_file.unlink()
+                success = False
 
         if success:
             shutil.move(temp_file, dest)
