@@ -17,6 +17,7 @@ import platform
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path, PurePosixPath
@@ -264,6 +265,8 @@ class IncrementalManager:
 
         self.hpatchz_path: Optional[Path] = None
         self._index_file: Optional[Dict] = None
+        self._verified_staged_patch_dests: set[str] = set()
+        self._verified_staged_patch_lock = threading.Lock()
 
     @property
     def default_config(self) -> Dict:
@@ -447,6 +450,17 @@ class IncrementalManager:
         if not path.exists() or path.stat().st_size != expected_size:
             return False
         return _calculate_file_md5(path) == expected_md5
+
+    def _mark_staged_patch_verified(self, dest: str) -> None:
+        """记录本次 apply 过程中已经完成 MD5 校验的增量输出缓存。"""
+        with self._verified_staged_patch_lock:
+            self._verified_staged_patch_dests.add(dest)
+
+    def _is_staged_patch_verified_in_this_run(self, dest: str, staged_path: Path, expected_size: int) -> bool:
+        """判断 staged patch 是否已在本次 apply 中校验过，可避免迁移阶段重复读大文件算 MD5。"""
+        with self._verified_staged_patch_lock:
+            verified = dest in self._verified_staged_patch_dests
+        return verified and staged_path.exists() and staged_path.stat().st_size == expected_size
 
     def download_incremental(self) -> bool:
         """下载增量更新包"""
@@ -874,23 +888,23 @@ class IncrementalManager:
                 staged_path = self._get_staged_complete_path(download_dir, dest)
 
                 try:
+                    if self._is_file_verified(staged_path, expected_size, expected_md5):
+                        if _safe_replace_file(
+                            staged_path,
+                            game_path,
+                            lambda msg: _emit_progress_log(progress, "ERROR", msg),
+                        ):
+                            moved_count += 1
+                        else:
+                            failed.append(dest)
+                        continue
+
                     if self._is_file_verified(game_path, expected_size, expected_md5):
                         skipped_count += 1
                         continue
 
-                    if not self._is_file_verified(staged_path, expected_size, expected_md5):
-                        _emit_progress_log(progress, "ERROR", f"完整文件缓存缺失或校验失败: {dest}")
-                        failed.append(dest)
-                        continue
-
-                    if _safe_replace_file(
-                        staged_path,
-                        game_path,
-                        lambda msg: _emit_progress_log(progress, "ERROR", msg),
-                    ):
-                        moved_count += 1
-                    else:
-                        failed.append(dest)
+                    _emit_progress_log(progress, "ERROR", f"完整文件缓存缺失或校验失败: {dest}")
+                    failed.append(dest)
                 finally:
                     progress.advance(task_id)
 
@@ -946,23 +960,34 @@ class IncrementalManager:
                 staged_path = self._get_staged_patch_path(download_dir, dest)
 
                 try:
+                    if self._is_staged_patch_verified_in_this_run(dest, staged_path, expected_size):
+                        if _safe_replace_file(
+                            staged_path,
+                            game_path,
+                            lambda msg: _emit_progress_log(progress, "ERROR", msg),
+                        ):
+                            moved_count += 1
+                        else:
+                            failed.append(dest)
+                        continue
+
+                    if self._is_file_verified(staged_path, expected_size, expected_md5):
+                        if _safe_replace_file(
+                            staged_path,
+                            game_path,
+                            lambda msg: _emit_progress_log(progress, "ERROR", msg),
+                        ):
+                            moved_count += 1
+                        else:
+                            failed.append(dest)
+                        continue
+
                     if self._is_file_verified(game_path, expected_size, expected_md5):
                         skipped_count += 1
                         continue
 
-                    if not self._is_file_verified(staged_path, expected_size, expected_md5):
-                        _emit_progress_log(progress, "ERROR", f"增量输出缓存缺失或校验失败: {dest}")
-                        failed.append(dest)
-                        continue
-
-                    if _safe_replace_file(
-                        staged_path,
-                        game_path,
-                        lambda msg: _emit_progress_log(progress, "ERROR", msg),
-                    ):
-                        moved_count += 1
-                    else:
-                        failed.append(dest)
+                    _emit_progress_log(progress, "ERROR", f"增量输出缓存缺失或校验失败: {dest}")
+                    failed.append(dest)
                 finally:
                     progress.advance(task_id)
 
@@ -1312,10 +1337,20 @@ class IncrementalManager:
                             log_error(f"回退下载也失败: {dst_rel_path}")
                         continue
 
+                    set_status(f"校验输出 {index}/{len(dst_files)}")
+                    if not self._is_file_verified(output_file, int(dst_info["size"]), dst_info["md5"]):
+                        set_status(f"输出校验失败，回退下载 {index}/{len(dst_files)}")
+                        log_warning(f"输出文件校验失败: {dst_rel_path}, 回退下载")
+                        if not self._download_full_file_to_stage(dst_info, staged_path, log_error):
+                            fail_count += 1
+                            log_error(f"回退下载也失败: {dst_rel_path}")
+                        continue
+
                     staged_path.parent.mkdir(parents=True, exist_ok=True)
                     if staged_path.exists():
                         staged_path.unlink()
                     shutil.move(output_file, staged_path)
+                    self._mark_staged_patch_verified(dst_rel_path)
 
                 if fail_count > 0:
                     return krpdiff_name, "partial_failed"
@@ -1337,6 +1372,7 @@ class IncrementalManager:
         expected_size = int(dst_info["size"])
 
         if self._is_file_verified(staged_path, expected_size, expected_md5):
+            self._mark_staged_patch_verified(dest)
             return True
         if staged_path.exists():
             staged_path.unlink()
@@ -1351,7 +1387,7 @@ class IncrementalManager:
             return False
 
         logger.debug(f"下载完整文件到缓存: {dest}")
-        return self._download_and_verify(
+        success = self._download_and_verify(
             url,
             staged_path,
             expected_size,
@@ -1359,6 +1395,9 @@ class IncrementalManager:
             error_callback=error_callback,
             suppress_success_log=True,
         )
+        if success:
+            self._mark_staged_patch_verified(dest)
+        return success
 
     def _download_full_file(self, dst_info: Dict, dest_path: Path) -> bool:
         """下载完整文件作为 hpatchz 失败的回退方案，先写入缓存再替换游戏文件"""
