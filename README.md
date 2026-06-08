@@ -27,7 +27,7 @@
 * **💾 自动记忆**：自动记录游戏路径，一次设置，永久生效。
 * **⚡️ 现代化 CLI**：基于 `Typer` 构建，支持自动补全和帮助信息。
 * **👯 并行下载**: 使用多线程并行下载，避免 CDN 节点降速，支持断点续传。
-
+* **🔥 增量更新(`incremental`)**: 实验性功能，详见[ dev 分支](https://github.com/timetetng/wutheringwaves-cli-manager/tree/dev)，基于官方启动器解包的补丁二进制(见release），欢迎测试并提交问题。
 
 ## 🔧 安装指南
 
