@@ -18,9 +18,10 @@ import shutil
 import subprocess
 import tempfile
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional, Tuple
+from queue import Empty, Queue
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -29,11 +30,15 @@ from rich.progress import (
     BarColumn,
     DownloadColumn,
     Progress,
+    ProgressColumn,
+    SpinnerColumn,
     TaskID,
     TextColumn,
+    TimeElapsedColumn,
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
+from rich.text import Text
 
 from ww_manager.download import RAINBOW_COLORS, NetworkError
 
@@ -43,6 +48,43 @@ logger = logging.getLogger("WW_Manager")
 HPATCHZ_REPO = "timetetng/wutheringwaves-cli-manager"
 HPATCHZ_VERSION = "hpatchz-v4.8.0"
 HPATCHZ_FILENAME = "hpatchz.exe"
+
+
+class ApplySpinnerColumn(SpinnerColumn):
+    """只为正在运行的增量包子任务显示 spinner。"""
+
+    def render(self, task):
+        if task.fields.get("kind") == "group":
+            return super().render(task)
+        return Text("")
+
+
+class ApplyBarColumn(BarColumn):
+    """只为总任务显示进度条，子任务只显示 spinner、名称和耗时。"""
+
+    def render(self, task):
+        if task.fields.get("kind") == "overall":
+            return super().render(task)
+        return Text("")
+
+
+class ApplyPercentageColumn(ProgressColumn):
+    """只为总任务显示百分比。"""
+
+    def render(self, task):
+        if task.total is None:
+            return Text("")
+        percentage = task.percentage or 0
+        return Text(f"{percentage:>3.1f}%", style="progress.percentage")
+
+
+class ApplyCountColumn(ProgressColumn):
+    """只为总任务显示 (完成数/总数)。"""
+
+    def render(self, task):
+        if task.total is None:
+            return Text("")
+        return Text(f"({int(task.completed)}/{int(task.total)})")
 
 
 class IncrementalError(Exception):
@@ -156,7 +198,27 @@ def _backup_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".bak")
 
 
-def _safe_replace_file(src: Path, dest: Path) -> bool:
+def _format_progress_log(level: str, msg: str) -> str:
+    """生成 Rich Progress 中手动输出日志的统一格式。"""
+    return f"{time.strftime('%H:%M:%S')} [{level}] {msg}"
+
+
+def _emit_progress_log(progress: Optional[Progress], level: str, msg: str) -> None:
+    """在 Rich Progress 上方输出带时间和级别的日志；无 Progress 时回退到 logging。"""
+    style_map = {"INFO": "dim", "WARNING": "yellow", "ERROR": "red"}
+    if progress:
+        progress.console.print(_format_progress_log(level, msg), style=style_map.get(level))
+        return
+
+    if level == "ERROR":
+        logger.error(msg)
+    elif level == "WARNING":
+        logger.warning(msg)
+    else:
+        logger.info(msg)
+
+
+def _safe_replace_file(src: Path, dest: Path, error_callback: Optional[Callable[[str], None]] = None) -> bool:
     """用已校验文件替换目标文件，失败时尽量恢复原文件"""
     backup = _backup_path(dest)
     try:
@@ -170,14 +232,22 @@ def _safe_replace_file(src: Path, dest: Path) -> bool:
             backup.unlink()
         return True
     except Exception as e:
-        logger.error(f"替换文件失败: {dest} ({e})")
+        message = f"替换文件失败: {dest} ({e})"
+        if error_callback:
+            error_callback(message)
+        else:
+            logger.error(message)
         try:
             if dest.exists() and backup.exists():
                 dest.unlink()
             if backup.exists() and not dest.exists():
                 shutil.move(backup, dest)
         except Exception as restore_error:
-            logger.error(f"恢复备份失败: {dest} ({restore_error})")
+            message = f"恢复备份失败: {dest} ({restore_error})"
+            if error_callback:
+                error_callback(message)
+            else:
+                logger.error(message)
         return False
 
 
@@ -636,7 +706,7 @@ class IncrementalManager:
                     try:
                         success = future.result()
                     except Exception as e:
-                        logger.error(f"下载任务异常 {dest}: {e}")
+                        _emit_progress_log(progress, "ERROR", f"下载任务异常 {dest}: {e}")
                         success = False
 
                     if success:
@@ -697,13 +767,13 @@ class IncrementalManager:
                 if temp_file.exists():
                     resume_byte = temp_file.stat().st_size
                     if expected_size > 0 and resume_byte > expected_size:
-                        logger.info(f"临时文件大小异常，重新下载: {dest.name}")
+                        _emit_progress_log(progress, "INFO", f"临时文件大小异常，重新下载: {dest.name}")
                         temp_file.unlink()
                         resume_byte = 0
 
                 if expected_size > 0 and resume_byte == expected_size:
                     if expected_md5 and _calculate_file_md5(temp_file) != expected_md5:
-                        logger.info(f"临时文件 MD5 异常，重新下载: {dest.name}")
+                        _emit_progress_log(progress, "INFO", f"临时文件 MD5 异常，重新下载: {dest.name}")
                         temp_file.unlink()
                         resume_byte = 0
                     else:
@@ -751,15 +821,14 @@ class IncrementalManager:
 
             except Exception as e:
                 if attempt == retries - 1:
-                    if progress:
-                        progress.console.log(f"[red]下载失败 {dest.name}: {e}[/red]")
+                    _emit_progress_log(progress, "ERROR", f"下载失败 {dest.name}: {e}")
                     return False
                 time.sleep(1 + attempt)
 
         if success and expected_md5:
             actual_md5 = _calculate_file_md5(temp_file)
             if actual_md5 != expected_md5:
-                logger.error(f"文件 MD5 不匹配: {dest.name}")
+                _emit_progress_log(progress, "ERROR", f"文件 MD5 不匹配: {dest.name}")
                 temp_file.unlink()
                 success = False
 
@@ -782,26 +851,48 @@ class IncrementalManager:
         skipped_count = 0
         failed = []
 
-        for item in complete_files:
-            dest = item["dest"]
-            expected_size = int(item["size"])
-            expected_md5 = item["md5"]
-            game_path = self.game_folder / _resource_rel_path(dest)
-            staged_path = self._get_staged_complete_path(download_dir, dest)
+        logger.info(f"开始迁移并校验完整资源文件: 共 {len(complete_files)} 个")
+        progress = Progress(
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=40),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            TextColumn("({task.completed}/{task.total})"),
+            TimeElapsedColumn(),
+            transient=False,
+        )
 
-            if self._is_file_verified(game_path, expected_size, expected_md5):
-                skipped_count += 1
-                continue
+        with progress:
+            task_id = progress.add_task("[bold cyan]迁移完整资源", total=len(complete_files))
 
-            if not self._is_file_verified(staged_path, expected_size, expected_md5):
-                logger.error(f"完整文件缓存缺失或校验失败: {dest}")
-                failed.append(dest)
-                continue
+            for item in complete_files:
+                dest = item["dest"]
+                progress.update(task_id, description=f"[bold cyan]迁移完整资源: {Path(dest).name[:60]}")
 
-            if _safe_replace_file(staged_path, game_path):
-                moved_count += 1
-            else:
-                failed.append(dest)
+                expected_size = int(item["size"])
+                expected_md5 = item["md5"]
+                game_path = self.game_folder / _resource_rel_path(dest)
+                staged_path = self._get_staged_complete_path(download_dir, dest)
+
+                try:
+                    if self._is_file_verified(game_path, expected_size, expected_md5):
+                        skipped_count += 1
+                        continue
+
+                    if not self._is_file_verified(staged_path, expected_size, expected_md5):
+                        _emit_progress_log(progress, "ERROR", f"完整文件缓存缺失或校验失败: {dest}")
+                        failed.append(dest)
+                        continue
+
+                    if _safe_replace_file(
+                        staged_path,
+                        game_path,
+                        lambda msg: _emit_progress_log(progress, "ERROR", msg),
+                    ):
+                        moved_count += 1
+                    else:
+                        failed.append(dest)
+                finally:
+                    progress.advance(task_id)
 
         if failed:
             logger.error(f"完整文件迁移失败: {failed}")
@@ -815,35 +906,65 @@ class IncrementalManager:
         resources = (self.index_file or {}).get("resource", [])
         complete_dests = {r["dest"] for r in resources if r.get("dest") and not _is_diff_resource(r["dest"])}
 
-        moved_count = 0
-        skipped_count = 0
-        failed = []
-
+        patch_targets = []
         for group in self.get_group_infos():
             for dst_info in group.get("dstFiles", []):
                 dest = dst_info["dest"]
                 if dest in complete_dests:
                     # 官方逻辑中普通资源文件优先，patch 输出不覆盖这些完整资源。
                     continue
+                patch_targets.append(dst_info)
+
+        moved_count = 0
+        skipped_count = 0
+        failed = []
+
+        if not patch_targets:
+            logger.info("没有需要迁移的增量输出文件")
+            return True
+
+        logger.info(f"开始覆盖并校验增量输出文件: 共 {len(patch_targets)} 个")
+        progress = Progress(
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=40),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            TextColumn("({task.completed}/{task.total})"),
+            TimeElapsedColumn(),
+            transient=False,
+        )
+
+        with progress:
+            task_id = progress.add_task("[bold cyan]覆盖并校验增量输出", total=len(patch_targets))
+
+            for dst_info in patch_targets:
+                dest = dst_info["dest"]
+                progress.update(task_id, description=f"[bold cyan]覆盖/校验: {Path(dest).name[:60]}")
 
                 expected_size = int(dst_info["size"])
                 expected_md5 = dst_info["md5"]
                 game_path = self.game_folder / _resource_rel_path(dest)
                 staged_path = self._get_staged_patch_path(download_dir, dest)
 
-                if self._is_file_verified(game_path, expected_size, expected_md5):
-                    skipped_count += 1
-                    continue
+                try:
+                    if self._is_file_verified(game_path, expected_size, expected_md5):
+                        skipped_count += 1
+                        continue
 
-                if not self._is_file_verified(staged_path, expected_size, expected_md5):
-                    logger.error(f"增量输出缓存缺失或校验失败: {dest}")
-                    failed.append(dest)
-                    continue
+                    if not self._is_file_verified(staged_path, expected_size, expected_md5):
+                        _emit_progress_log(progress, "ERROR", f"增量输出缓存缺失或校验失败: {dest}")
+                        failed.append(dest)
+                        continue
 
-                if _safe_replace_file(staged_path, game_path):
-                    moved_count += 1
-                else:
-                    failed.append(dest)
+                    if _safe_replace_file(
+                        staged_path,
+                        game_path,
+                        lambda msg: _emit_progress_log(progress, "ERROR", msg),
+                    ):
+                        moved_count += 1
+                    else:
+                        failed.append(dest)
+                finally:
+                    progress.advance(task_id)
 
         if failed:
             logger.error(f"增量输出迁移失败: {failed}")
@@ -854,6 +975,8 @@ class IncrementalManager:
 
     def apply_incremental(self) -> bool:
         """应用已下载的增量更新包"""
+        logger.info("正在准备应用增量更新...")
+        logger.info("正在检查增量更新运行环境...")
         is_ok, error_msg = check_hpatchz_requirements()
         if not is_ok:
             logger.warning(f"环境检查失败: {error_msg}")
@@ -877,7 +1000,7 @@ class IncrementalManager:
             return False
 
         logger.info(f"开始应用增量更新: {version_info.get('from_version')} -> {version_info.get('to_version')}")
-
+        logger.info("正在准备 hpatchz 工具...")
         self.hpatchz_path = get_hpatchz_path(self.cache_dir)
 
         index_file = download_dir / "indexFile.json"
@@ -896,55 +1019,118 @@ class IncrementalManager:
             logger.warning("没有增量更新组")
             return False
 
-        logger.info(f"开始应用 {len(group_infos)} 个增量包...预计 5-10 分钟，请勿中断进程")
+        max_workers = min(4, len(group_infos))
+        logger.info(
+            f"开始合并 {len(group_infos)} 个增量包，并发 {max_workers} 个。"
+            "单个大文件可能耗时数分钟，请勿中断进程。"
+        )
 
         results = {}
+        status_events = Queue()
+
+        def group_label(dest: Optional[str]) -> str:
+            if not dest:
+                return "unknown"
+            return Path(dest).stem
+
+        def group_description(dest: Optional[str], stage: Optional[str] = None) -> str:
+            label = group_label(dest)
+            if stage:
+                return f"[cyan]{label}[/cyan] [dim]{stage}[/dim]"
+            return f"[cyan]{label}[/cyan]"
 
         def apply_wrapper(group):
-            log_messages = []
+            dest = group.get("dest")
 
-            def log_info(msg):
-                log_messages.append(("info", msg))
+            def emit(kind: str, msg: Optional[str] = None):
+                status_events.put((kind, dest, msg))
+
+            def emit_log(level: str, msg: str):
+                status_events.put(("log", level, msg))
+
+            def update_status(msg: str):
+                emit("status", msg)
+
+            def log_info(_msg):
+                # 普通成功日志不在 Rich 进度条期间输出，避免刷屏。
+                pass
 
             def log_warning(msg):
-                log_messages.append(("warning", msg))
+                emit_log("WARNING", msg)
 
             def log_error(msg):
-                log_messages.append(("error", msg))
+                emit_log("ERROR", msg)
 
+            emit("start", "开始处理")
             try:
-                dest, result = self._apply_single_group(group, download_dir, log_info, log_warning, log_error)
-                return dest, result, log_messages
+                dest, result = self._apply_single_group(
+                    group,
+                    download_dir,
+                    log_info,
+                    log_warning,
+                    log_error,
+                    update_status,
+                )
+                return dest, result
             except Exception as e:
                 log_error(f"应用增量包异常: {e}")
-                return group.get("dest"), "failed", log_messages
-
-        from rich.progress import BarColumn, Progress, TextColumn
+                return dest, "failed"
+            finally:
+                emit("finish")
 
         progress = Progress(
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(bar_width=40),
-            "[progress.percentage]{task.percentage:>3.1f}%",
-            TextColumn("({task.completed}/{task.total})"),
+            ApplySpinnerColumn("dots"),
+            TextColumn("{task.description}"),
+            ApplyBarColumn(bar_width=40),
+            ApplyPercentageColumn(),
+            ApplyCountColumn(),
+            TimeElapsedColumn(),
             transient=False,
+            expand=True,
         )
 
         with progress:
-            task_id = progress.add_task("[bold cyan]应用增量包", total=len(group_infos))
+            task_id = progress.add_task("[bold cyan]应用增量包", total=len(group_infos), kind="overall")
+            active_tasks = {}
 
-            with ThreadPoolExecutor(max_workers=min(4, len(group_infos))) as executor:
-                futures = {executor.submit(apply_wrapper, group): group for group in group_infos}
-                for future in as_completed(futures):
-                    dest, result, log_messages = future.result()
-                    results[dest] = result
-                    for level, msg in log_messages:
-                        if level == "info":
-                            progress.console.print(f"[dim]{msg}[/dim]")
-                        elif level == "warning":
-                            progress.console.print(f"[yellow]WARNING[/yellow] {msg}")
+            def drain_status_events():
+                while True:
+                    try:
+                        kind, event_target, msg = status_events.get_nowait()
+                    except Empty:
+                        break
+
+                    if kind in ("start", "status"):
+                        child_task_id = active_tasks.get(event_target)
+                        description = group_description(event_target, msg)
+                        if child_task_id is None:
+                            active_tasks[event_target] = progress.add_task(description, total=None, kind="group")
                         else:
-                            progress.console.print(f"[red]ERROR[/red] {msg}")
-                    progress.update(task_id, advance=1)
+                            progress.update(child_task_id, description=description)
+                    elif kind == "log":
+                        _emit_progress_log(progress, event_target, msg)
+                    elif kind == "finish":
+                        child_task_id = active_tasks.pop(event_target, None)
+                        if child_task_id is not None:
+                            progress.remove_task(child_task_id)
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                pending = {executor.submit(apply_wrapper, group): group for group in group_infos}
+                while pending:
+                    done, pending_futures = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                    pending = pending_futures
+                    drain_status_events()
+
+                    for future in done:
+                        dest, result = future.result()
+                        results[dest] = result
+                        progress.update(task_id, advance=1)
+
+                    drain_status_events()
+
+            # 兜底清理仍显示的子任务，避免异常路径残留。
+            for child_task_id in list(active_tasks.values()):
+                progress.remove_task(child_task_id)
 
         success_count = sum(1 for r in results.values() if r == "success")
         skip_count = sum(1 for r in results.values() if r == "skipped")
@@ -952,8 +1138,8 @@ class IncrementalManager:
         failed_groups = [dest for dest, r in results.items() if r in ("failed", "partial_failed")]
 
         logger.info(
-            f"增量更新应用完成: 成功={success_count}, 跳过={skip_count}, "
-            f"失败={fail_count}，建议运行 'ww sync' 校验确认。"
+            f"增量包合并阶段完成: 成功={success_count}, 跳过={skip_count}, "
+            f"失败={fail_count}。接下来将覆盖并校验游戏目录文件。"
         )
 
         if fail_count > 0:
@@ -969,6 +1155,7 @@ class IncrementalManager:
             logger.warning("完整文件迁移失败，请运行 'ww sync' 修复。")
             return False
 
+        logger.info("正在保存索引并清理临时目录...")
         saved_index = self.cache_dir / "indexFile.json"
         if index_file.exists():
             shutil.copy2(index_file, saved_index)
@@ -978,19 +1165,34 @@ class IncrementalManager:
         logger.info("已清理增量下载目录")
 
         self._update_local_version(version_info.get("to_version"))
+        logger.info("增量更新应用完成。建议运行 'ww sync --new' 做最终校验。")
 
         return True
 
-    def _apply_single_group(self, group: Dict, download_dir: Path, log_info, log_warning, log_error) -> tuple:
+    def _apply_single_group(
+        self,
+        group: Dict,
+        download_dir: Path,
+        log_info,
+        log_warning,
+        log_error,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> tuple:
         """应用单个增量更新组"""
         krpdiff_name = group.get("dest")
         src_files = group.get("srcFiles", [])
         dst_files = group.get("dstFiles", [])
 
+        def set_status(msg: str):
+            if status_callback:
+                status_callback(msg)
+
+        set_status("检查资源信息")
         if not krpdiff_name or not src_files or not dst_files:
             return krpdiff_name, "failed"
 
         # 检查是否所有 dst 文件都已经是最新版本（跳过已完成的分组）
+        set_status("检查目标文件")
         dst_by_md5 = {d["md5"]: d for d in dst_files}
         all_dst_done = True
         for dst_info in dst_files:
@@ -1000,12 +1202,14 @@ class IncrementalManager:
                 break
         if all_dst_done:
             # 大小匹配，抽样第一个文件做 MD5 确认，避免在跳过路径上重复校验所有 dstFiles。
+            set_status("校验目标文件")
             first_dst_full = self.game_folder / _resource_rel_path(dst_files[0]["dest"])
             if _calculate_file_md5(first_dst_full) == dst_files[0]["md5"]:
                 log_info(f"所有文件已为目标版本，跳过 {len(dst_files)} 个文件")
                 return krpdiff_name, "skipped"
 
         # 检查第一个源文件的状态（决定运行 hpatchz 还是回退下载）
+        set_status("检查源文件")
         first_src = src_files[0]
         first_src_path = first_src["dest"]
         first_src_md5 = first_src["md5"]
@@ -1021,11 +1225,13 @@ class IncrementalManager:
 
         if first_local_md5 is None:
             # 源文件不存在，回退下载所有 dst 文件
+            set_status(f"源文件缺失，回退下载 {len(dst_files)} 个文件")
             logger.debug(f"源文件不存在: {first_src_path}, 回退下载 {len(dst_files)} 个文件")
             failed_count = 0
-            for dst_info in dst_files:
+            for index, dst_info in enumerate(dst_files, 1):
+                set_status(f"回退下载 {index}/{len(dst_files)}")
                 staged_path = self._get_staged_patch_path(download_dir, dst_info["dest"])
-                if not self._download_full_file_to_stage(dst_info, staged_path):
+                if not self._download_full_file_to_stage(dst_info, staged_path, log_error):
                     failed_count += 1
                     log_error(f"下载失败: {dst_info['dest']}")
                 else:
@@ -1038,6 +1244,7 @@ class IncrementalManager:
             # 仍需运行 hpatchz 来生成其他输出文件
             pass
         elif first_local_md5 != first_src_md5:
+            set_status("源文件校验失败")
             log_warning(
                 f"源文件 MD5 不匹配: {first_src_path} "
                 f"(期望 {first_src_md5[:16]}... 或 dst MD5, 实际 {first_local_md5[:16]}...)"
@@ -1046,10 +1253,12 @@ class IncrementalManager:
 
         # 从备份恢复
         if backup_path.exists() and not first_src_full.exists():
+            set_status("恢复中断文件")
             shutil.move(backup_path, first_src_full)
             log_info(f"恢复中断的更新: {first_src_path}")
             first_local_md5 = _calculate_file_md5(first_src_full)
 
+        set_status("检查增量包")
         krpdiff_path = download_dir / _resource_rel_path(krpdiff_name)
         if not krpdiff_path.exists():
             log_error(f"增量包不存在: {krpdiff_name}")
@@ -1060,15 +1269,24 @@ class IncrementalManager:
 
         try:
             with tempfile.TemporaryDirectory(prefix="ww_patch_", dir=patch_temp_dir) as temp_dir:
+                set_status("准备临时目录")
                 output_dir = Path(temp_dir) / "output"
                 output_dir.mkdir(parents=True, exist_ok=True)
 
-                if not self._run_hpatchz(krpdiff_path, output_dir, src_files):
+                if not self._run_hpatchz(
+                    krpdiff_path,
+                    output_dir,
+                    src_files,
+                    status_callback=set_status,
+                    error_callback=log_error,
+                ):
+                    set_status(f"hpatchz 失败，回退下载 {len(dst_files)} 个文件")
                     log_warning(f"hpatchz 应用失败，回退到完整下载: {first_src_path} 等 {len(dst_files)} 个文件")
                     failed_count = 0
-                    for dst_info in dst_files:
+                    for index, dst_info in enumerate(dst_files, 1):
+                        set_status(f"回退下载 {index}/{len(dst_files)}")
                         staged_path = self._get_staged_patch_path(download_dir, dst_info["dest"])
-                        if not self._download_full_file_to_stage(dst_info, staged_path):
+                        if not self._download_full_file_to_stage(dst_info, staged_path, log_error):
                             failed_count += 1
                             log_error(f"下载失败: {dst_info['dest']}")
                         else:
@@ -1078,18 +1296,18 @@ class IncrementalManager:
                     return krpdiff_name, "success"
 
                 # hpatchz 成功，缓存所有输出文件，最后统一校验并迁移到游戏目录
-                success_count = 0
+                set_status("缓存输出文件")
                 fail_count = 0
-                for dst_info in dst_files:
+                for index, dst_info in enumerate(dst_files, 1):
+                    set_status(f"缓存输出 {index}/{len(dst_files)}")
                     dst_rel_path = dst_info["dest"]
                     output_file = output_dir / _resource_rel_path(dst_rel_path)
                     staged_path = self._get_staged_patch_path(download_dir, dst_rel_path)
 
                     if not output_file.exists():
+                        set_status(f"输出缺失，回退下载 {index}/{len(dst_files)}")
                         log_warning(f"输出文件未生成: {dst_rel_path}, 回退下载")
-                        if self._download_full_file_to_stage(dst_info, staged_path):
-                            success_count += 1
-                        else:
+                        if not self._download_full_file_to_stage(dst_info, staged_path, log_error):
                             fail_count += 1
                             log_error(f"回退下载也失败: {dst_rel_path}")
                         continue
@@ -1099,13 +1317,6 @@ class IncrementalManager:
                         staged_path.unlink()
                     shutil.move(output_file, staged_path)
 
-                    success_count += 1
-
-                if success_count > 0:
-                    log_info(
-                        f"成功缓存 {success_count}/{len(dst_files)} 个文件"
-                        f"{' (回退下载 ' + str(fail_count) + ' 个失败)' if fail_count else ''}"
-                    )
                 if fail_count > 0:
                     return krpdiff_name, "partial_failed"
 
@@ -1114,7 +1325,12 @@ class IncrementalManager:
         finally:
             pass
 
-    def _download_full_file_to_stage(self, dst_info: Dict, staged_path: Path) -> bool:
+    def _download_full_file_to_stage(
+        self,
+        dst_info: Dict,
+        staged_path: Path,
+        error_callback: Optional[Callable[[str], None]] = None,
+    ) -> bool:
         """下载完整文件到指定缓存路径，不直接修改游戏目录"""
         dest = dst_info["dest"]
         expected_md5 = dst_info["md5"]
@@ -1127,11 +1343,22 @@ class IncrementalManager:
 
         url = self._build_resource_url(dst_info)
         if not url:
-            logger.error("无法获取资源路径")
+            message = "无法获取资源路径"
+            if error_callback:
+                error_callback(message)
+            else:
+                logger.error(message)
             return False
 
-        logger.info(f"下载完整文件到缓存: {dest}")
-        return self._download_and_verify(url, staged_path, expected_size, expected_md5)
+        logger.debug(f"下载完整文件到缓存: {dest}")
+        return self._download_and_verify(
+            url,
+            staged_path,
+            expected_size,
+            expected_md5,
+            error_callback=error_callback,
+            suppress_success_log=True,
+        )
 
     def _download_full_file(self, dst_info: Dict, dest_path: Path) -> bool:
         """下载完整文件作为 hpatchz 失败的回退方案，先写入缓存再替换游戏文件"""
@@ -1165,6 +1392,8 @@ class IncrementalManager:
         output_dir: Path,
         src_files: List[Dict],
         temp_olddir: Optional[Path] = None,
+        status_callback: Optional[Callable[[str], None]] = None,
+        error_callback: Optional[Callable[[str], None]] = None,
     ) -> bool:
         """运行 hpatchz 应用增量包
 
@@ -1173,8 +1402,22 @@ class IncrementalManager:
             output_dir: 输出目录
             src_files: 源文件列表（包含 dest 和 md5）
             temp_olddir: 预创建的临时源文件目录
+            status_callback: 状态回调，用于刷新当前增量包子任务
+            error_callback: 错误日志回调，用于在 Rich Progress 上方统一输出
         """
+
+        def set_status(msg: str):
+            if status_callback:
+                status_callback(msg)
+
+        def emit_error(msg: str):
+            if error_callback:
+                error_callback(msg)
+            else:
+                logger.error(msg)
+
         if temp_olddir is None:
+            set_status("准备 hpatchz 源文件")
             # 为当前 group 创建临时源文件目录
             patch_temp_dir = self.cache_dir / "patch_temp"
             patch_temp_dir.mkdir(parents=True, exist_ok=True)
@@ -1184,7 +1427,8 @@ class IncrementalManager:
             temp_olddir.mkdir(parents=True)
 
             # 复制所有源文件到临时目录
-            for src_file in src_files:
+            for index, src_file in enumerate(src_files, 1):
+                set_status(f"复制源文件 {index}/{len(src_files)}")
                 src_rel_path = _resource_rel_path(src_file["dest"])
                 src_full_path = self.game_folder / src_rel_path
                 dst_full_path = temp_olddir / src_rel_path
@@ -1211,11 +1455,13 @@ class IncrementalManager:
                 str(output_dir.absolute()) + "/",
             ]
 
+        set_status("运行 hpatchz")
         logger.debug(f"Running hpatchz: {' '.join(cmd)}")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
+        set_status("检查 hpatchz 结果")
         if result.returncode != 0:
-            logger.error(f"hpatchz 运行失败: {result.stderr}")
+            emit_error(f"hpatchz 运行失败: {result.stderr}")
             return False
 
         return True
@@ -1382,7 +1628,7 @@ class IncrementalManager:
 
                 url = self._build_resource_url(item, res_base)
                 if not url:
-                    logger.error(f"无法构建修复文件下载 URL: {dest}")
+                    _emit_progress_log(progress, "ERROR", f"无法构建修复文件下载 URL: {dest}")
                     return False, dest, expected_size
 
                 task_id = progress.add_task(description=f"[cyan]{file_name[:40]}[/cyan]", total=expected_size)
@@ -1404,18 +1650,22 @@ class IncrementalManager:
                     progress.remove_task(task_id)
 
                     if not self._is_file_verified(staged_path, expected_size, expected_md5):
-                        logger.error(f"修复文件校验失败: {dest}")
+                        _emit_progress_log(progress, "ERROR", f"修复文件校验失败: {dest}")
                         if staged_path.exists():
                             staged_path.unlink()
                         return False, dest, expected_size
 
-                    if not _safe_replace_file(staged_path, final_path):
+                    if not _safe_replace_file(
+                        staged_path,
+                        final_path,
+                        lambda msg: _emit_progress_log(progress, "ERROR", msg),
+                    ):
                         return False, dest, expected_size
 
                     return True, dest, expected_size
 
                 except Exception as e:
-                    logger.error(f"下载失败 {file_name}: {e}")
+                    _emit_progress_log(progress, "ERROR", f"下载失败 {file_name}: {e}")
                     if staged_path.exists():
                         staged_path.unlink()
                     try:
@@ -1430,10 +1680,10 @@ class IncrementalManager:
                     success, dest, size = future.result()
                     if success:
                         repair_count += 1
-                        logger.info(f"修复成功: {dest}")
+                        _emit_progress_log(progress, "INFO", f"修复成功: {dest}")
                     else:
                         fail_count += 1
-                        logger.error(f"修复失败: {dest}")
+                        _emit_progress_log(progress, "ERROR", f"修复失败: {dest}")
                     progress.update(overall_task, advance=size)
 
         logger.info(f"修复完成: 成功={repair_count}, 失败={fail_count}")
@@ -1514,28 +1764,43 @@ class IncrementalManager:
 
             actual_size = dest.stat().st_size
             if actual_size != expected_size:
-                logger.error(f"文件大小不匹配: {dest.name}")
+                _emit_progress_log(progress, "ERROR", f"文件大小不匹配: {dest.name}")
                 dest.unlink()
                 return False
 
             actual_md5 = _calculate_file_md5(dest)
             if actual_md5 != expected_md5:
-                logger.error(f"文件 MD5 不匹配: {dest.name}")
+                _emit_progress_log(progress, "ERROR", f"文件 MD5 不匹配: {dest.name}")
                 dest.unlink()
                 return False
 
             return True
 
         except Exception as e:
-            logger.error(f"下载失败 {dest.name}: {e}")
+            _emit_progress_log(progress, "ERROR", f"下载失败 {dest.name}: {e}")
             if temp_file.exists():
                 temp_file.unlink()
             if progress and task_id is not None:
                 progress.remove_task(task_id)
             return False
 
-    def _download_and_verify(self, url: str, dest: Path, expected_size: int, expected_md5: str) -> bool:
+    def _download_and_verify(
+        self,
+        url: str,
+        dest: Path,
+        expected_size: int,
+        expected_md5: str,
+        error_callback: Optional[Callable[[str], None]] = None,
+        suppress_success_log: bool = False,
+    ) -> bool:
         """下载文件并验证 MD5"""
+
+        def emit_error(msg: str):
+            if error_callback:
+                error_callback(msg)
+            else:
+                logger.error(msg)
+
         try:
             headers = {"User-Agent": "WW-Manager/2.0"}
             response = requests.get(url, headers=headers, timeout=60, stream=True)
@@ -1548,21 +1813,22 @@ class IncrementalManager:
 
             actual_size = dest.stat().st_size
             if actual_size != expected_size:
-                logger.error(f"文件大小不匹配: {dest.name} (期望 {expected_size}, 实际 {actual_size})")
+                emit_error(f"文件大小不匹配: {dest.name} (期望 {expected_size}, 实际 {actual_size})")
                 dest.unlink()
                 return False
 
             actual_md5 = _calculate_file_md5(dest)
             if actual_md5 != expected_md5:
-                logger.error(f"文件 MD5 不匹配: {dest.name}")
+                emit_error(f"文件 MD5 不匹配: {dest.name}")
                 dest.unlink()
                 return False
 
-            logger.info(f"修复成功: {dest.name}")
+            if not suppress_success_log:
+                logger.info(f"修复成功: {dest.name}")
             return True
 
         except Exception as e:
-            logger.error(f"下载失败 {dest.name}: {e}")
+            emit_error(f"下载失败 {dest.name}: {e}")
             if dest.exists():
                 dest.unlink()
             return False
