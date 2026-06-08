@@ -11,7 +11,7 @@ PKG_NAME := ww-manager
 
 help:
 	@echo "可用命令列表:"
-	@echo "  make setup      - 初始化开发环境 (同步依赖并安装 pre-commit)"
+	@echo "  make setup      - 初始化开发环境 (安装 pre-commit 等工具)"
 	@echo "  make format     - 自动格式化代码并修复可自动修复的 Lint 错误"
 	@echo "  make lint       - 运行严格的代码与格式检查"
 	@echo "  make build      - 构建 Wheel 和 sdist 发行包"
@@ -24,10 +24,8 @@ help:
 # ==============================================================================
 
 setup:
-	@echo "=> 同步 uv 依赖..."
-	uv sync
 	@echo "=> 安装 pre-commit 钩子..."
-	uv run pre-commit install
+	uv tool install pre-commit && uv tool install ruff
 
 # ==============================================================================
 # 代码审查与格式化
@@ -35,13 +33,13 @@ setup:
 
 format:
 	@echo "=> 格式化代码并尝试自动修复..."
-	uv run ruff check --fix .
-	uv run ruff format .
+	ruff check --fix .
+	ruff format .
 
 lint:
 	@echo "=> 执行严格审查 (Lint & Format Check)..."
-	uv run ruff check .
-	uv run ruff format --check .
+	ruff check .
+	ruff format --check .
 
 # ==============================================================================
 # 构建与分发

@@ -23,65 +23,28 @@
 * **🚀 秒级切换 (`checkout`)**：利用 MD5 快速校验，仅替换差异文件，在不同服务器间瞬间切换。
 * **🛠️ 智能修复 (`sync`)**：校验全量文件 MD5，自动修复损坏文件，下载缺失资源。
 * **📦 完整下载 (`download`)**：从零开始下载任一服务器的纯净客户端。
-* **🔥 增量更新(`incremental`)**: 测试中，基于官方启动器解包的补丁二进制(见release）。
+* **🔥 增量更新(`incremental`)**: 测试中，基于官方启动器解包的补丁二进制(见release），欢迎测试并提交问题。
 * **💾 自动记忆**：自动记录游戏路径，一次设置，永久生效。
 * **⚡️ 现代化 CLI**：基于 `Typer` 构建，支持自动补全和帮助信息。
 * **👯 并行下载**: 使用多线程并行下载，避免 CDN 节点降速，支持断点续传。
-* **🔥 增量更新(`incremental`)**: 实验性功能，详见[ dev 分支](https://github.com/timetetng/wutheringwaves-cli-manager/tree/dev)，基于官方启动器解包的补丁二进制(见release），欢迎测试并提交问题。
+
 
 ## 🔧 安装指南
 
-本工具支持通过多种方式安装，推荐使用 [**uv**](https://github.com/astral-sh/uv) 进行管理。
-
-###  AUR
-```bash
-yay -S ww-manager
-```
-
----
-
-### 🚀 使用 uv
-
-#### 1. 安装 uv
-
-* **Linux / macOS:**
-    ```bash
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    ```
-* **Windows:**
-    ```pwsh
-    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-    ```
-
->  **提示**：安装完成后，请**重启终端**以使环境变量生效。
-
-#### 2. 安装工具
-
-* 方式一：从 PyPI 安装 (推荐)
-```bash
-uv tool install ww-manager
-```
-
-* 方式二：从本地源码构建
-```bash
-git clone https://github.com/timetetng/wutheringwaves-cli-manager.git
-cd wutheringwaves-cli-manager
-
-# 在源码目录下执行安装
-uv tool install .
-```
-
-#### 3. 更新工具
+`dev` 分支仅用于开发测试，未提交到 AUR 以及 PyPI，请通过源码构建：
 
 ```bash
-ww update
+# 直接拉取 dev 分支仓库，已有仓库也可以直接 git checkout dev
+git clone -b dev --single-branch https://github.com/timetetng/wutheringwaves-cli-manager.git wwcli-dev &&cd wwcli-dev
+
+# 构建并安装
+uv tool install . --force
+
+# (可选)安装pre-commit
+make setup
 ```
 
-#### 4. 卸载工具
-
-```bash
-uv tool uninstall ww-manager
-```
+发现任何问题请提交 Issue, 贡献代码欢迎提交 PR.
 
 ## 📖 使用说明
 
@@ -120,7 +83,7 @@ ww checkout global
 ```
 #### 3\. 同步与修复 (`sync`)
 
-**每次游戏版本更新后**，或者切换服务器后发现文件缺失时使用。它会联网校验所有文件并下载更新。
+切换服务器或下载中断导致文件缺失时使用。它会联网校验所有文件并下载更新。版本更新请 `ww incremental` 命令增量更新
 
 ```bash
 ww sync
@@ -136,30 +99,25 @@ ww download cn
 ```
 
 #### 5\. 增量更新 (`incremental`)
-**节省约 100GB 流量**。在新版本预下载开放期间提前下载增量包，维护时应用：
+
+（**开发测试中**）在新版本预下载开放期间提前下载增量包，维护后应用。也可用于新版本直接增量更新，代替原先 `ww sync` 命令：
 
 ```bash
-# 预下载增量包
+# 下载增量包
 ww incremental
 
-# 维护时应用增量更新
+# 应用增量更新
 ww incremental --apply
 ```
 
 > [!CAUTION]
-> 1. **仅在新版本预下载开放期间可用，目前为**实验阶段**。经4.30测试，仍然有35g资源需要重新下载，比全量预下载节省约40g（edit:我趣，好像是库洛优化了近40g，不是我的功劳）；
+> 1. **新版本预下载开放之后才可以下载**；
 > 2. **如果应用中断，可重试 `ww incremental --apply`**；
 > 3. **应用后若有缺失文件，运行 `ww sync` 修复文件**；
-> 4. **请确保安装目录有足够磁盘空间**
+> 4. **请确保安装目录有足够磁盘空间（需要两倍的空间复制源文件用于合并补丁）**
 
-#### 7\. 校验新版本文件 (`sync --new`)
-增量更新应用后，校验游戏文件状态并修复不一致的文件：
 
-```bash
-ww sync --new
-```
-
-#### 8\. 获取抽卡记录链接 (`log`)
+#### 6\. 获取抽卡记录链接 (`log`)
 
 可以一键获取抽卡链接，用于导入小程序或者鸣潮机器人。
 
