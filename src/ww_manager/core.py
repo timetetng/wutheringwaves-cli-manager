@@ -29,6 +29,28 @@ from ww_manager.config import SERVER_CONFIGS, SERVER_DIFF_FILES
 logger = logging.getLogger("WW_Manager")
 
 
+# 日志解密
+LOG_MAGIC = b"\xa5\xef\xa5"
+
+
+def decrypt_client_log(data: bytes) -> bytes:
+    if len(data) < 3:
+        return data
+    out = bytearray()
+    for b in data[3:]:
+        out.append(b ^ (0xA5 if b % 2 == 1 else 0xEF))
+    return bytes(out)
+
+
+def is_log_encrypted(data: bytes) -> bool:
+    if data[:3] == LOG_MAGIC:
+        return True
+    if data[0] == 0 and len(data) > 3:
+        dec = decrypt_client_log(data)
+        return dec.decode("utf-8", errors="ignore").startswith("Log file open")
+    return False
+
+
 # --- 自定义异常 ---
 class WWError(Exception):
     """基础异常类"""

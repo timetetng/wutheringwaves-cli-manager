@@ -149,7 +149,7 @@ ww predownload --apply
 > [!CAUTION]
 > 1. **版本更新当天凌晨4点开始维护之后**，才可以应用预下载资源；
 > 2. **请确保使用和预下载相同的端服合并** ；
-> 3. **当前仅实现全量下载，请确保有足够磁盘空间**。
+> 3. **此为全量下载，请确保有足够磁盘空间，增量更新见[ dev 分支](https://github.com/timetetng/wutheringwaves-cli-manager/tree/dev)**。
 
 #### 6\. 获取抽卡记录链接 (`log`)
 
