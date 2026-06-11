@@ -231,6 +231,13 @@ ww upadate
 
 ---
 
+### Q5: 除了本项目，还有其他下载更新鸣潮的方式吗？
+OC👌，给希望在 Linux 上使用官方启动器的用户的解决方案：
+
+[在 Linux 上运行鸣潮官方启动器](https://site.moyingji.one/linux/gaming/workarounds/wuwa-launcher)
+
+---
+
 ### 📢 反馈
 任何问题请在 **Issue** 中提出，也欢迎 **PR**。
 
