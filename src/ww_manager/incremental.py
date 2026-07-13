@@ -60,11 +60,14 @@ class ApplySpinnerColumn(SpinnerColumn):
         return Text("")
 
 
-class ApplyBarColumn(BarColumn):
-    """只为总任务显示进度条，子任务只显示 spinner、名称和耗时。"""
+class ApplyRainbowBarColumn(BarColumn):
+    """总任务使用彩虹进度条，子任务不显示 bar。"""
 
     def render(self, task):
         if task.fields.get("kind") == "overall":
+            color = RAINBOW_COLORS[task.id % len(RAINBOW_COLORS)]
+            self.complete_style = color
+            self.finished_style = color
             return super().render(task)
         return Text("")
 
@@ -1045,9 +1048,10 @@ class IncrementalManager:
             return False
 
         max_workers = min(4, len(group_infos))
+        # 大文件优先：按 group 总大小降序排列，让最大的先启动
+        group_infos = sorted(group_infos, key=lambda g: self._get_group_size(g), reverse=True)
         logger.info(
-            f"开始合并 {len(group_infos)} 个增量包，并发 {max_workers} 个。"
-            "单个大文件可能耗时数分钟，请勿中断进程。"
+            f"开始合并 {len(group_infos)} 个增量包，并发 {max_workers} 个部分大文件可能耗时数分钟，请勿中断进程。"
         )
 
         results = {}
@@ -1058,11 +1062,16 @@ class IncrementalManager:
                 return "unknown"
             return Path(dest).stem
 
-        def group_description(dest: Optional[str], stage: Optional[str] = None) -> str:
+        _group_colors = RAINBOW_COLORS
+
+        def group_color(task_idx: int) -> str:
+            return _group_colors[task_idx % len(_group_colors)]
+
+        def group_description(dest: Optional[str], stage: Optional[str] = None, color: str = "cyan") -> str:
             label = group_label(dest)
             if stage:
-                return f"[cyan]{label}[/cyan] [dim]{stage}[/dim]"
-            return f"[cyan]{label}[/cyan]"
+                return f"[{color}]{label}[/{color}] [dim]{stage}[/dim]"
+            return f"[{color}]{label}[/{color}]"
 
         def apply_wrapper(group):
             dest = group.get("dest")
@@ -1106,7 +1115,7 @@ class IncrementalManager:
         progress = Progress(
             ApplySpinnerColumn("dots"),
             TextColumn("{task.description}"),
-            ApplyBarColumn(bar_width=40),
+            ApplyRainbowBarColumn(bar_width=40),
             ApplyPercentageColumn(),
             ApplyCountColumn(),
             TimeElapsedColumn(),
@@ -1118,7 +1127,11 @@ class IncrementalManager:
             task_id = progress.add_task("[bold cyan]应用增量包", total=len(group_infos), kind="overall")
             active_tasks = {}
 
+            _child_color_counter = 0
+            _child_color_map: dict = {}
+
             def drain_status_events():
+                nonlocal _child_color_counter
                 while True:
                     try:
                         kind, event_target, msg = status_events.get_nowait()
@@ -1127,15 +1140,21 @@ class IncrementalManager:
 
                     if kind in ("start", "status"):
                         child_task_id = active_tasks.get(event_target)
-                        description = group_description(event_target, msg)
                         if child_task_id is None:
+                            c = group_color(_child_color_counter)
+                            _child_color_map[event_target] = _child_color_counter
+                            _child_color_counter += 1
+                            description = group_description(event_target, msg, color=c)
                             active_tasks[event_target] = progress.add_task(description, total=None, kind="group")
                         else:
+                            idx = _child_color_map.get(event_target, 0)
+                            description = group_description(event_target, msg, color=group_color(idx))
                             progress.update(child_task_id, description=description)
                     elif kind == "log":
                         _emit_progress_log(progress, event_target, msg)
                     elif kind == "finish":
                         child_task_id = active_tasks.pop(event_target, None)
+                        _child_color_map.pop(event_target, None)
                         if child_task_id is not None:
                             progress.remove_task(child_task_id)
 
