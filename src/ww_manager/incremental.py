@@ -1208,6 +1208,9 @@ class IncrementalManager:
         shutil.rmtree(download_dir)
         logger.info("已清理增量下载目录")
 
+        self._cleanup_cache_dir()
+        logger.info("已清理缓存临时目录")
+
         self._update_local_version(version_info.get("to_version"))
         logger.info("增量更新应用完成。建议运行 'ww sync --new' 做最终校验。")
 
@@ -1749,6 +1752,18 @@ class IncrementalManager:
             self._update_local_version(target_version or index_data)
             return True
         return False
+
+    def _cleanup_cache_dir(self) -> None:
+        """清理缓存中的临时目录（patch_temp、回退下载、修复下载等）"""
+        temp_subdirs = ["patch_temp", "full_download_temp", "repair_download_temp"]
+        cleaned = 0
+        for name in temp_subdirs:
+            subdir = self.cache_dir / name
+            if subdir.exists():
+                shutil.rmtree(subdir, ignore_errors=True)
+                cleaned += 1
+        if cleaned:
+            logger.debug(f"已清理 {cleaned} 个缓存临时目录")
 
     def _find_resource_base(self) -> Optional[str]:
         """从 indexFile.json 或 API 配置获取资源路径前缀"""
