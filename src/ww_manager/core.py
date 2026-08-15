@@ -25,7 +25,12 @@ from rich.progress import (
 )
 
 from ww_manager.config import SERVER_CONFIGS, SERVER_DIFF_FILES
-from ww_manager.incremental import IncrementalError, IncrementalManager, check_hpatchz_requirements
+from ww_manager.incremental import (
+    IncrementalError,
+    IncrementalManager,
+    _resource_rel_path,
+    check_hpatchz_requirements,
+)
 
 logger = logging.getLogger("WW_Manager")
 
@@ -427,7 +432,10 @@ class WGameManager:
 
             # 定义供多线程调用的单个文件校验函数
             def check_file(item):
-                dest_path = self.game_folder / item["dest"]
+                try:
+                    dest_path = self.game_folder / _resource_rel_path(item["dest"])
+                except IncrementalError:
+                    return None, item["dest"]
                 expected_md5 = item["md5"]
                 expected_size = int(item["size"])
 
@@ -515,7 +523,11 @@ class WGameManager:
         logger.info(f"开始准备预下载资源 (目标版本: {target_version})...")
 
         for item in res_list:
-            dest_path = predownload_root / item["dest"]
+            try:
+                dest_path = predownload_root / _resource_rel_path(item["dest"])
+            except IncrementalError:
+                logger.warning(f"跳过非法资源路径: {item['dest']}")
+                continue
             expected_size = int(item["size"])
 
             # 判断是否需要下载
