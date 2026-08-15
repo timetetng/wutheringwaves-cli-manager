@@ -149,6 +149,20 @@ def main(
     ctx.obj["game_path"] = final_path
 
 
+def _is_ww_manager_repo(path: Path) -> bool:
+    """检查目录是否为 ww-manager 源码仓库，避免在其它 git 仓库误拉代码"""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return "wutheringwaves-cli-manager" in result.stdout
+    except Exception:
+        return False
+
+
 @app.command()
 def update():
     """更新 ww-manager"""
@@ -157,9 +171,9 @@ def update():
     script_phys_dir = Path(__file__).resolve().parent.parent
 
     repo_path = None
-    if (current_dir / ".git").exists():
+    if (current_dir / ".git").exists() and _is_ww_manager_repo(current_dir):
         repo_path = current_dir
-    elif (script_phys_dir / ".git").exists():
+    elif (script_phys_dir / ".git").exists() and _is_ww_manager_repo(script_phys_dir):
         repo_path = script_phys_dir
 
     # 1. 源码
