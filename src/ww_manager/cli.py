@@ -360,7 +360,7 @@ def log(
         return
 
     pattern = re.compile(r'https?://[^"]+')
-    found: str | None = None
+    found: Optional[str] = None
 
     try:
         data = log_file.read_bytes()
