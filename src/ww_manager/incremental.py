@@ -839,6 +839,8 @@ class IncrementalManager:
             except Exception as e:
                 if attempt == retries - 1:
                     _emit_progress_log(progress, "ERROR", f"下载失败 {dest.name}: {e}")
+                    if progress and task_id is not None:
+                        progress.remove_task(task_id)
                     return False
                 time.sleep(1 + attempt)
 

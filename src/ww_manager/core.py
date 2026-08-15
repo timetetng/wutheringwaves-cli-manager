@@ -348,6 +348,8 @@ class WGameManager:
                     # 只有最后一次失败才记录日志，避免进度条乱掉
                     if progress:
                         progress.console.log(f"[red]下载失败 {dest.name}: {e}[/red]")
+                    if progress and task_id is not None:
+                        progress.remove_task(task_id)
                     return False
                 time.sleep(1 + attempt)
 
