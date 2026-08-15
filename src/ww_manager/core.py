@@ -309,6 +309,12 @@ class WGameManager:
                 with urlopen(req, timeout=15) as rsp:
                     if rsp.status not in (200, 206):
                         raise NetworkError(f"HTTP {rsp.status}")
+                    if resume_byte > 0 and rsp.status == 200:
+                        # 服务器忽略 Range 时重新写临时文件，避免追加出损坏文件
+                        resume_byte = 0
+                        mode = "wb"
+                        if progress and task_id is not None:
+                            progress.update(task_id, completed=0)
 
                     with open(temp_file, mode) as f:
                         while True:
