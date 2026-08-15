@@ -46,7 +46,7 @@ def decrypt_client_log(data: bytes) -> bytes:
 def is_log_encrypted(data: bytes) -> bool:
     if data[:3] == LOG_MAGIC:
         return True
-    if data[0] == 0 and len(data) > 3:
+    if len(data) > 3 and data[0] == 0:
         dec = decrypt_client_log(data)
         return dec.decode("utf-8", errors="ignore").startswith("Log file open")
     return False
