@@ -132,7 +132,7 @@ ww log
 自动检查安装方式并尝试更新
 
 ```bash
-ww upadate
+ww update
 ```
 
 ## 🎮 启动游戏 (Linux)

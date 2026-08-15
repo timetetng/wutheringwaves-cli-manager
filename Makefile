@@ -76,6 +76,6 @@ clean:
 	@echo "=> 清理完成！"
 
 uninstall:
-		@echo "=> 从 Arch Linux 系统中卸载本地测试包..."
-			sudo pacman -Rns $(PKG_NAME) || true
-				@echo "=> 卸载完成！"1
+	@echo "=> 从 Arch Linux 系统中卸载本地测试包..."
+	sudo pacman -Rns $(PKG_NAME) || true
+	@echo "=> 卸载完成！"
