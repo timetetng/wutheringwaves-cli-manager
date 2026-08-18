@@ -31,20 +31,58 @@
 
 ## 🔧 安装指南
 
-`dev` 分支仅用于开发测试，未提交到 AUR 以及 PyPI，请通过源码构建：
+本工具支持通过多种方式安装，推荐使用 [**uv**](https://github.com/astral-sh/uv) 进行管理。
+
+###  AUR
 
 ```bash
-# 直接拉取 dev 分支仓库，已有仓库也可以直接 git checkout dev
-git clone -b dev --single-branch https://github.com/timetetng/wutheringwaves-cli-manager.git wwcli-dev &&cd wwcli-dev
-
-# 构建并安装
-uv tool install . --force
-
-# (可选)安装pre-commit
-make setup
+yay -S ww-manager
 ```
 
-发现任何问题请提交 Issue, 贡献代码欢迎提交 PR.
+---
+
+### 🚀 使用 uv
+
+#### 1. 安装 uv
+
+* **Linux / macOS:**
+    ```bash
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    ```
+* **Windows:**
+    ```pwsh
+    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+    ```
+
+>  **提示**：安装完成后，请**重启终端**以使环境变量生效。
+
+#### 2. 安装工具
+
+* 方式一：从 PyPI 安装 (推荐)
+```bash
+uv tool install ww-manager
+```
+
+* 方式二：从本地源码构建
+```bash
+git clone https://github.com/timetetng/wutheringwaves-cli-manager.git
+cd wutheringwaves-cli-manager
+
+# 在源码目录下执行安装
+uv tool install .
+```
+
+#### 3. 更新工具
+
+```bash
+ww update
+```
+
+#### 4. 卸载工具
+
+```bash
+uv tool uninstall ww-manager
+```
 
 ## 📖 使用说明
 
