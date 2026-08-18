@@ -149,6 +149,20 @@ def main(
     ctx.obj["game_path"] = final_path
 
 
+def _is_ww_manager_repo(path: Path) -> bool:
+    """检查目录是否为 ww-manager 源码仓库，避免在其它 git 仓库误拉代码"""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return "wutheringwaves-cli-manager" in result.stdout
+    except Exception:
+        return False
+
+
 @app.command()
 def update():
     """更新 ww-manager"""
@@ -157,9 +171,9 @@ def update():
     script_phys_dir = Path(__file__).resolve().parent.parent
 
     repo_path = None
-    if (current_dir / ".git").exists():
+    if (current_dir / ".git").exists() and _is_ww_manager_repo(current_dir):
         repo_path = current_dir
-    elif (script_phys_dir / ".git").exists():
+    elif (script_phys_dir / ".git").exists() and _is_ww_manager_repo(script_phys_dir):
         repo_path = script_phys_dir
 
     # 1. 源码
@@ -226,7 +240,10 @@ def status(ctx: typer.Context):
 
 
 @app.command()
-def sync(ctx: typer.Context):
+def sync(
+    ctx: typer.Context,
+    check_new: Annotated[bool, typer.Option("--new", help="校验并修复新版本文件状态（用于增量更新应用后）")] = False,
+):
     """全量校验并修复文件"""
     path = get_game_path(ctx)
     cfg_file = path / "launcherDownloadConfig.json"
@@ -239,7 +256,12 @@ def sync(ctx: typer.Context):
             pass
     try:
         mgr = WGameManager(path, server)
-        mgr.sync_files(force_check_md5=True)
+        if check_new:
+            success = mgr.verify_new_version()
+            if not success:
+                typer.secho("校验发现问题，请根据提示处理", fg="yellow")
+        else:
+            mgr.sync_files(force_check_md5=True)
     except WWError as e:
         typer.secho(f"执行失败: {e}", fg="red")
         raise typer.Exit(1)
@@ -273,13 +295,16 @@ def checkout(
         raise typer.Exit(1)
 
 
-@app.command()
-def predownload(
+def _run_incremental(
     ctx: typer.Context,
-    action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用预下载资源")] = None,
-    apply_flag: Annotated[bool, typer.Option("--apply", help="应用预下载资源")] = False,
+    action: Optional[str],
+    apply_flag: bool,
 ):
-    """预下载管理"""
+    """增量更新核心逻辑（下载增量包 / 应用增量更新）。
+
+    predownload 与 incremental 两个命令共用此实现：
+    通过预设通道/新版本通道下载增量包，并在维护后应用合并补丁。
+    """
     path = get_game_path(ctx)
     cfg_file = path / "launcherDownloadConfig.json"
     server = "cn"
@@ -289,22 +314,65 @@ def predownload(
             server = APPID_TO_SERVER.get(d.get("appId"), "cn")
         except Exception:
             pass
-    is_apply = (action == "apply") or apply_flag
-    if action and action != "apply":
-        typer.secho(f"未知的参数: {action}。直接运行进行预下载，应用更新请使用 'apply'。", fg="red")
-        raise typer.Exit(1)
+
     try:
         mgr = WGameManager(path, server)
+        is_apply = (action == "apply") or apply_flag
+
+        if action and action != "apply":
+            typer.secho(f"未知的参数: {action}。直接运行进行下载，应用更新请使用 'apply'。", fg="red")
+            raise typer.Exit(1)
+
         if is_apply:
             typer.confirm(
-                "确定要应用预下载资源吗？\n这将会覆盖现有的游戏文件，请确保游戏目前已维护或更新完毕。", abort=True
+                "确定要应用增量更新吗？\n这将会修改现有的游戏文件，请确保游戏目前已维护或更新完毕。", abort=True
             )
-            mgr.apply_predownload()
+            success = mgr.apply_incremental()
+            if success:
+                typer.secho("增量更新应用成功！", fg="green")
+            else:
+                typer.secho("增量更新应用失败", fg="red")
+                raise typer.Exit(1)
         else:
-            mgr.download_predownload()
+            success = mgr.download_incremental()
+            if success:
+                typer.secho("增量更新资源下载完成！之后可使用 'apply' 命令应用更新。", fg="green")
+            else:
+                typer.secho("增量更新资源下载失败", fg="red")
+                raise typer.Exit(1)
+
     except WWError as e:
-        typer.secho(f"预下载操作失败: {e}", fg="red")
+        typer.secho(f"增量更新操作失败: {e}", fg="red")
         raise typer.Exit(1)
+
+
+@app.command()
+def predownload(
+    ctx: typer.Context,
+    action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
+    apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
+):
+    """
+    预下载/增量更新
+
+    预下载开放期间执行下载增量包，维护后应用合并补丁；新版本开启后也可直接用于增量更新。
+    用法：ww predownload 下载增量包，ww predownload --apply 应用更新。
+    """
+    _run_incremental(ctx, action, apply_flag)
+
+
+@app.command()
+def incremental(
+    ctx: typer.Context,
+    action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
+    apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
+):
+    """
+    增量更新（predownload 的别名）
+
+    用法与 ww predownload 一致：下载增量包，应用时使用 'apply'。
+    """
+    _run_incremental(ctx, action, apply_flag)
 
 
 @app.command()
@@ -320,7 +388,7 @@ def log(
         return
 
     pattern = re.compile(r'https?://[^"]+')
-    found: str | None = None
+    found: Optional[str] = None
 
     try:
         data = log_file.read_bytes()

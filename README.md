@@ -1,6 +1,6 @@
 
 <div align="center"><h1>WutheringWaves CLI Manager</h1><h3>鸣潮命令行管理器</h3><div align="center">
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.1-brightgreen.svg" alt="version 2.1">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.2-brightgreen.svg" alt="version 2.2">
 </div>
 </div>
 
@@ -23,65 +23,28 @@
 * **🚀 秒级切换 (`checkout`)**：利用 MD5 快速校验，仅替换差异文件，在不同服务器间瞬间切换。
 * **🛠️ 智能修复 (`sync`)**：校验全量文件 MD5，自动修复损坏文件，下载缺失资源。
 * **📦 完整下载 (`download`)**：从零开始下载任一服务器的纯净客户端。
-* **🔥 预下载(`predownload`)**: 预下载开放时提前下载游戏资源。
+* **🔥 预下载/增量更新(`predownload`)**: 预下载开放期下载增量包、维护后应用合并补丁；新版本开启后也可直接增量更新。基于官方启动器解包的补丁二进制(见 release），欢迎测试并提交问题。`incremental` 为其别名。
 * **💾 自动记忆**：自动记录游戏路径，一次设置，永久生效。
 * **⚡️ 现代化 CLI**：基于 `Typer` 构建，支持自动补全和帮助信息。
 * **👯 并行下载**: 使用多线程并行下载，避免 CDN 节点降速，支持断点续传。
-* **🔥 增量更新(`incremental`)**: 实验性功能，详见[ dev 分支](https://github.com/timetetng/wutheringwaves-cli-manager/tree/dev)，基于官方启动器解包的补丁二进制(见release），欢迎测试并提交问题。
+
 
 ## 🔧 安装指南
 
-本工具支持通过多种方式安装，推荐使用 [**uv**](https://github.com/astral-sh/uv) 进行管理。
-
-###  AUR
-```bash
-yay -S ww-manager
-```
-
----
-
-### 🚀 使用 uv
-
-#### 1. 安装 uv
-
-* **Linux / macOS:**
-    ```bash
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    ```
-* **Windows:**
-    ```pwsh
-    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-    ```
-
->  **提示**：安装完成后，请**重启终端**以使环境变量生效。
-
-#### 2. 安装工具
-
-* 方式一：从 PyPI 安装 (推荐)
-```bash
-uv tool install ww-manager
-```
-
-* 方式二：从本地源码构建
-```bash
-git clone https://github.com/timetetng/wutheringwaves-cli-manager.git
-cd wutheringwaves-cli-manager
-
-# 在源码目录下执行安装
-uv tool install .
-```
-
-#### 3. 更新工具
+`dev` 分支仅用于开发测试，未提交到 AUR 以及 PyPI，请通过源码构建：
 
 ```bash
-ww update
+# 直接拉取 dev 分支仓库，已有仓库也可以直接 git checkout dev
+git clone -b dev --single-branch https://github.com/timetetng/wutheringwaves-cli-manager.git wwcli-dev &&cd wwcli-dev
+
+# 构建并安装
+uv tool install . --force
+
+# (可选)安装pre-commit
+make setup
 ```
 
-#### 4. 卸载工具
-
-```bash
-uv tool uninstall ww-manager
-```
+发现任何问题请提交 Issue, 贡献代码欢迎提交 PR.
 
 ## 📖 使用说明
 
@@ -120,7 +83,7 @@ ww checkout global
 ```
 #### 3\. 同步与修复 (`sync`)
 
-**每次游戏版本更新后**，或者切换服务器后发现文件缺失时使用。它会联网校验所有文件并下载更新。
+切换服务器或下载中断导致文件缺失时使用。它会联网校验所有文件并下载更新。版本更新请 `ww predownload` 命令预下载/增量更新（`ww predownload --apply` 应用）
 
 ```bash
 ww sync
@@ -135,21 +98,28 @@ ww sync
 ww download cn
 ```
 
-#### 5\. 预下载更新 (`predownload`)
-**版本更新前几天**会开放预下载，此时可以使用 `ww predownload` 进行预下载：
+#### 5\. 预下载 / 增量更新 (`predownload`，别名 `incremental`)
+
+在新版本预下载开放期间通过本命令提前下载增量包，维护后应用合并补丁。新版本开启后同样可执行本命令直接增量更新（不再依赖全量 sync 同步文件）。`incremental` 与 `predownload` 等价，可互换使用。
 
 ```bash
-# 预下载
+# 下载增量包（预下载开放期提前下载；新版本开启后也可直接下载增量包更新）
 ww predownload
 
-# 版本更新后，应用预下载（合并资源）
+# 应用增量更新（维护后合并补丁）
 ww predownload --apply
+
+# incremental 别名用法相同
+ww incremental
+ww incremental --apply
 ```
 
 > [!CAUTION]
-> 1. **版本更新当天凌晨4点开始维护之后**，才可以应用预下载资源；
-> 2. **请确保使用和预下载相同的端服合并** ；
-> 3. **此为全量下载，请确保有足够磁盘空间，增量更新见[ dev 分支](https://github.com/timetetng/wutheringwaves-cli-manager/tree/dev)**。
+> 1. **预下载开放之后即可开始下载增量包**（新版本开启后此通道会转为直接增量更新）；
+> 2. **如果应用中断，可重试 `ww predownload --apply`**；
+> 3. **应用后若有缺失文件，运行 `ww sync` 修复文件**；
+> 4. **请确保安装目录有足够磁盘空间（需要两倍的空间复制源文件用于合并补丁）**
+
 
 #### 6\. 获取抽卡记录链接 (`log`)
 
@@ -166,7 +136,7 @@ ww log
 自动检查安装方式并尝试更新
 
 ```bash
-ww upadate
+ww update
 ```
 
 ## 🎮 启动游戏 (Linux)

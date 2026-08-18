@@ -25,6 +25,12 @@ from rich.progress import (
 )
 
 from ww_manager.config import SERVER_CONFIGS, SERVER_DIFF_FILES
+from ww_manager.incremental import (
+    IncrementalError,
+    IncrementalManager,
+    _resource_rel_path,
+    check_hpatchz_requirements,
+)
 
 logger = logging.getLogger("WW_Manager")
 
@@ -45,7 +51,7 @@ def decrypt_client_log(data: bytes) -> bytes:
 def is_log_encrypted(data: bytes) -> bool:
     if data[:3] == LOG_MAGIC:
         return True
-    if data[0] == 0 and len(data) > 3:
+    if len(data) > 3 and data[0] == 0:
         dec = decrypt_client_log(data)
         return dec.decode("utf-8", errors="ignore").startswith("Log file open")
     return False
@@ -225,23 +231,6 @@ class WGameManager:
                 raise NetworkError("无法下载文件清单")
         return self._game_index
 
-    # 获取预下载信息
-    @property
-    def predownload_index(self):
-        pre_info = self.launcher_info.get("predownload")
-        if not pre_info:
-            return None
-
-        # 构造预下载 index 的 URL
-        config = pre_info.get("config", {})
-        uri = config.get("indexFile")
-        if not uri:
-            return None
-
-        url = urljoin(self.cdn_node, uri)
-        logger.info("下载预下载文件清单...")
-        return self._http_get_json(url)
-
     def _http_get_json(self, url: str) -> Optional[Any]:
         try:
             req = Request(url, headers={"User-Agent": "WW-Manager/2.0", "Accept-Encoding": "gzip"})
@@ -308,6 +297,12 @@ class WGameManager:
                 with urlopen(req, timeout=15) as rsp:
                     if rsp.status not in (200, 206):
                         raise NetworkError(f"HTTP {rsp.status}")
+                    if resume_byte > 0 and rsp.status == 200:
+                        # 服务器忽略 Range 时重新写临时文件，避免追加出损坏文件
+                        resume_byte = 0
+                        mode = "wb"
+                        if progress and task_id is not None:
+                            progress.update(task_id, completed=0)
 
                     with open(temp_file, mode) as f:
                         while True:
@@ -336,6 +331,8 @@ class WGameManager:
                     # 只有最后一次失败才记录日志，避免进度条乱掉
                     if progress:
                         progress.console.log(f"[red]下载失败 {dest.name}: {e}[/red]")
+                    if progress and task_id is not None:
+                        progress.remove_task(task_id)
                     return False
                 time.sleep(1 + attempt)
 
@@ -420,7 +417,10 @@ class WGameManager:
 
             # 定义供多线程调用的单个文件校验函数
             def check_file(item):
-                dest_path = self.game_folder / item["dest"]
+                try:
+                    dest_path = self.game_folder / _resource_rel_path(item["dest"])
+                except IncrementalError:
+                    return None, item["dest"]
                 expected_md5 = item["md5"]
                 expected_size = int(item["size"])
 
@@ -477,128 +477,6 @@ class WGameManager:
 
         logger.info(f"{self.server_type} 服完整客户端下载完毕！")
 
-    def download_predownload(self):
-        """执行预下载逻辑，将资源下载到 .predownload 临时目录"""
-        index = self.predownload_index
-        if not index:
-            raise WWError("当前服务器未开放预下载，或未能获取到预下载配置。")
-
-        pre_info = self.launcher_info.get("predownload", {})
-        pre_config = pre_info.get("config", {})
-        res_base = pre_config.get("resourcesBasePath") or pre_config.get("baseUrl")
-        if not res_base:
-            raise WWError("无法获取预下载资源路径配置 (resourcesBasePath 和 baseUrl 均为空)")
-        res_list = index.get("resource", [])
-
-        if not res_list:
-            logger.info("预下载资源列表为空。")
-            return
-
-        # 创建预下载目录
-        predownload_root = self.game_folder / ".predownload"
-        predownload_root.mkdir(parents=True, exist_ok=True)
-
-        # 保存版本和服务器信息，供之后 apply_predownload 校验使用
-        target_version = pre_info.get("version", "unknown")
-        version_info = {"version": target_version, "server": self.server_type}
-        with open(predownload_root / "predownload_version.json", "w", encoding="utf-8") as f:
-            json.dump(version_info, f, indent=4)
-
-        tasks = []
-        logger.info(f"开始准备预下载资源 (目标版本: {target_version})...")
-
-        for item in res_list:
-            dest_path = predownload_root / item["dest"]
-            expected_size = int(item["size"])
-
-            # 判断是否需要下载
-            need_download = False
-            if not dest_path.exists():
-                need_download = True
-            elif dest_path.stat().st_size != expected_size:
-                need_download = True
-
-            if need_download:
-                url = urljoin(self.cdn_node, f"{res_base}/{item['dest']}")
-                tasks.append(
-                    {
-                        "url": quote(url, safe=":/"),
-                        "path": dest_path,
-                        "size": expected_size,
-                    }
-                )
-
-        if tasks:
-            self._batch_download(tasks)
-            logger.info("预下载资源下载完成！之后可使用 'ww predownload --apply' 命令应用更新。")
-        else:
-            logger.info("所有预下载资源均已存在且校验通过，无需重复下载。")
-
-    # 应用预下载
-    def apply_predownload(self):
-        predownload_root = self.game_folder / ".predownload"
-        version_file = predownload_root / "predownload_version.json"
-
-        if not predownload_root.exists() or not version_file.exists():
-            raise ConfigError("未找到有效的预下载内容，请先执行预下载。")
-
-        # 读取版本信息
-        try:
-            with open(version_file, "r") as f:
-                info = json.load(f)
-                target_version = info["version"]
-                predownload_server = info["server"]
-        except Exception:
-            raise ConfigError("预下载版本信息损坏。")
-
-        # 将校验逻辑移出 try 块，避免明确的报错信息被 Exception 捕获吞掉
-        if predownload_server != self.server_type:
-            raise ConfigError(f"预下载的服务器类型 ({predownload_server}) 与当前不符。")
-
-        logger.info(f"正在应用更新 (目标版本: {target_version})...")
-
-        # 1. 移动文件
-        # 遍历 .predownload 下的所有文件并移动到 game_folder
-        count = 0
-        for file_path in predownload_root.rglob("*"):
-            if file_path.is_file() and file_path.name != "predownload_version.json":
-                # 计算相对路径
-                rel_path = file_path.relative_to(predownload_root)
-                dest_path = self.game_folder / rel_path
-
-                # 确保目标文件夹存在
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-                # 移动文件 (如果存在则覆盖)
-                shutil.move(str(file_path), str(dest_path))
-                # 清除旧文件的 MD5 缓存
-                self.md5_cache.clear(dest_path)
-                count += 1
-
-        logger.info(f"已合并 {count} 个文件。")
-
-        # 2. 清理预下载目录
-        shutil.rmtree(predownload_root)
-
-        # 3. 更新本地配置文件版本号
-        cfg_path = self.game_folder / "launcherDownloadConfig.json"
-        if cfg_path.exists():
-            with open(cfg_path, "r+") as f:
-                data = json.load(f)
-                data["version"] = target_version
-                f.seek(0)
-                json.dump(data, f, indent=4)
-                f.truncate()
-
-        logger.info("预下载资源已合并。正在进行最终完整性校验...")
-
-        # 4. 强制执行一次 Sync 以确保万无一失
-        self._launcher_info = None
-        self._game_index = None
-        self.sync_files(force_check_md5=False)
-
-        logger.info(f"更新完成！当前版本: {target_version}")
-
     def checkout(self, target_server: str, force_sync: bool = False):
         # 1. 禁用当前差异文件
         for _, files in SERVER_DIFF_FILES.items():
@@ -645,3 +523,69 @@ class WGameManager:
             with open(self.game_folder / "launcherDownloadConfig.json", "w") as f:
                 json.dump(cfg, f, indent=4)
             logger.info(f"本地配置已更新: {self.server_type} ({v})")
+
+    def apply_incremental_update(self, dry_run: bool = False) -> bool:
+        """旧接口保留，调用新的统一管理器"""
+        is_ok, error_msg = check_hpatchz_requirements()
+        if not is_ok:
+            logger.warning(f"增量更新环境检查失败: {error_msg}")
+            return False
+
+        if dry_run:
+            logger.info("增量更新环境检查通过")
+            return True
+
+        manager = IncrementalManager(
+            self.game_folder,
+            self.server_type,
+            self.launcher_info,
+            self.cdn_node,
+        )
+
+        try:
+            return manager.apply_incremental()
+        except IncrementalError as e:
+            logger.error(f"增量更新失败: {e}")
+            return False
+
+    def download_incremental(self) -> bool:
+        """下载增量更新包"""
+        manager = IncrementalManager(
+            self.game_folder,
+            self.server_type,
+            self.launcher_info,
+            self.cdn_node,
+        )
+        try:
+            return manager.download_incremental()
+        except IncrementalError as e:
+            logger.error(f"增量包下载失败: {e}")
+            return False
+
+    def apply_incremental(self) -> bool:
+        """应用已下载的增量更新包"""
+        manager = IncrementalManager(
+            self.game_folder,
+            self.server_type,
+            self.launcher_info,
+            self.cdn_node,
+        )
+        try:
+            return manager.apply_incremental()
+        except IncrementalError as e:
+            logger.error(f"增量更新应用失败: {e}")
+            return False
+
+    def verify_new_version(self) -> bool:
+        """校验新版本文件状态（用于增量更新前检查）"""
+        manager = IncrementalManager(
+            self.game_folder,
+            self.server_type,
+            self.launcher_info,
+            self.cdn_node,
+        )
+        try:
+            return manager.verify_new_version()
+        except IncrementalError as e:
+            logger.error(f"校验失败: {e}")
+            return False
