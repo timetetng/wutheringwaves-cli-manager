@@ -295,16 +295,15 @@ def checkout(
         raise typer.Exit(1)
 
 
-@app.command()
-def incremental(
+def _run_incremental(
     ctx: typer.Context,
-    action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
-    apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
+    action: Optional[str],
+    apply_flag: bool,
 ):
-    """
-    增量更新
+    """增量更新核心逻辑（下载增量包 / 应用增量更新）。
 
-    需要在新版本预下载开放期间先执行下载，之后在维护时应用。
+    predownload 与 incremental 两个命令共用此实现：
+    通过预设通道/新版本通道下载增量包，并在维护后应用合并补丁。
     """
     path = get_game_path(ctx)
     cfg_file = path / "launcherDownloadConfig.json"
@@ -337,7 +336,7 @@ def incremental(
         else:
             success = mgr.download_incremental()
             if success:
-                typer.secho("增量更新资源下载完成！之后可使用 'ww incremental --apply' 命令应用更新。", fg="green")
+                typer.secho("增量更新资源下载完成！之后可使用 'apply' 命令应用更新。", fg="green")
             else:
                 typer.secho("增量更新资源下载失败", fg="red")
                 raise typer.Exit(1)
@@ -345,6 +344,35 @@ def incremental(
     except WWError as e:
         typer.secho(f"增量更新操作失败: {e}", fg="red")
         raise typer.Exit(1)
+
+
+@app.command()
+def predownload(
+    ctx: typer.Context,
+    action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
+    apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
+):
+    """
+    预下载/增量更新
+
+    预下载开放期间执行下载增量包，维护后应用合并补丁；新版本开启后也可直接用于增量更新。
+    用法：ww predownload 下载增量包，ww predownload --apply 应用更新。
+    """
+    _run_incremental(ctx, action, apply_flag)
+
+
+@app.command()
+def incremental(
+    ctx: typer.Context,
+    action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
+    apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
+):
+    """
+    增量更新（predownload 的别名）
+
+    用法与 ww predownload 一致：下载增量包，应用时使用 'apply'。
+    """
+    _run_incremental(ctx, action, apply_flag)
 
 
 @app.command()
