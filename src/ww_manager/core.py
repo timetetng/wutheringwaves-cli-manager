@@ -24,7 +24,15 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
-from ww_manager.config import SERVER_CONFIGS, SERVER_DIFF_FILES
+from ww_manager.config import (
+    APPID_TO_SERVER,
+    DIFF_CACHE_SERVERS,
+    SERVER_CONFIGS,
+    SERVER_DIFF_CACHE_DIR_NAME,
+    SERVER_DIFF_CACHE_MANIFEST,
+    SERVER_DIFF_CACHE_VERSION,
+    parse_major_minor,
+)
 from ww_manager.incremental import (
     IncrementalError,
     IncrementalManager,
@@ -194,6 +202,10 @@ class WGameManager:
         self.config = SERVER_CONFIGS[server_type]
 
         self.md5_cache = MD5Cache(self.game_folder / "wwm_md5_cache.json", self.game_folder)
+
+        # 服务器差异缓存目录（游戏目录内集中管理）
+        self.diff_cache_dir = self.game_folder / SERVER_DIFF_CACHE_DIR_NAME
+        self.diff_cache_manifest = self.diff_cache_dir / SERVER_DIFF_CACHE_MANIFEST
 
         self._launcher_info = None
         self._cdn_node = None
@@ -478,41 +490,267 @@ class WGameManager:
         logger.info(f"{self.server_type} 服完整客户端下载完毕！")
 
     def checkout(self, target_server: str, force_sync: bool = False):
-        # 1. 禁用当前差异文件
-        for _, files in SERVER_DIFF_FILES.items():
-            for f_rel in files:
-                f = self.game_folder / f_rel
-                bak = f.with_suffix(f.suffix + ".bak")
-                if f.exists():
-                    # Windows 兼容性
-                    os.replace(f, bak)
-                    self.md5_cache.clear(f)
+        """切换服务器。
 
-        # 2. 启用目标差异文件
-        missing = False
-        for f_rel in SERVER_DIFF_FILES.get(target_server, []):
-            f = self.game_folder / f_rel
-            bak = f.with_suffix(f.suffix + ".bak")
+        官服/B服适用"差异缓存"切换：
+        - 每次切换都请求两服索引的 md5 清单，算出差异文件集（同名 md5 不同 +
+          仅某服存在的文件）。
+        - 对每个差异文件，若本地缓存已存在且 md5 匹配目标服索引 -> 直接本地拷贝恢复；
+          否则从 CDN 下载并回填缓存（首次/缓存失效必然要走 CDN）。
+        - 同时把当前磁盘上的源服版本备份进缓存，保证切回源服时也能本地恢复。
+        - 大版本更新（major.minor 变化，如 3.4 -> 3.5）时差异文件必然变化，重置清空缓存。
 
-            if bak.exists():
-                # Windows 兼容
-                os.replace(bak, f)
-                self.md5_cache.clear(f)
-            elif f.exists():
-                pass
-            else:
-                missing = True
+        国际服(global) 文件集与国服几乎全异，不适用差异缓存，回退到全量校验同步。
+        --force-sync 强制走全量 md5 校验同步兜底。
+        """
+        if target_server not in SERVER_CONFIGS:
+            raise ConfigError(f"无效的服务器类型: {target_server}")
 
-        # 3. 更新配置
-        self.server_type = target_server
-        try:
+        src = self._detect_current_server()
+        dst = target_server
+
+        participate = src in DIFF_CACHE_SERVERS and dst in DIFF_CACHE_SERVERS
+
+        # 获取源服与目标服索引（源服用于对比差异与备份，目标服用于恢复/下载）
+        src_ctx = self._fetch_server_context(src)
+        dst_ctx = self._fetch_server_context(dst)
+
+        # 让 self 指向目标服，供配置写入/后续使用
+        self.server_type = dst
+        self.config = SERVER_CONFIGS[dst]
+        self._launcher_info = dst_ctx["info"]
+        self._cdn_node = dst_ctx["cdn"]
+
+        if src == dst:
+            logger.info(f"当前已在 {dst} 服，无需切换差异文件")
+            if force_sync:
+                logger.info("检测到强制同步，执行全量校验同步...")
+                self.sync_files(force_check_md5=True)
             self._update_local_config()
-        except Exception:
-            pass
+            return
 
-        if missing or force_sync:
-            logger.info("检测到缺失文件或强制同步，开始同步...")
+        if participate and not force_sync:
+            self._checkout_via_cache(src, dst, src_ctx, dst_ctx)
+        else:
+            label = "非差异缓存适用(国际服)" if not participate else "强制同步"
+            logger.info(f"{src} -> {dst}: {label}，执行全量校验同步...")
             self.sync_files(force_check_md5=True)
+            self._update_local_config()
+
+    # 差异缓存
+
+    def _detect_current_server(self) -> str:
+        """从本地配置读取当前已安装服；读不到则回退 self.server_type。"""
+        cfg_file = self.game_folder / "launcherDownloadConfig.json"
+        if cfg_file.exists():
+            try:
+                d = json.loads(cfg_file.read_text(encoding="utf-8"))
+                srv = APPID_TO_SERVER.get(d.get("appId"))
+                if srv:
+                    return srv
+            except Exception:
+                pass
+        return self.server_type
+
+    def _fetch_server_context(self, server: str) -> Dict[str, Any]:
+        """获取指定服的索引上下文，独立于 self.server_type。
+
+        返回 {version, cdn, res_base, resource, info}。
+        """
+        if server not in SERVER_CONFIGS:
+            raise ConfigError(f"无效的服务器类型: {server}")
+        cfg = SERVER_CONFIGS[server]
+        info = self._http_get_json(cfg["api_url"])
+        if not info:
+            raise NetworkError(f"无法获取 {server} 服启动器配置信息")
+        version = info["default"].get("version", "")
+        nodes = info["default"].get("cdnList", [])
+        valid = [n for n in nodes if n.get("K1") == 1 and n.get("K2") == 1]
+        if not valid:
+            raise NetworkError(f"{server} 服没有可用的 CDN 节点")
+        cdn = max(valid, key=lambda x: x["P"])["url"]
+        res_base = info["default"].get("resourcesBasePath") or info["default"].get("baseUrl")
+        uri = info["default"]["config"]["indexFile"]
+        idx = self._http_get_json(urljoin(cdn, uri))
+        if not idx:
+            raise NetworkError(f"无法下载 {server} 服文件清单")
+        return {
+            "version": version,
+            "cdn": cdn,
+            "res_base": res_base,
+            "resource": idx.get("resource", []),
+            "info": info,
+        }
+
+    @staticmethod
+    def _compute_diff_sets(src_res: List[Dict], dst_res: List[Dict]):
+        """对比两服文件清单。
+
+        返回 (same, diff_or_new, only_src)：
+         - same:        两服同名且 md5 相同（共享文件，无需处理）
+         - diff_or_new: 目标服需要的版本文件（同名 md5 不同 或 仅目标服存在）
+         - only_src:    仅源服存在（切到目标服后应隔离/移除）
+        """
+        src_map = {i["dest"]: i for i in src_res}
+        dst_map = {i["dest"]: i for i in dst_res}
+        same, diff_or_new, only_src = [], [], []
+        for d in set(src_map) | set(dst_map):
+            s = src_map.get(d)
+            t = dst_map.get(d)
+            if t is None:
+                only_src.append(d)
+            elif s is None or s["md5"] != t["md5"]:
+                diff_or_new.append(d)
+            else:
+                same.append(d)
+        return same, diff_or_new, only_src
+
+    def _checkout_via_cache(self, src: str, dst: str, src_ctx, dst_ctx) -> None:
+        same, diff_or_new, only_src = self._compute_diff_sets(src_ctx["resource"], dst_ctx["resource"])
+
+        # 大版本更新判定：major.minor 变化则重置清空差异缓存
+        major = parse_major_minor(dst_ctx["version"])
+        manifest = self._load_cache_manifest()
+        cached_major = tuple(manifest.get("major_minor") or ())
+        if major and cached_major and tuple(major) != cached_major:
+            logger.info(
+                f"检测到大版本更新 {'.'.join(map(str, cached_major))} -> {'.'.join(map(str, major))}，重置差异缓存..."
+            )
+            self._reset_diff_cache()
+            manifest = self._load_cache_manifest()
+
+        logger.info(f"分析 {src} ↔ {dst} 差异: 共享 {len(same)}，差异 {len(diff_or_new)}，仅{src}存在 {len(only_src)}")
+
+        # 1) 备份源服当前磁盘版本 + 恢复/收集目标服差异文件
+        to_download = []  # (dest, size, md5)
+        restored = 0
+        dst_map = {i["dest"]: i for i in dst_ctx["resource"]}
+        for d in diff_or_new:
+            item = dst_map[d]
+            self._backup_src_to_cache(src, d)
+            dst_cache = self._server_cache_path(dst, d)
+            if dst_cache.exists() and self._safe_md5(dst_cache) == item["md5"]:
+                # 缓存命中：本地恢复
+                dest_path = self.game_folder / _resource_rel_path(d)
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(dst_cache, dest_path)
+                self.md5_cache.clear(dest_path)
+                restored += 1
+            else:
+                to_download.append((d, item["size"], item["md5"]))
+
+        # 2) 下载缺失/失效的目标服版本并回填缓存
+        downloaded = self._download_diff_dst(dst, to_download, dst_ctx)
+
+        # 3) 隔离仅源服存在的文件（备份到缓存后从游戏目录移除）
+        for d in only_src:
+            self._isolate_src_only(src, d)
+
+        # 4) 记录缓存版本与大版本号
+        manifest["version"] = SERVER_DIFF_CACHE_VERSION
+        if major:
+            manifest["major_minor"] = list(major)
+        self._save_cache_manifest(manifest)
+
+        logger.info(f"切换完成: 本地恢复 {restored}，下载 {downloaded}，隔离 {len(only_src)}，共享 {len(same)}")
+
+        self._update_local_config()
+
+    def _load_cache_manifest(self) -> Dict[str, Any]:
+        if self.diff_cache_manifest.exists():
+            try:
+                with open(self.diff_cache_manifest, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"读取差异缓存清单失败，将重建: {e}")
+        return {}
+
+    def _save_cache_manifest(self, manifest: Dict[str, Any]) -> None:
+        try:
+            self.diff_cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.diff_cache_manifest, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.error(f"保存差异缓存清单失败: {e}")
+
+    def _reset_diff_cache(self) -> None:
+        """大版本更新时清空整个差异缓存目录（差异文件集必然变化）。"""
+        try:
+            if self.diff_cache_dir.exists():
+                shutil.rmtree(self.diff_cache_dir, ignore_errors=True)
+            logger.info(f"差异缓存已重置: {self.diff_cache_dir}")
+        except Exception as e:
+            logger.error(f"重置差异缓存失败: {e}")
+
+    def _server_cache_path(self, server: str, dest: str) -> Path:
+        """某服某文件的缓存路径：<cache_dir>/<server>/<rel_path>"""
+        return self.diff_cache_dir / server / _resource_rel_path(dest)
+
+    def _safe_md5(self, path: Path) -> Optional[str]:
+        if not path.exists() or not path.is_file():
+            return None
+        try:
+            with open(path, "rb") as f:
+                h = hashlib.md5()
+                for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return None
+
+    def _backup_src_to_cache(self, src: str, dest: str) -> None:
+        """把当前磁盘上的源服版本备份进缓存，供切回源服时秒级恢复。"""
+        game_path = self.game_folder / _resource_rel_path(dest)
+        if not game_path.is_file():
+            return
+        cache_path = self._server_cache_path(src, dest)
+        if cache_path.is_file():
+            return  # 已缓存
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(game_path, cache_path)
+        logger.debug(f"已备份源服版本: {dest} -> {cache_path}")
+
+    def _isolate_src_only(self, src: str, dest: str) -> None:
+        """仅源服存在的文件：切到目标服后不再需要，备份进缓存并从游戏目录移除。"""
+        game_path = self.game_folder / _resource_rel_path(dest)
+        if not game_path.is_file():
+            return
+        cache_path = self._server_cache_path(src, dest)
+        if not cache_path.is_file():
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(game_path, cache_path)
+        os.remove(game_path)
+        self.md5_cache.clear(game_path)
+        logger.debug(f"已隔离仅{src}存在的文件: {dest}")
+
+    def _download_diff_dst(self, dst: str, to_download, dst_ctx) -> int:
+        """下载目标服差异文件到游戏目录并回填缓存。to_download: (dest, size, md5)。"""
+        if not to_download:
+            return 0
+        total = sum(t[1] for t in to_download)
+        logger.info(f"准备下载 {len(to_download)} 个差异文件，总大小: {total / 1024 / 1024:.2f} MB")
+
+        tasks = []
+        for d, size, _md5 in to_download:
+            url = urljoin(dst_ctx["cdn"], f"{dst_ctx['res_base']}/{d}")
+            tasks.append(
+                {
+                    "url": quote(url, safe=":/"),
+                    "path": self.game_folder / _resource_rel_path(d),
+                    "size": size,
+                    "_dest": d,
+                }
+            )
+
+        self._batch_download(tasks)
+
+        # 回填目标服缓存
+        for t in tasks:
+            d = t["_dest"]
+            cache_path = self._server_cache_path(dst, d)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(t["path"], cache_path)
+        return len(tasks)
 
     def _update_local_config(self):
         # 优先使用 launcher_info 中的版本，如果获取不到则保持原状或报错

@@ -111,13 +111,17 @@ ww status
 
 **秒级**切换服务器（仅限官/b服）。
 
+官服、B服之间采用**差异文件缓存**机制：首次切换会下载两服差异文件并备份到游戏目录内的 `wwm_server_diff_cache/`，此后任意切换都从优先本地缓存恢复，无需重新下载，失败时回退至CDN下载。大版本更新（如 3.4 → 3.5）时会自动重置缓存。
+
 ```bash
 # 切换到 Bilibili 服
 ww checkout bilibili
 # 切换到 官服
 ww checkout cn
-# 切换到 国际服（需要完整下载）
+# 切换到 国际服（包体差异过大，需要完整下载，不适用差异缓存）
 ww checkout global
+# 强制全量校验同步（兜底）
+ww checkout cn --force-sync
 ```
 #### 3\. 同步与修复 (`sync`)
 
