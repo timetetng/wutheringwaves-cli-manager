@@ -1,8 +1,10 @@
 import json
 import logging
+import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import webbrowser
 from enum import Enum
@@ -68,7 +70,7 @@ def get_help_text_with_version():
 app = typer.Typer(
     help=get_help_text_with_version(),
     no_args_is_help=True,
-    add_completion=False,
+    add_completion=True,
     rich_markup_mode="rich",
 )
 logger = logging.getLogger("WW_Manager")
@@ -112,6 +114,31 @@ def get_game_path(ctx: typer.Context) -> Path:
 # --- Commands ---
 
 
+def _auto_install_completion() -> None:
+    """首次运行自动安装当前 shell 的补全脚本, 幂等; 设 _WW_NO_AUTO_COMPLETION=1 禁用"""
+    if os.environ.get("_WW_NO_AUTO_COMPLETION"):
+        return
+    shell = Path(os.environ.get("SHELL", "")).name
+    if shell not in {"bash", "zsh", "fish"}:
+        return
+    dest = {
+        "bash": Path.home() / ".bash_completions" / "ww.sh",
+        "zsh": Path.home() / ".zfunc" / "_ww",
+        "fish": Path.home() / ".config" / "fish" / "completions" / "ww.fish",
+    }[shell]
+    if dest.exists():
+        return
+    try:
+        from typer._completion_shared import install
+
+        os.environ["_TYPER_COMPLETE_TEST_DISABLE_SHELL_DETECTION"] = "1"
+        install(shell=shell, prog_name="ww", complete_var="_WW_COMPLETE")
+        if sys.stdin.isatty():
+            typer.echo(f"[ww] 已自动安装 {shell} 补全脚本, 重启终端生效")
+    except Exception:
+        pass
+
+
 @app.callback()
 def main(
     ctx: typer.Context,
@@ -124,6 +151,7 @@ def main(
     """
     鸣潮 (Wuthering Waves) CLI 管理器
     """
+    _auto_install_completion()
     setup_logging(verbose)
     config = load_app_config()
     _ = version
