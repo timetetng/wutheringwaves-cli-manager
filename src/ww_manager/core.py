@@ -510,7 +510,7 @@ class WGameManager:
         if not top_dirs:
             return
 
-        removed, skipped = [], []
+        removed = []
         for top in sorted(top_dirs):
             scan_root = self.game_folder / top
             if not scan_root.is_dir():
@@ -525,11 +525,10 @@ class WGameManager:
                     rel_str = full.relative_to(self.game_folder).as_posix()
                     if rel_str in expected_dests:
                         continue
-                    # 只清理本工具曾管理过的文件（md5 缓存有记录）
-                    if rel_str not in self.md5_cache.cache:
-                        skipped.append(rel_str)
-                        continue
-                    removed.append((full, rel_str))
+                    # 只清理本工具曾管理过的文件（md5 缓存有记录），
+                    # 不在缓存中的文件（运行时资源/用户文件）直接跳过
+                    if rel_str in self.md5_cache.cache:
+                        removed.append((full, rel_str))
 
         for full, rel_str in removed:
             try:
@@ -540,12 +539,6 @@ class WGameManager:
                 logger.warning(f"清理旧文件失败 {rel_str}: {e}")
         if removed:
             logger.info(f"清理完成: 共删除 {len(removed)} 个已废弃文件")
-        if skipped:
-            logger.warning(
-                "以下文件不在当前 manifest 中（可能为运行时资源/用户文件，已保留）: "
-                + ", ".join(sorted(skipped)[:10])
-                + (f" 等 {len(skipped)} 个" if len(skipped) > 10 else "")
-            )
 
     def download_full(self):
         """下载完整客户端"""
