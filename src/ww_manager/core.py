@@ -479,6 +479,74 @@ class WGameManager:
         else:
             logger.info("所有文件校验通过，无需下载。")
 
+        # Issue #19: 清理已从 manifest 移除的旧文件（如升级后残留的旧 pak）。
+        # UE 会挂载 Paks 目录下所有 .pak，过期文件会覆盖新文件导致启动失败。
+        self._cleanup_stale_files(res_list)
+
+    def _cleanup_stale_files(self, res_list) -> None:
+        """删除磁盘上已从当前 manifest 移除的旧文件（Issue #19）。
+
+        只清理「本工具曾管理过、现已废弃」的文件：
+        - 判据 = 文件在 md5 缓存中有记录（说明曾由本工具校验/下载），
+          且不在当前 manifest 中；
+        - 扫描范围 = manifest 声明过的顶层资源目录（如 Client/、Engine/），
+          跳过 `Saved/` 子目录（玩家截图/存档/运行时语音视频资源由游戏自身管理）。
+
+        绝不删除用户自行放置的文件：不在 md5 缓存中的文件一律保留。
+        """
+        # 1) 当前 manifest 声明的全部相对路径（POSIX 风格）
+        expected_dests = set()
+        top_dirs = set()
+        for item in res_list:
+            try:
+                rel = _resource_rel_path(item["dest"])
+            except IncrementalError:
+                continue
+            rel_str = rel.as_posix()
+            expected_dests.add(rel_str)
+            if rel.parent != Path("."):
+                top_dirs.add(rel.parts[0])  # 顶层目录名，如 Client / Engine
+
+        if not top_dirs:
+            return
+
+        removed, skipped = [], []
+        for top in sorted(top_dirs):
+            scan_root = self.game_folder / top
+            if not scan_root.is_dir():
+                continue
+            for dirpath, dirnames, filenames in os.walk(scan_root):
+                # 跳过隐藏目录与 Saved/ 目录（玩家截图/存档/运行时资源由游戏自身管理）
+                dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != "Saved"]
+                for name in filenames:
+                    if name.startswith(".") or name.endswith((".temp", ".bak", ".tmp")):
+                        continue
+                    full = Path(dirpath) / name
+                    rel_str = full.relative_to(self.game_folder).as_posix()
+                    if rel_str in expected_dests:
+                        continue
+                    # 只清理本工具曾管理过的文件（md5 缓存有记录）
+                    if rel_str not in self.md5_cache.cache:
+                        skipped.append(rel_str)
+                        continue
+                    removed.append((full, rel_str))
+
+        for full, rel_str in removed:
+            try:
+                full.unlink()
+                self.md5_cache.clear(full)
+                logger.warning(f"已清理已从 manifest 移除的旧文件: {rel_str}")
+            except OSError as e:
+                logger.warning(f"清理旧文件失败 {rel_str}: {e}")
+        if removed:
+            logger.info(f"清理完成: 共删除 {len(removed)} 个已废弃文件")
+        if skipped:
+            logger.warning(
+                "以下文件不在当前 manifest 中（可能为运行时资源/用户文件，已保留）: "
+                + ", ".join(sorted(skipped)[:10])
+                + (f" 等 {len(skipped)} 个" if len(skipped) > 10 else "")
+            )
+
     def download_full(self):
         """下载完整客户端"""
         logger.info(f"准备下载 {self.server_type} 服完整客户端到: {self.game_folder}")
