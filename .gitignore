@@ -14,10 +14,8 @@ PKGBUILD
 
 # Test and development
 test-scripts/
-scripts/
 *.exe
 *.dll
 *.zip
 group_*_output/
 Client/
-scripts/

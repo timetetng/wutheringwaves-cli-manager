@@ -22,6 +22,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build]
 sources = { "ww_manager" = "src/ww_manager" }
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/ww_manager"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py39"

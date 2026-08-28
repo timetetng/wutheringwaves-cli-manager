@@ -16,3 +16,13 @@ repos:
 
       # 2. 格式化 (Format)
       - id: ruff-format
+
+  # 本地 hook：commit 时自动同步 pyproject.toml 版本号到中英文 README 徽章
+  - repo: local
+    hooks:
+      - id: sync-version-badges
+        name: sync-version-badges
+        entry: python scripts/sync_version.py
+        language: python
+        pass_filenames: false
+        always_run: true

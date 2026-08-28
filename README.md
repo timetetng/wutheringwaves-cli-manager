@@ -1,6 +1,7 @@
 
 <div align="center"><h1>WutheringWaves CLI Manager</h1><h3>鸣潮命令行管理器</h3><div align="center">
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.2-brightgreen.svg" alt="version 2.2">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.2.4-brightgreen.svg" alt="version 2.2.4">
+  <br>
 </div>
 </div>
 
@@ -13,6 +14,8 @@
 
 专为 Linux 用户打造的《鸣潮》客户端命令行管理工具。
 结合了 **完整的下载/校验功能** 与 **秒级服务器切换** 技术。一旦完成“烘焙”，即可在官服 (CN)、B服 (Bilibili) 之间瞬时切换，无需重新下载庞大的游戏文件。
+
+> 🌐 [**English**](./docs/README.en.md)
 
 > **国际服因为包体差异不支持快速切换**。
 >
@@ -246,9 +249,12 @@ ww update
 ---
 
 ### Q5: 除了本项目，还有其他下载更新鸣潮的方式吗？
-OC👌，给希望在 Linux 上使用官方启动器的用户的解决方案：
+当然👌，给希望在 Linux 上使用官方启动器的用户的解决方案：
 
-[在 Linux 上运行鸣潮官方启动器](https://site.moyingji.one/linux/gaming/workarounds/wuwa-launcher)
+[在 Linux 上运行鸣潮官方启动器](./docs/wuwa-launcher.md)
+
+> [!NOTE]
+> 原链接来自 [MoYingJi QwQ](https://site.moyingji.one/linux/gaming/workarounds/wuwa-launcher)，原作者博客域名即将过期，已归档镜像至本仓库 `docs/wuwa-launcher.md`。
 
 ---
 
