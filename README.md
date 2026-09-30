@@ -27,6 +27,7 @@
 * **🛠️ 智能修复 (`sync`)**：校验全量文件 MD5，自动修复损坏文件，下载缺失资源。
 * **📦 完整下载 (`download`)**：从零开始下载任一服务器的纯净客户端。
 * **🔥 预下载/增量更新(`predownload`)**: 预下载开放期下载增量包、维护后应用合并补丁；新版本开启后也可直接增量更新。基于官方启动器解包的补丁二进制(见 release），欢迎测试并提交问题。`incremental` 为其别名。
+* **🎨 资源档位下载(`resource`)**: 下载 3.7+ 画质档位基础包(HD/SD/UHD)，补齐全量清单之外的 `Client/Content/<TIER>/` 资源；清单地址自动从 3.0+ 官方启动器 KRApp.conf 解码。
 * **💾 自动记忆**：自动记录游戏路径，一次设置，永久生效。
 * **⚡️ 现代化 CLI**：基于 `Typer` 构建，支持自动补全和帮助信息。
 * **👯 并行下载**: 使用多线程并行下载，避免 CDN 节点降速，支持断点续传。
@@ -168,7 +169,27 @@ ww incremental --apply
 > 4. **请确保安装目录有足够磁盘空间（需要两倍的空间复制源文件用于合并补丁）**
 
 
-#### 6\. 获取抽卡记录链接 (`log`)
+#### 6\. 资源档位下载 (`resource`)
+
+下载 3.7+ 的画质档位基础包（HD/SD/UHD → `Client/Content/<TIER>/`）。分档基础包**不在**常规全量清单中（`ww download`/`ww sync` 下载的是 HD 档），UHD/SD 档需要本命令下载，游戏以 `-krqlv=<tier>` 启动时加载对应目录。
+
+```bash
+# 下载 UHD 档基础包（约 61.5 GiB，支持断点续传，重复执行只补缺失/损坏文件）
+ww resource uhd
+
+# 强制 MD5 校验（默认只比对文件大小，更快）
+ww resource uhd --force-md5
+
+# 手动指定 bundle 配置 URL（默认自动从官方启动器 KRApp.conf 解码，需 3.0+ 启动器）
+ww resource uhd --config-url https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10003_<appKey>/G152/official/index.json
+```
+
+> [!NOTE]
+> 1. 档位包使用独立的 MD5 缓存（`wwm_md5_cache_resource_<tier>.json`），不会干扰 `ww sync`；
+> 2. 清单 URL 中的 appKey 随官方启动器小版本更新而变化，本命令默认从游戏目录上级的启动器版本目录（如 `3.0.1.0/Assets/KRApp.conf`，Base64+XOR 编码）自动解码最新地址；
+> 3. 缺失基础包时 UHD 档游戏会在加载 UI 资源阶段直接崩溃（表现为登录界面前后 `EXCEPTION_ACCESS_VIOLATION`）。
+
+#### 7\. 获取抽卡记录链接 (`log`)
 
 可以一键获取抽卡链接，用于导入小程序或者鸣潮机器人。
 
@@ -179,7 +200,7 @@ ww log
 
 > `-o`、`--open`: 获取链接并跳转打开。
 
-#### 7\. 更新工具本身（`update`）
+#### 8\. 更新工具本身（`update`）
 自动检查安装方式并尝试更新
 
 ```bash
@@ -202,6 +223,8 @@ ww update
 > ```bash
 > Client-Win64-Shipping.exe -krqlv=hd
 > ```
+>
+> 想玩 UHD/SD 档，先用 [`ww resource`](#6-资源档位下载-resource) 下载对应档位基础包，再把启动参数改为 `-krqlv=uhd` / `-krqlv=sd`。
 
 如果你熟悉 Linux，你可以参考项目中的 `run_ww.sh` 脚本并添加 .desktop 文件绕过 Steam 启动，或者按照以下步骤通过 Steam 启动：
 

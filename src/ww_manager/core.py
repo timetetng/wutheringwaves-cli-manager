@@ -483,6 +483,161 @@ class WGameManager:
         # UE 会挂载 Paks 目录下所有 .pak，过期文件会覆盖新文件导致启动失败。
         self._cleanup_stale_files(res_list)
 
+    # --- 3.7+ 资源档位 (HD/SD/UHD) 基础包下载 ---
+
+    RESOURCE_TIERS = ("hd", "sd", "uhd")
+    _KRAPP_XOR_KEY = 0x63
+
+    def _find_krapp_conf(self) -> Optional[Path]:
+        """在游戏目录上级 (启动器根) 的版本目录中查找最新的 KRApp.conf"""
+        launcher_root = self.game_folder.parent
+        candidates = []
+        for conf in launcher_root.glob("*/Assets/KRApp.conf"):
+            version_dir = conf.parent.parent.name
+            try:
+                key = tuple(int(x) for x in version_dir.split("."))
+            except ValueError:
+                continue
+            candidates.append((key, conf))
+        if not candidates:
+            return None
+        return max(candidates)[1]
+
+    @staticmethod
+    def _decode_krapp_conf(path: Path) -> Dict[str, Any]:
+        """解码 KRApp.conf (Base64 + 逐字节 XOR 0x63) 为 JSON 配置"""
+        import base64
+
+        raw = path.read_bytes()
+        decoded = bytes(b ^ WGameManager._KRAPP_XOR_KEY for b in base64.b64decode(raw))
+        return json.loads(decoded)
+
+    def get_bundle_config(self, config_url: Optional[str] = None) -> Dict[str, Any]:
+        """获取 3.0+ 启动器的资源档位配置 (resourcePacks / bundles / cdnList)。
+
+        bundle 配置 URL 中的 appKey 随启动器小版本更新而变化，因此默认从
+        本地启动器版本目录的 KRApp.conf 解码出 games[0].configUrl；
+        也可通过 config_url 参数显式指定。
+        """
+        if not config_url:
+            krapp = self._find_krapp_conf()
+            if krapp is None:
+                raise ConfigError(
+                    "未在游戏目录上级找到启动器 KRApp.conf (需要 3.0+ 启动器)，"
+                    "请安装新版官方启动器，或用 --config-url 手动指定配置地址"
+                )
+            conf = self._decode_krapp_conf(krapp)
+            try:
+                config_url = conf["games"][0]["configUrl"]
+            except (KeyError, IndexError, TypeError):
+                raise ConfigError(f"KRApp.conf 中未找到 configUrl: {krapp}")
+        logger.info("正在获取资源档位配置...")
+        data = self._http_get_json(config_url)
+        if not data:
+            raise NetworkError("无法获取资源档位配置")
+        return data
+
+    def download_resource_tier(
+        self,
+        tier: str,
+        config_url: Optional[str] = None,
+        force_check_md5: bool = False,
+    ) -> None:
+        """下载 3.7+ 指定档位 (HD/SD/UHD) 的基础资源包到 Client/Content/<TIER>/。
+
+        3.7 起游戏按 -krqlv=<tier> 启动参数加载分档资源；HD/SD/UHD 基础包
+        不在旧版启动器全量清单 (indexFile) 中，只能通过 3.0+ 启动器的
+        resourcePacks 体系获取 —— 缺失基础包时游戏会在加载 UI 资源阶段
+        直接崩溃。
+        """
+        tier = tier.lower()
+        if tier not in self.RESOURCE_TIERS:
+            raise ConfigError(f"无效的资源档位: {tier} (可选: {', '.join(self.RESOURCE_TIERS)})")
+
+        bundle = self.get_bundle_config(config_url)
+        packs = bundle.get("resourcePacks") or {}
+        if tier not in packs:
+            raise ConfigError(f"配置中不存在 {tier} 资源包, 可用: {', '.join(packs)}")
+        pack = packs[tier]
+
+        # 档位资源包走 bundle 配置自带的 CDN 列表
+        nodes = [n for n in bundle.get("cdnList", []) if n.get("K1") == 1 and n.get("K2") == 1]
+        if not nodes:
+            raise NetworkError("没有可用的 CDN 节点")
+        cdn = max(nodes, key=lambda x: x["P"])["url"]
+        logger.info(f"使用 CDN: {cdn}")
+
+        manifest = self._http_get_json(urljoin(cdn, pack["indexFile"]))
+        if not manifest or not manifest.get("resource"):
+            raise NetworkError("无法下载资源档位清单")
+        res_list = manifest["resource"]
+        total_size = sum(int(i["size"]) for i in res_list)
+        logger.info(
+            f"{tier} 档位资源包 v{pack.get('version', '?')}: {len(res_list)} 个文件, "
+            f"共 {total_size / 1024 / 1024 / 1024:.2f} GiB"
+        )
+
+        # 分档资源不在基础清单中，必须使用独立的 md5 缓存：若写入共享缓存，
+        # 会被 sync 的 _cleanup_stale_files 当作"已废弃文件"误删
+        tier_cache = MD5Cache(self.game_folder / f"wwm_md5_cache_resource_{tier}.json", self.game_folder)
+
+        res_base = pack["baseUrl"].lstrip("/")
+        tasks = []
+        logger.info("正在校验文件 (可能需要几分钟)...")
+
+        with Progress(
+            TextColumn("[progress.description]{task.description}", justify="left"),
+            BarColumn(bar_width=40),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            TimeRemainingColumn(),
+            expand=True,
+            transient=True,
+        ) as progress:
+            verify_task = progress.add_task("[cyan]准备校验...", total=len(res_list))
+
+            def check_file(item):
+                try:
+                    dest_path = self.game_folder / _resource_rel_path(item["dest"])
+                except IncrementalError:
+                    return None, item["dest"]
+                expected_md5 = item["md5"]
+                expected_size = int(item["size"])
+
+                need_download = False
+                if not dest_path.exists():
+                    need_download = True
+                elif force_check_md5:
+                    if tier_cache.get(dest_path) != expected_md5:
+                        need_download = True
+                elif dest_path.stat().st_size != expected_size:
+                    need_download = True
+
+                download_info = None
+                if need_download:
+                    url = urljoin(cdn, f"{res_base}/{item['dest']}")
+                    download_info = {
+                        "url": quote(url, safe=":/"),
+                        "path": dest_path,
+                        "size": expected_size,
+                    }
+                return download_info, dest_path.name
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(check_file, item): item for item in res_list}
+                for future in as_completed(futures):
+                    download_info, file_name = future.result()
+                    if download_info:
+                        tasks.append(download_info)
+                    progress.update(verify_task, description=f"[cyan]校验中: {file_name}[/cyan]")
+                    progress.advance(verify_task)
+
+        if tasks:
+            self._batch_download(tasks)
+            tier_cache.save()
+            logger.info(f"{tier} 档位资源下载完成。游戏需以 -krqlv={tier} 启动。")
+        else:
+            logger.info("所有文件校验通过，无需下载。")
+
     def _cleanup_stale_files(self, res_list) -> None:
         """删除磁盘上已从当前 manifest 移除的旧文件（Issue #19）。
 
