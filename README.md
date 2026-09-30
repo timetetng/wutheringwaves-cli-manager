@@ -13,7 +13,7 @@
 </div>
 
 专为 Linux 用户打造的《鸣潮》客户端命令行管理工具。
-结合了 **完整的下载/校验功能** 与 **秒级服务器切换** 技术。一旦完成“烘焙”，即可在官服 (CN)、B服 (Bilibili) 之间瞬时切换，无需重新下载庞大的游戏文件。
+结合了 **完整的下载/校验功能** 与 **秒级服务器切换** 技术。一旦完成“烘焙”，即可在官服 (CN)、B 服 (Bilibili) 之间瞬时切换，无需重新下载庞大的游戏文件。
 
 > 🌐 [**English**](./docs/README.en.md)
 
@@ -61,7 +61,7 @@ yay -S ww-manager
 
 #### 2. 安装工具
 
-* 方式一：从 PyPI 安装 (推荐)
+* 方式一：从 PyPI 安装 （推荐）
 ```bash
 uv tool install ww-manager
 ```
@@ -112,9 +112,9 @@ ww status
 
 #### 2\. 快速切换服务器 (`checkout`)
 
-**秒级**切换服务器（仅限官/b服）。
+**秒级**切换服务器（仅限官/b 服）。
 
-官服、B服之间采用**差异文件缓存**机制：首次切换会下载两服差异文件并备份到游戏目录内的 `wwm_server_diff_cache/`，此后任意切换都从优先本地缓存恢复，无需重新下载，失败时回退至CDN下载。大版本更新（如 3.4 → 3.5）时会自动重置缓存。
+官服、B 服之间采用**差异文件缓存**机制：首次切换会下载两服差异文件并备份到游戏目录内的 `wwm_server_diff_cache/`，此后任意切换都从优先本地缓存恢复，无需重新下载，失败时回退至 CDN 下载。大版本更新（如 3.4 → 3.5）时会自动重置缓存。
 
 ```bash
 # 切换到 Bilibili 服
@@ -190,18 +190,31 @@ ww update
 
 本工具仅负责文件管理。启动游戏推荐使用 Steam + Proton。
 
+> [!IMPORTANT]
+> **3.7 起启动必须带画质档位参数：`-krqlv=<hd|sd|uhd>`**
+>
+> 3.7 把游戏资源改成了分档打包（`Client/Content/HD/`、`SD/`、`UHD/`），需要通过参数指定档位。
+> 缺少该参数（或取值非法）时，游戏会在挂载完 pak 之后直接崩溃：
+> `Fatal error: [File:Unknown] [Line: 54] kuro: Use launcher to start game!`
+>
+> 官方启动器下发的默认值就是 `-krqlv=hd`（“高清画质启动”）。本工具下载的是高清档资源，所以直接用 `hd`：
+>
+> ```bash
+> Client-Win64-Shipping.exe -krqlv=hd
+> ```
+
 如果你熟悉 Linux，你可以参考项目中的 `run_ww.sh` 脚本并添加 .desktop 文件绕过 Steam 启动，或者按照以下步骤通过 Steam 启动：
 
 1. **Steam 设置**：
 
       * 添加“非 Steam 游戏”，指向 `安装目录/Client/Binaries/Win64/Client-Win64-Shipping.exe`。
-      * 在兼容性中强制使用 `GE-Proton` 或 `dwproton` (如果 ACE 警告频繁请尝试切换 proton)
+      * 在兼容性中强制使用 `dwproton` （如果 ACE 警告频繁请尝试切换 proton）
 
 2. **启动参数**：
     在 Steam 启动选项中添加：
 
     ```bash
-    steamdeck=1
+    steamdeck=1 -krqlv=hd
     ```
 
 ## 🛠️ 常见问题 (FAQ)
@@ -238,7 +251,7 @@ ww update
 ---
 
 ### Q4: 登录框无法聚焦输入？
-以 ArchLinux 中通过 Steam 启动的鸣潮为例，按照以下步骤操作即可:
+以 ArchLinux 中通过 Steam 启动的鸣潮为例，按照以下步骤操作即可：
 1. `sudo pacman -S protontricks` 安装 `protontricks`；
 2. 运行 `protontricks --gui`，在弹出的列表里找到鸣潮；
 3. 选择 `Select the default wineprefix -> Run winecfg`;
@@ -255,6 +268,11 @@ ww update
 
 > [!NOTE]
 > 原链接来自 [MoYingJi QwQ](https://site.moyingji.one/linux/gaming/workarounds/wuwa-launcher)，原作者博客域名即将过期，已归档镜像至本仓库 `docs/wuwa-launcher.md`。
+
+---
+
+### Q6: 3.7 更新后启动报 `Fatal error: ... kuro: Use launcher to start game!`？
+游戏本体没坏，是**缺少画质档位参数**：3.7 起资源分档（HD/SD/UHD），必须由启动器在命令行上告知档位。在启动脚本 / Steam 启动选项里加上 `-krqlv=hd` 即可，详见上方 [启动游戏 (Linux)](#-启动游戏-linux) 一节的提示。
 
 ---
 

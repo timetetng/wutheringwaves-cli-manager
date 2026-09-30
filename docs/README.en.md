@@ -187,6 +187,19 @@ ww update
 
 This tool only manages files. For launching the game, Steam + Proton is recommended.
 
+> [!IMPORTANT]
+> **Since 3.7 the game must be launched with a quality-tier argument: `-krqlv=<hd|sd|uhd>`**
+>
+> 3.7 split the game assets into quality tiers (`Client/Content/HD/`, `SD/`, `UHD/`) — the tier has to be passed as a launch argument.
+> Without it (or with an invalid value) the game crashes right after mounting the paks:
+> `Fatal error: [File:Unknown] [Line: 54] kuro: Use launcher to start game!`
+>
+> The official launcher sends `-krqlv=hd` by default (“HD quality launch”). This tool downloads the HD tier, so just use `hd`:
+>
+> ```bash
+> Client-Win64-Shipping.exe -krqlv=hd
+> ```
+
 If you're comfortable with Linux, you can use the `run_ww.sh` script in this repo together with a .desktop file to bypass Steam, or launch via Steam as follows:
 
 1. **Steam settings**:
@@ -198,7 +211,7 @@ If you're comfortable with Linux, you can use the `run_ww.sh` script in this rep
      Add to Steam launch options:
 
     ```bash
-    steamdeck=1
+    steamdeck=1 -krqlv=hd
     ```
 
 ## 🛠️ FAQ
@@ -254,6 +267,11 @@ Of course 👌 — for users who want to run the **official launcher** on Linux:
 > [!NOTE]
 > The original author's blog domain is expiring, so [`wuwa-launcher.md`](./wuwa-launcher.md) has been archived as a mirror in this docs directory. Original URL:
 > https://site.moyingji.one/linux/gaming/workarounds/wuwa-launcher
+
+---
+
+### Q6: Since 3.7 the game fails with `Fatal error: ... kuro: Use launcher to start game!`?
+The game files are fine — the **quality-tier argument is missing**: since 3.7 the assets are tiered (HD/SD/UHD) and the launcher must pass the tier on the command line. Add `-krqlv=hd` to your launch script / Steam launch options; see the note in [Launching the game (Linux)](#-launching-the-game-linux) above.
 
 ---
 

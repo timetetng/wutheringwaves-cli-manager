@@ -19,3 +19,6 @@ test-scripts/
 *.zip
 group_*_output/
 Client/
+
+# Pi 工作目录
+.pi/
