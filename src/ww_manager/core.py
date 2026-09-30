@@ -637,6 +637,44 @@ class WGameManager:
             logger.info(f"{tier} 档位资源下载完成。游戏需以 -krqlv={tier} 启动。")
         else:
             logger.info("所有文件校验通过，无需下载。")
+        self._register_installed_tier(tier, str(pack.get("version", "")), bundle)
+
+    def _register_installed_tier(self, tier: str, version: str, bundle: Dict[str, Any]) -> None:
+        """将已安装的档位登记进官方启动器的安装记录，使其能直接识别。
+
+        3.0+ 启动器对"已安装"的认定与文件无关，只看两处记录：
+        1. 游戏根 launcherDownloadConfig.json 的 bundles[<TIER>] —— 缺失时
+           档位切换/目录重定向报 "redirect bundle incompatible"；
+        2. launcherDownloadConfig/<pack>.json (packName/version) —— 缺失时
+           启动按钮显示"修复游戏" (KRCheckUpdateFlow: pack version file missing)。
+        """
+        pack_name = tier.lower()
+        try:
+            bundles = bundle.get("bundles", {})
+            bundle_packs = bundles.get(tier.upper(), {}).get("resourcePacks") or [pack_name]
+            cfg_path = self.game_folder / "launcherDownloadConfig.json"
+            cfg: Dict[str, Any] = {}
+            if cfg_path.exists():
+                try:
+                    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                except Exception:
+                    cfg = {}
+            cfg.setdefault("bundles", {})[tier.upper()] = {
+                "version": version,
+                "state": "",
+                "resourcePacks": bundle_packs,
+            }
+            cfg_path.write_text(json.dumps(cfg, indent=4, ensure_ascii=False), encoding="utf-8")
+
+            ver_dir = self.game_folder / "launcherDownloadConfig"
+            ver_dir.mkdir(exist_ok=True)
+            (ver_dir / f"{pack_name}.json").write_text(
+                json.dumps({"packName": pack_name, "version": version}, indent=2),
+                encoding="utf-8",
+            )
+            logger.info(f"已登记 {tier.upper()} 档安装记录 (launcherDownloadConfig)，官方启动器可直接识别。")
+        except Exception as e:
+            logger.warning(f"登记安装记录失败 (不影响文件下载): {e}")
 
     def _cleanup_stale_files(self, res_list) -> None:
         """删除磁盘上已从当前 manifest 移除的旧文件（Issue #19）。
