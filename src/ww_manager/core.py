@@ -358,10 +358,11 @@ class WGameManager:
 
         return success
 
-    def _batch_download(self, tasks: List[dict]):
+    def _batch_download(self, tasks: List[dict]) -> int:
+        """批量下载，返回失败的文件数 (0 = 全部成功)"""
         if not tasks:
             logger.info("没有文件需要下载")
-            return
+            return 0
 
         total_size = sum(t["size"] for t in tasks)
         logger.info(f"准备下载 {len(tasks)} 个文件，总大小: {total_size / 1024 / 1024:.2f} MB")
@@ -395,9 +396,12 @@ class WGameManager:
                     )
                     futures.append(future)
 
+                failed = 0
                 for f in as_completed(futures):
                     if not f.result():
+                        failed += 1
                         progress.console.log("[red]有文件下载失败，请重试 sync[/red]")
+        return failed
 
     def sync_files(self, force_check_md5=False):
         # 确保获取的是当前版本的配置
@@ -527,14 +531,25 @@ class WGameManager:
                     "请安装新版官方启动器，或用 --config-url 手动指定配置地址"
                 )
             conf = self._decode_krapp_conf(krapp)
-            try:
-                config_url = conf["games"][0]["configUrl"]
-            except (KeyError, IndexError, TypeError):
-                raise ConfigError(f"KRApp.conf 中未找到 configUrl: {krapp}")
+            games = conf.get("games") or []
+            # 按 resId/appId 匹配当前渠道，避免多游戏/多渠道启动器取错条目
+            game = next(
+                (g for g in games if str(g.get("resId")) == str(self.config.get("appId"))),
+                None,
+            )
+            if game is None and len(games) == 1:
+                game = games[0]
+            if game is None or not game.get("configUrl"):
+                raise ConfigError(
+                    f"KRApp.conf 中未找到当前渠道 (appId={self.config.get('appId')}) 的 configUrl: {krapp}"
+                )
+            config_url = game["configUrl"]
         logger.info("正在获取资源档位配置...")
         data = self._http_get_json(config_url)
         if not data:
-            raise NetworkError("无法获取资源档位配置")
+            raise NetworkError(
+                "无法获取资源档位配置 (可能当前渠道暂未提供分档资源，b 服目前没有档位包分发；官服/国际服可用)"
+            )
         return data
 
     def download_resource_tier(
@@ -557,6 +572,8 @@ class WGameManager:
         bundle = self.get_bundle_config(config_url)
         packs = bundle.get("resourcePacks") or {}
         if tier not in packs:
+            if not packs:
+                raise ConfigError("当前渠道的启动器配置不包含任何档位资源包 (b 服暂无分档分发，仅官服/国际服提供)")
             raise ConfigError(f"配置中不存在 {tier} 资源包, 可用: {', '.join(packs)}")
         pack = packs[tier]
 
@@ -571,6 +588,18 @@ class WGameManager:
         if not manifest or not manifest.get("resource"):
             raise NetworkError("无法下载资源档位清单")
         res_list = manifest["resource"]
+        # dest 前缀白名单：档位包文件必须落在 Client/Content/<TIER>/ 下（大小写不敏感）
+        tier_prefix = f"client/content/{tier}/"
+
+        def _in_tier_dir(item) -> bool:
+            return str(item["dest"]).replace("\\", "/").lower().startswith(tier_prefix)
+
+        skipped = [i["dest"] for i in res_list if not _in_tier_dir(i)]
+        if skipped:
+            logger.warning(f"清单中 {len(skipped)} 个文件不在 {tier_prefix} 目录下，已跳过: {skipped[:3]}...")
+            res_list = [i for i in res_list if _in_tier_dir(i)]
+        if not res_list:
+            raise NetworkError("档位清单中没有位于本档位目录下的文件")
         total_size = sum(int(i["size"]) for i in res_list)
         logger.info(
             f"{tier} 档位资源包 v{pack.get('version', '?')}: {len(res_list)} 个文件, "
@@ -632,12 +661,48 @@ class WGameManager:
                     progress.advance(verify_task)
 
         if tasks:
-            self._batch_download(tasks)
+            failed = self._batch_download(tasks)
             tier_cache.save()
+            if failed:
+                # 下载不完整时不登记安装标记：官方启动器优先采信标记，
+                # 会把残缺档位当作已安装
+                logger.error(
+                    f"{failed} 个文件下载失败，{tier} 档位未完成，不登记安装记录。"
+                    f"请重跑 `ww resource {tier}` 断点续传。"
+                )
+                return
             logger.info(f"{tier} 档位资源下载完成。游戏需以 -krqlv={tier} 启动。")
         else:
             logger.info("所有文件校验通过，无需下载。")
+        self._cleanup_tier_stale_files(tier, res_list)
         self._register_installed_tier(tier, str(pack.get("version", "")), bundle)
+
+    def _cleanup_tier_stale_files(self, tier: str, res_list: List[dict]) -> None:
+        """清理档位目录中已从清单移除的旧文件（同类风险见基础清单的 Issue #19）。
+
+        UE 会挂载 Content/Paks 与分档目录下的所有 .pak，版本更新后改名/移除的
+        旧 pak 若残留会被继续挂载。只处理 Client/Content/<TIER>/ 目录内、
+        且后缀为 .pak/.sig/.temp 的文件，不在当前清单中的才删除。
+        """
+        tier_dir = self.game_folder / "Client" / "Content" / tier.upper()
+        if not tier_dir.is_dir():
+            return
+        expected = {Path(str(i["dest"]).replace("\\", "/")).name for i in res_list}
+        removed = []
+        for f in tier_dir.iterdir():
+            if not f.is_file():
+                continue
+            if f.suffix.lower() not in (".pak", ".sig", ".temp"):
+                continue
+            if f.name in expected:
+                continue
+            try:
+                f.unlink()
+                removed.append(f.name)
+            except OSError as e:
+                logger.warning(f"清理档位旧文件失败 {f.name}: {e}")
+        if removed:
+            logger.warning(f"已清理 {len(removed)} 个不在当前 {tier.upper()} 清单中的旧文件: {removed[:5]}...")
 
     def _register_installed_tier(self, tier: str, version: str, bundle: Dict[str, Any]) -> None:
         """将已安装的档位登记进官方启动器的安装记录，使其能直接识别。
@@ -1010,10 +1075,18 @@ class WGameManager:
         # 优先使用 launcher_info 中的版本，如果获取不到则保持原状或报错
         if self._launcher_info:
             v = self.launcher_info["default"]["version"]
-            cfg = {"version": v, "appId": self.config["appId"], "group": "default"}
+            cfg_path = self.game_folder / "launcherDownloadConfig.json"
+            # 读-改-写：只更新 version/appId/group，保留其他键
+            # (如 resource 命令登记的 bundles 档位记录，整文件覆写会将其抹掉)
+            cfg: Dict[str, Any] = {}
+            if cfg_path.exists():
+                try:
+                    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                except Exception:
+                    cfg = {}
+            cfg.update({"version": v, "appId": self.config["appId"], "group": "default"})
             self.game_folder.mkdir(parents=True, exist_ok=True)
-            with open(self.game_folder / "launcherDownloadConfig.json", "w") as f:
-                json.dump(cfg, f, indent=4)
+            cfg_path.write_text(json.dumps(cfg, indent=4, ensure_ascii=False), encoding="utf-8")
             logger.info(f"本地配置已更新: {self.server_type} ({v})")
 
     def apply_incremental_update(self, dry_run: bool = False) -> bool:

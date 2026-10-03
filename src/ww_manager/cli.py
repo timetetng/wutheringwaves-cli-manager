@@ -310,7 +310,7 @@ def download(ctx: typer.Context, server: ServerType):
 @app.command()
 def resource(
     ctx: typer.Context,
-    tier: Annotated[str, typer.Argument(help="资源档位: hd / sd / uhd")] = "uhd",
+    tier: Annotated[str, typer.Argument(help="资源档位: hd / sd / uhd (必填)")],
     config_url: Annotated[
         Optional[str],
         typer.Option("--config-url", help="手动指定 bundle 配置 URL (默认从启动器 KRApp.conf 解码)"),

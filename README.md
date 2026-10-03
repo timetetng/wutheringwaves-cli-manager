@@ -185,9 +185,12 @@ ww resource uhd --config-url https://prod-cn-alicdn-gamestarter.kurogame.com/lau
 ```
 
 > [!NOTE]
-> 1. 档位包使用独立的 MD5 缓存（`wwm_md5_cache_resource_<tier>.json`），不会干扰 `ww sync`；
-> 2. 清单 URL 中的 appKey 随官方启动器小版本更新而变化，本命令默认从游戏目录上级的启动器版本目录（如 `3.0.1.0/Assets/KRApp.conf`，Base64+XOR 编码）自动解码最新地址；
-> 3. 缺失基础包时 UHD 档游戏会在加载 UI 资源阶段直接崩溃（表现为登录界面前后 `EXCEPTION_ACCESS_VIOLATION`）。
+> 1. 档位包使用独立的 MD5 缓存（`wwm_md5_cache_resource_<tier>.json`），不会干扰 `ww sync`（该缓存仅在 `--force-md5` 校验或实际发生下载时生成）；
+> 2. 清单 URL 中的 appKey 随官方启动器小版本更新而变化，本命令默认从游戏目录上级的启动器版本目录（如 `3.0.1.0/Assets/KRApp.conf`，Base64+XOR 编码）按当前渠道 (resId/appId) 匹配并自动解码最新地址；
+> 3. 下载/校验全部成功后会自动登记官方启动器安装记录（`launcherDownloadConfig.json` 的 `bundles` 条目 + `launcherDownloadConfig/<pack>.json` 版本标记），官方启动器可直接识别档位；下载失败不会登记，重跑本命令续传即可；
+> 4. 版本更新后已从清单移除的旧 pak 会在本档位目录内自动清理（仅限 `Client/Content/<TIER>/` 下的 `.pak/.sig/.temp`）；
+> 5. **b 服暂无分档资源分发**（其启动器配置不含 resourcePacks），仅官服/国际服可用；
+> 6. 缺失基础包时，官服 3.7.0 实测 `-krqlv=uhd` 启动会在登录界面加载 UI 资源阶段崩溃（`Couldn't find file for package /Game/Aki/UI/UIResources/...` 大量报错后 `EXCEPTION_ACCESS_VIOLATION`，启动约 34 秒）；"游戏内切档会自动回退不崩"的说法对应的是另一条路径（游戏内下载器），与缺目录直启不同。
 
 #### 7\. 获取抽卡记录链接 (`log`)
 
