@@ -308,6 +308,39 @@ def download(ctx: typer.Context, server: ServerType):
 
 
 @app.command()
+def resource(
+    ctx: typer.Context,
+    tier: Annotated[str, typer.Argument(help="资源档位: hd / sd / uhd (必填)")],
+    config_url: Annotated[
+        Optional[str],
+        typer.Option("--config-url", help="手动指定 bundle 配置 URL (默认从启动器 KRApp.conf 解码)"),
+    ] = None,
+    force_md5: Annotated[bool, typer.Option("--force-md5", help="强制校验 MD5 (默认仅校验文件大小)")] = False,
+):
+    """下载 3.7+ 资源档位基础包 (→ Client/Content/<TIER>/)
+
+    游戏需以 -krqlv=<tier> 启动参数加载对应档位; HD/SD/UHD 基础包
+    不在常规全量清单中 (缺失时 UHD 档启动即崩溃), 由 3.0+ 启动器的
+    resourcePacks 体系分发。
+    """
+    path = get_game_path(ctx)
+    cfg_file = path / "launcherDownloadConfig.json"
+    server = "cn"
+    if cfg_file.exists():
+        try:
+            d = json.loads(cfg_file.read_text(encoding="utf-8"))
+            server = APPID_TO_SERVER.get(d.get("appId"), "cn")
+        except Exception:
+            pass
+    try:
+        mgr = WGameManager(path, server)
+        mgr.download_resource_tier(tier, config_url=config_url, force_check_md5=force_md5)
+    except WWError as e:
+        typer.secho(f"执行失败: {e}", fg="red")
+        raise typer.Exit(1)
+
+
+@app.command()
 def checkout(
     ctx: typer.Context,
     server: ServerType,
