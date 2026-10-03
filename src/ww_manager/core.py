@@ -532,17 +532,20 @@ class WGameManager:
                 )
             conf = self._decode_krapp_conf(krapp)
             games = conf.get("games") or []
-            # 按 resId/appId 匹配当前渠道，避免多游戏/多渠道启动器取错条目
-            game = next(
-                (g for g in games if str(g.get("resId")) == str(self.config.get("appId"))),
-                None,
-            )
-            if game is None and len(games) == 1:
-                game = games[0]
-            if game is None or not game.get("configUrl"):
+            app_id = str(self.config.get("appId"))
+            # 严格按 resId/appId 匹配当前渠道,不做任何 fallback:
+            # 各渠道档位包清单/CDN 独立分发,静默借用其他渠道的配置会拿到
+            # md5 不匹配的资源包
+            game = next((g for g in games if str(g.get("resId")) == app_id), None)
+            if game is None:
+                available = ", ".join(f"resId={g.get('resId')}" for g in games if g.get("resId")) or "无"
                 raise ConfigError(
-                    f"KRApp.conf 中未找到当前渠道 (appId={self.config.get('appId')}) 的 configUrl: {krapp}"
+                    f"本机启动器 ({krapp}) 不包含当前渠道 (appId={app_id}) 的配置"
+                    f" [可用: {available}]。各渠道档位包独立分发,不能混用;请安装"
+                    " 对应渠道的官方启动器, 或用 --config-url 指定该渠道的 bundle 配置地址"
                 )
+            if not game.get("configUrl"):
+                raise ConfigError(f"KRApp.conf 中该渠道条目缺少 configUrl: {krapp}")
             config_url = game["configUrl"]
         logger.info("正在获取资源档位配置...")
         data = self._http_get_json(config_url)
