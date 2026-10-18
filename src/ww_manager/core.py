@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 import time
@@ -44,7 +45,10 @@ logger = logging.getLogger("WW_Manager")
 
 
 # 日志解密
-LOG_MAGIC = b"\xa5\xef\xa5"
+# 文件头前 3 字节每次运行都会变（实测有 00 54 50 / ef bb bf / a5 f1 f5 / 4a 1e 1a 等），
+# 所以不能靠固定 magic 判断，只能按解码后的内容判断。
+# 明文开头只有两种形态："Log file open, [YYYY..." 或 "[YYYY.MM.DD-..."
+_LOG_HEAD = re.compile(rb"^(\xef\xbb\xbf)?(\[20\d\d\.|Log file open)")
 
 
 def decrypt_client_log(data: bytes) -> bytes:
@@ -57,12 +61,12 @@ def decrypt_client_log(data: bytes) -> bytes:
 
 
 def is_log_encrypted(data: bytes) -> bool:
-    if data[:3] == LOG_MAGIC:
-        return True
-    if len(data) > 3 and data[0] == 0:
-        dec = decrypt_client_log(data)
-        return dec.decode("utf-8", errors="ignore").startswith("Log file open")
-    return False
+    if len(data) < 3:
+        return False
+    if _LOG_HEAD.match(data):  # 头部已是明文
+        return False
+    # 否则按“跳过前 3 字节 + 奇偶异或”试解，看开头是否像日志
+    return bool(_LOG_HEAD.match(decrypt_client_log(data[:64])))
 
 
 # --- 自定义异常 ---
