@@ -15,11 +15,13 @@ from rich.progress import (
     BarColumn,
     DownloadColumn,
     Progress,
+    Task,
     TaskID,
     TextColumn,
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
+from rich.progress_bar import ProgressBar
 
 logger = logging.getLogger("WW_Manager")
 
@@ -49,11 +51,21 @@ class NetworkError(Exception):
     pass
 
 
+class RainbowBarColumn(BarColumn):
+    """进度条与文件名使用相同的任务颜色。"""
+
+    def render(self, task: Task) -> ProgressBar:
+        color = RAINBOW_COLORS[task.id % len(RAINBOW_COLORS)]
+        self.complete_style = color
+        self.finished_style = color
+        return super().render(task)
+
+
 def create_download_progress(transient: bool = True) -> Progress:
     """创建下载进度条"""
     return Progress(
-        TextColumn("[bold blue]{task.description}"),
-        BarColumn(bar_width=40),
+        TextColumn("{task.description}", justify="right"),
+        RainbowBarColumn(bar_width=40),
         "[progress.percentage]{task.percentage:>3.1f}%",
         DownloadColumn(),
         TransferSpeedColumn(),
@@ -96,6 +108,16 @@ def download_single_file(
         progress.update(task_id, description=f"[{color}]{dest.name}[/{color}]")
 
     temp_file = dest.with_suffix(dest.suffix + ".temp")
+    reported = 0
+
+    def update_progress(completed: int) -> None:
+        nonlocal reported
+        if progress:
+            if task_id is not None:
+                progress.update(task_id, completed=completed)
+            if overall_task_id is not None:
+                progress.update(overall_task_id, advance=completed - reported)
+        reported = completed
 
     def verified() -> bool:
         if not temp_file.is_file() or temp_file.stat().st_size != expected_size:
@@ -119,6 +141,7 @@ def download_single_file(
                 if temp_file.exists() and temp_file.stat().st_size >= expected_size:
                     if verified():
                         temp_file.replace(dest)
+                        update_progress(expected_size)
                         return True
                     temp_file.unlink()
 
@@ -126,8 +149,7 @@ def download_single_file(
                 headers = {"User-Agent": "WW-Manager/2.0"}
                 if resume_byte:
                     headers["Range"] = f"bytes={resume_byte}-"
-                if progress and task_id is not None:
-                    progress.update(task_id, completed=resume_byte)
+                update_progress(resume_byte)
 
                 req = Request(url, headers=headers)
                 with urlopen(req, timeout=15) as rsp:
@@ -141,21 +163,20 @@ def download_single_file(
                     else:
                         # CDN 忽略 Range 时从头覆盖，不能把完整响应追加到断点之后。
                         resume_byte = 0
+                    update_progress(resume_byte)
                     mode = "ab" if resume_byte else "wb"
                     with temp_file.open(mode) as stream:
                         for chunk in iter(lambda: rsp.read(256 * 1024), b""):
                             stream.write(chunk)
-                            if progress:
-                                if task_id is not None:
-                                    progress.update(task_id, advance=len(chunk))
-                                if overall_task_id is not None:
-                                    progress.update(overall_task_id, advance=len(chunk))
+                            resume_byte += len(chunk)
+                            update_progress(min(resume_byte, expected_size))
 
                 if verified():
                     temp_file.replace(dest)
                     return True
                 if temp_file.stat().st_size >= expected_size:
                     temp_file.unlink()
+                    update_progress(0)
                 raise NetworkError(f"文件大小或 MD5 校验失败: {dest.name}")
             except Exception as e:
                 if attempt == 2:
@@ -226,4 +247,5 @@ __all__ = [
     "batch_download",
     "NetworkError",
     "RAINBOW_COLORS",
+    "RainbowBarColumn",
 ]

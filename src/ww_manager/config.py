@@ -70,6 +70,17 @@ SERVER_CONFIGS = {
     },
 }
 
+# 官服/B服共用画质包入口；版本、清单及下载 CDN 从官方配置动态读取。
+RESOURCE_CONFIG_PATH = "launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json"
+RESOURCE_CONFIG_URLS = tuple(
+    host + RESOURCE_CONFIG_PATH
+    for host in (
+        "https://prod-cn-alicdn-gamestarter.kurogame.com/",
+        "https://prod-volcdn-gamestarter.kurogame.xyz/",
+        "https://prod-tencentcdn-gamestarter.kurogame.com/",
+    )
+)
+
 APPID_TO_SERVER = {v["appId"]: k for k, v in SERVER_CONFIGS.items()}
 
 

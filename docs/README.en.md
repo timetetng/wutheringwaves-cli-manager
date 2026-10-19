@@ -1,12 +1,12 @@
 <div align="center"><h1>WutheringWaves CLI Manager</h1><h3>Command-line manager for Wuthering Waves</h3><div align="center">
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.2.5-brightgreen.svg" alt="version 2.2.5">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.0-brightgreen.svg" alt="version 2.3.0">
 </div>
 </div>
 
 <div align="center" style="width: 80%;">
     <div style="display: flex; justify-content: space-between; align-items: flex-start; width: 80%;">
-        <img src="https://cdn.jsdelivr.net/gh/timetetng/Pic-Bed@main/ww-example1.png" alt="badge" style="width: 40%; height: auto;">
-        <img src="https://cdn.jsdelivr.net/gh/timetetng/Pic-Bed@main/ww-example2.png" alt="CLI preview" style="width: 40%; height: auto;">
+        <img src="./images/cli-preview.webp" alt="CLI help preview" style="width: 40%; height: auto;">
+        <img src="./images/download-preview.webp" alt="Download progress preview" style="width: 40%; height: auto;">
     </div>
 </div>
 

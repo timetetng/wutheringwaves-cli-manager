@@ -265,7 +265,8 @@ def status(ctx: typer.Context):
         for state in WGameManager(path, server).resource_tier_status():
             tier = state["tier"]
             typer.echo(
-                f"档位 {tier.upper()}: {state['state']} / 版本 {state['version'] or '未知'} / 启动参数 -krqlv={tier}"
+                f"档位 {tier.upper()}{' [工具当前档位]' if state['active'] else ''}: "
+                f"{state['state']} / 版本 {state['version'] or '未知'} / 启动参数 -krqlv={tier}"
             )
     except (WWError, OSError, ValueError) as e:
         typer.secho(f"读取状态失败: {e}", fg="red")
@@ -303,8 +304,11 @@ def sync(
 
 
 @app.command()
-def download(ctx: typer.Context, server: ServerType):
-    """[初始化] 下载完整客户端"""
+def download(
+    ctx: typer.Context,
+    server: Annotated[ServerType, typer.Argument(help="目标服务器，默认官服 HD")] = ServerType.cn,
+):
+    """[初始化] 下载完整客户端，默认官服 HD"""
     path = get_game_path(ctx)
     try:
         mgr = WGameManager(path, server.value)
@@ -321,7 +325,7 @@ def resource(
     tier: Annotated[str, typer.Argument(help="资源档位: hd / sd / uhd (必填)")],
     config_url: Annotated[
         Optional[str],
-        typer.Option("--config-url", help="手动指定 bundle 配置 URL (默认从启动器 KRApp.conf 解码)"),
+        typer.Option("--config-url", help="覆盖自动获取的官方画质配置地址（通常无需指定）"),
     ] = None,
     force_md5: Annotated[bool, typer.Option("--force-md5", help="忽略 MD5 缓存，重新计算所有文件哈希")] = False,
     remove: Annotated[bool, typer.Option("--remove", help="确认后删除该档位目录、缓存和安装登记")] = False,
@@ -379,6 +383,7 @@ def _run_incremental(
     ctx: typer.Context,
     action: Optional[str],
     apply_flag: bool,
+    config_url: Optional[str] = None,
 ):
     """增量更新核心逻辑（下载增量包 / 应用增量更新）。
 
@@ -410,12 +415,11 @@ def _run_incremental(
             success = mgr.apply_incremental()
             if success:
                 typer.secho("增量更新应用成功！", fg="green")
-                mgr.remind_resource_tiers()
             else:
                 typer.secho("增量更新应用失败", fg="red")
                 raise typer.Exit(1)
         else:
-            success = mgr.download_incremental()
+            success = mgr.download_incremental(config_url=config_url)
             if success:
                 typer.secho("增量更新资源下载完成！之后可使用 'apply' 命令应用更新。", fg="green")
             else:
@@ -432,6 +436,9 @@ def predownload(
     ctx: typer.Context,
     action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
     apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
+    config_url: Annotated[
+        Optional[str], typer.Option("--config-url", help="覆盖自动获取的分包配置地址（通常无需指定）")
+    ] = None,
 ):
     """
     预下载/增量更新
@@ -439,7 +446,7 @@ def predownload(
     预下载开放期间执行下载增量包，维护后应用合并补丁；新版本开启后也可直接用于增量更新。
     用法：ww predownload 下载增量包，ww predownload --apply 应用更新。
     """
-    _run_incremental(ctx, action, apply_flag)
+    _run_incremental(ctx, action, apply_flag, config_url)
 
 
 @app.command()
@@ -447,13 +454,16 @@ def incremental(
     ctx: typer.Context,
     action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
     apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
+    config_url: Annotated[
+        Optional[str], typer.Option("--config-url", help="覆盖自动获取的分包配置地址（通常无需指定）")
+    ] = None,
 ):
     """
     增量更新（predownload 的别名）
 
     用法与 ww predownload 一致：下载增量包，应用时使用 'apply'。
     """
-    _run_incremental(ctx, action, apply_flag)
+    _run_incremental(ctx, action, apply_flag, config_url)
 
 
 @app.command()

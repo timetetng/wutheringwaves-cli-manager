@@ -15,25 +15,23 @@ from urllib.request import Request, urlopen
 
 from rich.progress import (
     BarColumn,
-    DownloadColumn,
     Progress,
-    Task,
     TaskID,
     TextColumn,
     TimeRemainingColumn,
-    TransferSpeedColumn,
 )
 
 from ww_manager.config import (
     APPID_TO_SERVER,
     DIFF_CACHE_SERVERS,
+    RESOURCE_CONFIG_URLS,
     SERVER_CONFIGS,
     SERVER_DIFF_CACHE_DIR_NAME,
     SERVER_DIFF_CACHE_MANIFEST,
     SERVER_DIFF_CACHE_VERSION,
     parse_major_minor,
 )
-from ww_manager.download import download_single_file
+from ww_manager.download import create_download_progress, download_single_file
 from ww_manager.incremental import (
     IncrementalError,
     IncrementalManager,
@@ -173,38 +171,6 @@ class MD5Cache:
             pass
 
 
-# 定义彩虹颜色列表
-RAINBOW_COLORS = [
-    "bright_red",
-    "orange1",
-    "gold1",
-    "yellow",
-    "chartreuse1",
-    "green",
-    "spring_green1",
-    "cyan1",
-    "deep_sky_blue1",
-    "dodger_blue1",
-    "blue",
-    "purple",
-    "magenta",
-    "hot_pink",
-    "deep_pink2",
-]
-
-
-class RainbowBarColumn(BarColumn):
-    """美化bar"""
-
-    def render(self, task: Task) -> Any:
-        # 根据 task.id 计算颜色，确保和文件名颜色一致
-        color = RAINBOW_COLORS[task.id % len(RAINBOW_COLORS)]
-        self.complete_style = color
-        self.finished_style = color
-        # 调用父类的 render
-        return super().render(task)
-
-
 # --- 核心管理器 ---
 class WGameManager:
     def __init__(self, game_folder: Path, server_type: str):
@@ -297,16 +263,7 @@ class WGameManager:
 
         max_workers = 8
 
-        progress = Progress(
-            TextColumn("{task.description}", justify="right"),
-            RainbowBarColumn(bar_width=40),
-            "[progress.percentage]{task.percentage:>3.1f}%",
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            TimeRemainingColumn(),
-            expand=True,
-            transient=True,  # 进度条完成后自动消失
-        )
+        progress = create_download_progress()
 
         with progress:
             overall_task = progress.add_task("Total Download", total=total_size)
@@ -329,7 +286,7 @@ class WGameManager:
                 for f in as_completed(futures):
                     if not f.result():
                         failed += 1
-                        progress.console.log("[red]有文件下载失败，请重试 sync[/red]")
+                        logger.debug("文件下载失败，详情见下载器错误")
         return failed
 
     def sync_files(self, force_check_md5=False):
@@ -343,11 +300,6 @@ class WGameManager:
         tasks = []
 
         logger.info("正在校验文件 (可能需要几分钟)...")
-
-        # 引入 rich 进度条和多线程组件
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 
         with Progress(
             TextColumn("[progress.description]{task.description}", justify="left"),
@@ -421,78 +373,25 @@ class WGameManager:
     # --- 3.7+ 资源档位 (HD/SD/UHD) 基础包下载 ---
 
     RESOURCE_TIERS = ("hd", "sd", "uhd")
-    _KRAPP_XOR_KEY = 0x63
-
-    def _find_krapp_conf(self) -> Optional[Path]:
-        """在游戏目录上级 (启动器根) 的版本目录中查找最新的 KRApp.conf"""
-        launcher_root = self.game_folder.parent
-        candidates = []
-        for conf in launcher_root.glob("*/Assets/KRApp.conf"):
-            version_dir = conf.parent.parent.name
-            try:
-                key = tuple(int(x) for x in version_dir.split("."))
-            except ValueError:
-                continue
-            candidates.append((key, conf))
-        if not candidates:
-            return None
-        return max(candidates)[1]
-
-    @staticmethod
-    def _decode_krapp_conf(path: Path) -> Dict[str, Any]:
-        """解码 KRApp.conf (Base64 + 逐字节 XOR 0x63) 为 JSON 配置"""
-        import base64
-
-        try:
-            raw = path.read_bytes()
-            decoded = bytes(b ^ WGameManager._KRAPP_XOR_KEY for b in base64.b64decode(raw))
-            data = json.loads(decoded)
-            if not isinstance(data, dict):
-                raise ValueError("配置必须为 JSON 对象")
-            return data
-        except (OSError, ValueError) as e:
-            raise ConfigError(f"无法解码启动器配置 {path}: {e}") from e
 
     def get_bundle_config(self, config_url: Optional[str] = None) -> Dict[str, Any]:
-        """获取 3.0+ 启动器的资源档位配置 (resourcePacks / bundles / cdnList)。
-
-        bundle 配置 URL 中的 appKey 随启动器小版本更新而变化，因此默认从
-        本地启动器版本目录的 KRApp.conf 解码出 games[0].configUrl；
-        也可通过 config_url 参数显式指定。
-        """
-        if not config_url:
-            krapp = self._find_krapp_conf()
-            if krapp is None:
-                raise ConfigError(
-                    "未在游戏目录上级找到启动器 KRApp.conf (需要 3.0+ 启动器)，"
-                    "请安装新版官方启动器，或用 --config-url 手动指定配置地址"
-                )
-            conf = self._decode_krapp_conf(krapp)
-            games = conf.get("games") or []
-            app_id = str(self.config.get("appId"))
-            # 严格按 resId/appId 匹配当前渠道,不做任何 fallback:
-            # 各渠道档位包清单/CDN 独立分发,静默借用其他渠道的配置会拿到
-            # md5 不匹配的资源包
-            game = next((g for g in games if str(g.get("resId")) == app_id), None)
-            if game is None:
-                available = ", ".join(f"resId={g.get('resId')}" for g in games if g.get("resId")) or "无"
-                raise ConfigError(
-                    f"本机启动器 ({krapp}) 不包含当前渠道 (appId={app_id}) 的配置"
-                    f" [可用: {available}]。各渠道档位包独立分发,不能混用;请安装"
-                    " 对应渠道的官方启动器, 或用 --config-url 指定该渠道的 bundle 配置地址"
-                )
-            if not game.get("configUrl"):
-                raise ConfigError(f"KRApp.conf 中该渠道条目缺少 configUrl: {krapp}")
-            config_url = game["configUrl"]
-        if not isinstance(config_url, str) or not config_url:
+        """自动获取官服/B服共用的画质配置，不依赖本地启动器。"""
+        if self.server_type == "global":
+            raise ConfigError("国际服暂仅支持默认 HD，请使用 ww download global 或 ww sync")
+        if config_url is not None and (not isinstance(config_url, str) or not config_url):
             raise ConfigError("资源档位配置地址为空")
         logger.info("正在获取资源档位配置...")
-        data = self._http_get_json(config_url)
-        if not data:
-            raise NetworkError(
-                "无法获取资源档位配置 (可能当前渠道暂未提供分档资源，b 服目前没有档位包分发；官服/国际服可用)"
-            )
-        return data
+        for url in (config_url,) if config_url else RESOURCE_CONFIG_URLS:
+            data = self._http_get_json(url)
+            if (
+                isinstance(data, dict)
+                and isinstance(data.get("resourcePacks"), dict)
+                and data["resourcePacks"]
+                and isinstance(data.get("cdnList"), list)
+                and data["cdnList"]
+            ):
+                return data
+        raise NetworkError("无法获取有效的官方画质配置，请检查网络或更新工具后重试")
 
     def _validate_tier(self, tier: str) -> str:
         tier = tier.lower()
@@ -543,6 +442,64 @@ class WGameManager:
             if temporary and temporary.exists():
                 temporary.unlink()
 
+    def _read_resource_state(self) -> Dict[str, Any]:
+        """档位选择由工具显式维护，不从目录或游戏启动参数推断。"""
+        path = self._managed_path("wwm_resource_state.json")
+        if not path.exists():
+            return {"active_tier": "hd", "versions": {}, "incomplete": []}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or data.get("active_tier") not in (*self.RESOURCE_TIERS, None):
+                raise ValueError("当前档位非法")
+            if not isinstance(data.get("versions"), dict) or not isinstance(data.get("incomplete", []), list):
+                raise ValueError("分包版本记录非法")
+            if any(not isinstance(v, str) or not v for v in data["versions"].values()):
+                raise ValueError("分包版本必须为非空字符串")
+            return data
+        except (OSError, ValueError) as e:
+            raise ConfigError(f"无法读取档位选择记录，拒绝猜测当前档位: {e}") from e
+
+    def current_resource_tier(self) -> str:
+        if self.server_type == "global":
+            return "hd"
+        tier = self._read_resource_state()["active_tier"]
+        if tier is None:
+            raise ConfigError("当前档位已被移除，请先运行 ww resource <tier> 选择档位")
+        return tier
+
+    def resource_pack_version(self, pack: str) -> Optional[str]:
+        state = self._read_resource_state()
+        versions = state["versions"]
+        if pack in versions and (pack != "common" or state.get("common_server") == self.server_type):
+            return versions[pack]
+        cfg = self._read_local_config()
+        if pack in ("common", "hd"):
+            # 旧安装的主清单为 common + HD；其它档位不能借用游戏主版本。
+            return cfg.get("version")
+        record = cfg.get("bundles", {}).get(pack.upper(), {})
+        marker = self._managed_path(f"launcherDownloadConfig/{pack}.json")
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else {}
+            if isinstance(data, dict) and isinstance(record, dict):
+                if data.get("packName") == pack and data.get("version") == record.get("version"):
+                    return record.get("version")
+        except (OSError, ValueError):
+            pass
+        return None
+
+    def _record_resource_pack(self, pack: str, version: str, incomplete: bool = False) -> None:
+        state = self._read_resource_state()
+        state["versions"][pack] = version
+        if pack == "common":
+            state["common_server"] = self.server_type
+        pending = set(state.get("incomplete", []))
+        if incomplete:
+            pending.add(pack)
+        else:
+            pending.discard(pack)
+        state["incomplete"] = sorted(pending)
+        self._write_local_json("wwm_resource_state.json", state)
+
     def _tier_manifest(self, tier: str, resources: Any) -> List[dict]:
         """先验证整份清单，再允许创建文件、清理旧包或登记安装。"""
         if not isinstance(resources, list) or not resources:
@@ -589,6 +546,7 @@ class WGameManager:
     ) -> None:
         """下载并验证档位基础包；缓存仅省略未变化文件的重复哈希。"""
         tier = self._validate_tier(tier)
+        self._read_resource_state()
         bundle = self.get_bundle_config(config_url)
         if not isinstance(bundle, dict):
             raise ConfigError("资源档位配置必须为 JSON 对象")
@@ -660,7 +618,11 @@ class WGameManager:
         self._cleanup_tier_stale_files(tier, resources, cache)
         cache.save()
         self._register_installed_tier(tier, version, bundle)
-        logger.info(f"{tier.upper()} 档位已验证并登记。游戏需以 -krqlv={tier} 启动。")
+        self._record_resource_pack(tier, version)
+        state = self._read_resource_state()
+        state["active_tier"] = tier
+        self._write_local_json("wwm_resource_state.json", state)
+        logger.info(f"{tier.upper()} 档位已验证并设为工具当前档位。游戏仍需以 -krqlv={tier} 启动。")
 
     def _cleanup_tier_stale_files(self, tier: str, resources: List[dict], cache: MD5Cache) -> None:
         """仅删除独立缓存里曾管理过的旧资源，保留用户自行放置的文件。"""
@@ -673,7 +635,7 @@ class WGameManager:
             try:
                 if path.is_file():
                     path.unlink()
-                    logger.info(f"已清理档位旧文件: {relative}")
+                    logger.debug(f"已清理档位旧文件: {relative}")
                 cache.clear(path)
             except OSError as e:
                 raise WWError(f"清理档位旧文件失败 {relative}: {e}") from e
@@ -704,6 +666,7 @@ class WGameManager:
     def resource_tier_status(self) -> List[dict]:
         """只读取本地登记与目录，不联网，也不把目录存在等同于完整安装。"""
         cfg = self._read_local_config()
+        selection = self._read_resource_state()
         states = []
         for tier in self.RESOURCE_TIERS:
             record = cfg.get("bundles", {}).get(tier.upper(), {})
@@ -721,12 +684,28 @@ class WGameManager:
             state = (
                 "已登记（未校验）" if registered and present else ("未登记/不完整" if present or version else "未安装")
             )
-            states.append({"tier": tier, "version": version, "state": state, "present": present})
+            if tier in selection.get("incomplete", []):
+                state = "更新未完成"
+            states.append(
+                {
+                    "tier": tier,
+                    "version": version,
+                    "state": state,
+                    "present": present,
+                    "active": selection["active_tier"] == tier,
+                }
+            )
         return states
 
     def remove_resource_tier(self, tier: str) -> None:
         """删除用户明确选择的整个档位目录、独立缓存及两处安装记录。"""
         tier = self._validate_tier(tier)
+        selection = self._read_resource_state()
+        selection["versions"].pop(tier, None)
+        selection["incomplete"] = [p for p in selection.get("incomplete", []) if p != tier]
+        if selection["active_tier"] == tier:
+            selection["active_tier"] = None
+        self._write_local_json("wwm_resource_state.json", selection)
         cfg = self._read_local_config()
         directory = self._managed_path(f"Client/Content/{tier.upper()}")
         cache = self._managed_path(f"wwm_md5_cache_resource_{tier}.json")
@@ -742,13 +721,19 @@ class WGameManager:
         logger.info(f"已移除 {tier.upper()} 档位；其它档位与基础资源未修改")
 
     def remind_resource_tiers(self) -> None:
-        """基础更新后只提醒，不静默下载大型档位资源。"""
-        for state in self.resource_tier_status():
-            if state["present"] or state["version"]:
-                tier = state["tier"]
-                logger.warning(
-                    f"{tier.upper()} 档位需独立校验/更新，请运行 ww resource {tier}；基础更新成功不代表档位包已更新"
-                )
+        """仅提醒版本落后或更新中断的档位，同版本切服不重复警告。"""
+        version = self._read_local_config().get("version")
+        outdated = [
+            state["tier"]
+            for state in self.resource_tier_status()
+            if (state["present"] or state["version"])
+            and (state["version"] != version or state["state"] == "更新未完成")
+        ]
+        if outdated:
+            logger.warning(
+                f"档位 {', '.join(t.upper() for t in outdated)} 未确认与基础版本 {version} 同步；"
+                "请用 ww status 查看，ww resource <tier> 校验修复"
+            )
 
     def _cleanup_stale_files(self, res_list) -> None:
         """删除磁盘上已从当前 manifest 移除的旧文件（Issue #19）。
@@ -801,7 +786,7 @@ class WGameManager:
             try:
                 full.unlink()
                 self.md5_cache.clear(full)
-                logger.warning(f"已清理已从 manifest 移除的旧文件: {rel_str}")
+                logger.debug(f"已清理已从 manifest 移除的旧文件: {rel_str}")
             except OSError as e:
                 logger.warning(f"清理旧文件失败 {rel_str}: {e}")
         if removed:
@@ -1059,7 +1044,7 @@ class WGameManager:
         if not to_download:
             return 0
         total = sum(t[1] for t in to_download)
-        logger.info(f"准备下载 {len(to_download)} 个差异文件，总大小: {total / 1024 / 1024:.2f} MB")
+        logger.debug(f"待下载差异文件: {len(to_download)} 个，{total / 1024 / 1024:.2f} MiB")
 
         tasks = []
         for d, size, _md5 in to_download:
@@ -1093,6 +1078,8 @@ class WGameManager:
             cfg = self._read_local_config()
             cfg.update({"version": v, "appId": self.config["appId"], "group": "default"})
             self._write_local_json("launcherDownloadConfig.json", cfg)
+            self._record_resource_pack("common", v)
+            self._record_resource_pack("hd", v)
             logger.info(f"本地配置已更新: {self.server_type} ({v})")
 
     def apply_incremental_update(self, dry_run: bool = False) -> bool:
@@ -1119,8 +1106,14 @@ class WGameManager:
             logger.error(f"增量更新失败: {e}")
             return False
 
-    def download_incremental(self) -> bool:
-        """下载增量更新包"""
+    def download_incremental(self, config_url: Optional[str] = None) -> bool:
+        """统一下载 common + 当前档位，未开放的分包渠道不降级到 HD。"""
+        from .resource_updates import ResourceUpdater
+
+        updater = ResourceUpdater(self)
+        if self.server_type != "global" or updater.has_pending_plan():
+            return updater.download(config_url)
+        logger.info("国际服使用默认 HD 基础增量")
         manager = IncrementalManager(
             self.game_folder,
             self.server_type,
@@ -1134,7 +1127,14 @@ class WGameManager:
             return False
 
     def apply_incremental(self) -> bool:
-        """应用已下载的增量更新包"""
+        """应用已固定的分包更新计划，应用阶段不重新选择线上目标。"""
+        from .resource_updates import ResourceUpdater
+
+        updater = ResourceUpdater(self)
+        if updater.has_pending_plan():
+            return updater.apply()
+        if self.current_resource_tier() != "hd":
+            raise ConfigError("未找到当前档位的分包更新计划，请先运行 ww incremental")
         manager = IncrementalManager(
             self.game_folder,
             self.server_type,
@@ -1142,13 +1142,26 @@ class WGameManager:
             self.cdn_node,
         )
         try:
-            return manager.apply_incremental()
+            success = manager.apply_incremental()
+            if success:
+                version = manager.get_current_version()
+                if version:
+                    self._record_resource_pack("common", version)
+                    self._record_resource_pack("hd", version)
+            return success
         except IncrementalError as e:
             logger.error(f"增量更新应用失败: {e}")
             return False
 
     def verify_new_version(self) -> bool:
-        """校验新版本文件状态（用于增量更新前检查）"""
+        """校验已应用更新的文件，不混用其它档位索引。"""
+        from .resource_updates import HISTORY, ResourceUpdater
+
+        updater = ResourceUpdater(self)
+        if updater.has_pending_plan() or self._managed_path(HISTORY).is_file():
+            return updater.verify()
+        if self.current_resource_tier() != "hd":
+            raise ConfigError("没有所选档位的分包更新记录，请使用 ww resource <tier> 全量校验")
         manager = IncrementalManager(
             self.game_folder,
             self.server_type,

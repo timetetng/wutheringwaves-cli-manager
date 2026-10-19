@@ -41,7 +41,13 @@ from rich.progress import (
 )
 from rich.text import Text
 
-from ww_manager.download import RAINBOW_COLORS, NetworkError
+from ww_manager.download import (
+    RAINBOW_COLORS,
+    NetworkError,
+    RainbowBarColumn,
+    create_download_progress,
+    download_single_file,
+)
 
 logger = logging.getLogger("WW_Manager")
 
@@ -60,15 +66,16 @@ class ApplySpinnerColumn(SpinnerColumn):
         return Text("")
 
 
-class ApplyRainbowBarColumn(BarColumn):
-    """总任务使用彩虹进度条，子任务不显示 bar。"""
+class ApplyRainbowBarColumn(ProgressColumn):
+    """总任务复用下载进度条，子任务只显示状态。"""
+
+    def __init__(self, bar_width=40):
+        super().__init__()
+        self.bar = RainbowBarColumn(bar_width=bar_width)
 
     def render(self, task):
         if task.fields.get("kind") == "overall":
-            color = RAINBOW_COLORS[task.id % len(RAINBOW_COLORS)]
-            self.complete_style = color
-            self.finished_style = color
-            return super().render(task)
+            return self.bar.render(task)
         return Text("")
 
 
@@ -176,10 +183,13 @@ def _get_krpdiff_size(url: str) -> Optional[int]:
 
 def _calculate_file_md5(file_path: Path) -> str:
     """计算文件 MD5"""
-    hash_md5 = hashlib.md5()
-    with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(4096 * 1024), b""):
-            hash_md5.update(chunk)
+    hash_md5 = hashlib.md5(usedforsecurity=False)
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096 * 1024), b""):
+                hash_md5.update(chunk)
+    except OSError as e:
+        raise IncrementalError(f"无法校验文件 {file_path}: {e}") from e
     return hash_md5.hexdigest()
 
 
@@ -258,12 +268,20 @@ def _safe_replace_file(src: Path, dest: Path, error_callback: Optional[Callable[
 class IncrementalManager:
     """统一的增量更新管理器，支持 cn、global、bilibili"""
 
-    def __init__(self, game_folder: Path, server_type: str, api_data: Dict, cdn_base: str):
+    def __init__(
+        self, game_folder: Path, server_type: str, api_data: Dict, cdn_base: str, pack_name: Optional[str] = None
+    ):
         self.game_folder = game_folder
         self.server_type = server_type
         self.cdn_base = cdn_base.rstrip("/")
         self.api_data = api_data
         self.cache_dir = game_folder / ".ww_manager_cache"
+        self.download_dir = game_folder / ".incremental_download"
+        if pack_name is not None:
+            if pack_name not in ("common", "hd", "sd", "uhd"):
+                raise IncrementalError(f"非法资源包名称: {pack_name}")
+            self.cache_dir = self.cache_dir / "packs" / pack_name
+            self.download_dir = self.download_dir / "packs" / pack_name
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.hpatchz_path: Optional[Path] = None
@@ -484,7 +502,7 @@ class IncrementalManager:
 
         logger.info(f"正在获取增量更新信息: {current_version}")
 
-        index_data = _http_get_json(index_url)
+        index_data = self._index_file if self._index_file is not None else _http_get_json(index_url)
         if not index_data:
             logger.error("获取增量更新索引失败")
             return False
@@ -492,24 +510,23 @@ class IncrementalManager:
         self._index_file = index_data
 
         group_infos = self.get_group_infos()
-        if not group_infos:
-            logger.warning("没有找到增量更新组")
-            return False
+        # 分包热修复允许空清单，也允许只有完整文件或删除项而没有二进制差分组。
+        logger.debug(f"找到 {len(group_infos)} 个增量更新组")
 
-        logger.info(f"找到 {len(group_infos)} 个增量更新组")
-
-        download_dir = self.game_folder / ".incremental_download"
+        download_dir = self.download_dir
         download_dir.mkdir(parents=True, exist_ok=True)
-
-        (download_dir / "indexFile.json").write_text(json.dumps(index_data, indent=2))
 
         version_info = {
             "from_version": current_version,
             "to_version": self.get_target_version(),
             "server": self.server_type,
         }
-        with open(download_dir / "version_info.json", "w", encoding="utf-8") as f:
-            json.dump(version_info, f, indent=4)
+        try:
+            (download_dir / "indexFile.json").write_text(json.dumps(index_data, indent=2), encoding="utf-8")
+            (download_dir / "version_info.json").write_text(json.dumps(version_info, indent=4), encoding="utf-8")
+        except OSError as e:
+            logger.error(f"无法保存增量下载记录: {e}")
+            return False
 
         resources = index_data.get("resource", [])
         resource_by_dest = {r["dest"]: r for r in resources if r.get("dest")}
@@ -527,7 +544,7 @@ class IncrementalManager:
             elif self.default_config.get("baseUrl"):
                 res_base = self.default_config["baseUrl"].rstrip("/")
 
-        logger.info("正在检查本地增量更新资源缓存...")
+        logger.debug("正在检查本地增量更新资源缓存...")
 
         pending_groups = []
         skipped_groups = []
@@ -585,7 +602,7 @@ class IncrementalManager:
                         temp_path.unlink()
                 pending_size += expected_size - resume_size
 
-        total_size = total_size + pending_size
+        total_size = sum(item[3] for item in pending_groups)
 
         complete_tasks = []
         complete_ready_count = 0
@@ -639,29 +656,13 @@ class IncrementalManager:
 
         if not pending_groups and not complete_tasks:
             logger.info("无需下载，所有增量更新资源已在本地就绪")
-            if complete_total_count:
-                logger.info(
-                    f"所有下载资源已就绪: 增量包 {len(skipped_groups)}/{len(group_infos)}, "
-                    f"完整文件 {complete_ready_count}/{complete_total_count}"
-                )
-            else:
-                logger.info(f"所有增量包已下载完成 ({len(skipped_groups)}/{len(group_infos)})")
             return True
 
         if pending_groups:
             logger.info(f"待下载: {len(pending_groups)} 个增量包 ({pending_size / 1024 / 1024:.2f} MB)")
         already_downloaded_count = len(skipped_groups)
 
-        progress = Progress(
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(bar_width=40),
-            "[progress.percentage]{task.percentage:>3.1f}%",
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            TimeRemainingColumn(),
-            expand=True,
-            transient=True,
-        )
+        progress = create_download_progress()
 
         max_workers = 8
         failed_patches = []
@@ -764,7 +765,9 @@ class IncrementalManager:
         progress: Optional[Progress] = None,
         overall_task_id: Optional[TaskID] = None,
     ) -> bool:
-        """下载单个文件，支持断点续传和大小校验，使用 Rich Progress 显示进度"""
+        """已知大小的文件复用通用下载器；旧接口保留无大小信息的兼容路径。"""
+        if expected_size > 0:
+            return download_single_file(url, dest, expected_size, progress, overall_task_id, expected_md5=expected_md5)
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         task_id = None
@@ -852,7 +855,11 @@ class IncrementalManager:
                 success = False
 
         if success:
-            shutil.move(temp_file, dest)
+            try:
+                shutil.move(temp_file, dest)
+            except OSError as e:
+                _emit_progress_log(progress, "ERROR", f"无法保存下载文件 {dest.name}: {e}")
+                success = False
 
         if progress and task_id is not None:
             progress.remove_task(task_id)
@@ -1039,13 +1046,7 @@ class IncrementalManager:
     def apply_incremental(self) -> bool:
         """应用已下载的增量更新包"""
         logger.info("正在准备应用增量更新...")
-        logger.info("正在检查增量更新运行环境...")
-        is_ok, error_msg = check_hpatchz_requirements()
-        if not is_ok:
-            logger.warning(f"环境检查失败: {error_msg}")
-            raise IncrementalError(error_msg)
-
-        download_dir = self.game_folder / ".incremental_download"
+        download_dir = self.download_dir
         version_file = download_dir / "version_info.json"
 
         if not download_dir.exists() or not version_file.exists():
@@ -1063,9 +1064,6 @@ class IncrementalManager:
             return False
 
         logger.info(f"开始应用增量更新: {version_info.get('from_version')} -> {version_info.get('to_version')}")
-        logger.info("正在准备 hpatchz 工具...")
-        self.hpatchz_path = get_hpatchz_path(self.cache_dir)
-
         index_file = download_dir / "indexFile.json"
         if not index_file.exists():
             logger.error("无法找到 indexFile.json")
@@ -1078,11 +1076,14 @@ class IncrementalManager:
             return False
 
         group_infos = self.get_group_infos()
-        if not group_infos:
-            logger.warning("没有增量更新组")
-            return False
+        if group_infos:
+            is_ok, error_msg = check_hpatchz_requirements()
+            if not is_ok:
+                raise IncrementalError(error_msg)
+            logger.info("正在准备 hpatchz 工具...")
+            self.hpatchz_path = get_hpatchz_path(self.cache_dir)
 
-        max_workers = min(4, len(group_infos))
+        max_workers = max(1, min(4, len(group_infos)))
         # 大文件优先：按 group 总大小降序排列，让最大的先启动
         group_infos = sorted(group_infos, key=lambda g: self._get_group_size(g), reverse=True)
         logger.info(
@@ -1244,13 +1245,18 @@ class IncrementalManager:
             shutil.copy2(index_file, saved_index)
             logger.info("已保存索引到缓存")
 
-        shutil.rmtree(download_dir)
-        logger.info("已清理增量下载目录")
+        # 先提交分包断点；登记失败时保留下载目录，允许继续校验和应用。
+        self._update_local_version(version_info.get("to_version"))
+        try:
+            shutil.rmtree(download_dir)
+            logger.info("已清理增量下载目录")
+        except OSError as e:
+            # 已完成迁移和版本登记；仅临时清理失败不应伪装成更新失败。
+            logger.warning(f"增量更新已完成，但临时下载目录清理失败: {e}")
 
         self._cleanup_cache_dir()
         logger.info("已清理缓存临时目录")
 
-        self._update_local_version(version_info.get("to_version"))
         logger.info("增量更新应用完成。建议运行 'ww sync --new' 做最终校验。")
 
         return True
@@ -1340,7 +1346,11 @@ class IncrementalManager:
         # 从备份恢复
         if backup_path.exists() and not first_src_full.exists():
             set_status("恢复中断文件")
-            shutil.move(backup_path, first_src_full)
+            try:
+                shutil.move(backup_path, first_src_full)
+            except OSError as e:
+                log_error(f"无法恢复中断的更新 {first_src_path}: {e}")
+                return krpdiff_name, "failed"
             log_info(f"恢复中断的更新: {first_src_path}")
             first_local_md5 = _calculate_file_md5(first_src_full)
 
@@ -1522,9 +1532,13 @@ class IncrementalManager:
             patch_temp_dir = self.cache_dir / "patch_temp"
             patch_temp_dir.mkdir(parents=True, exist_ok=True)
             temp_olddir = patch_temp_dir / f"olddir_{Path(krpdiff_path).stem}"
-            if temp_olddir.exists():
-                shutil.rmtree(temp_olddir)
-            temp_olddir.mkdir(parents=True)
+            try:
+                if temp_olddir.exists():
+                    shutil.rmtree(temp_olddir)
+                temp_olddir.mkdir(parents=True)
+            except OSError as e:
+                emit_error(f"无法准备 hpatchz 源文件目录: {e}")
+                return False
 
             # 复制所有源文件到临时目录
             for index, src_file in enumerate(src_files, 1):
@@ -1580,7 +1594,7 @@ class IncrementalManager:
 
     def verify_new_version(self) -> bool:
         """校验新版本文件状态，用于增量更新后的检查"""
-        download_dir = self.game_folder / ".incremental_download"
+        download_dir = self.download_dir
         index_file = download_dir / "indexFile.json"
         cache_index_file = self.cache_dir / "indexFile.json"
 
@@ -1618,10 +1632,6 @@ class IncrementalManager:
             return False
 
         logger.info(f"正在校验 {len(game_files)} 个新版本文件...")
-
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        from rich.progress import BarColumn, Progress, TextColumn, TimeRemainingColumn
 
         ok_count = 0
         inconsistent_files = []
@@ -1686,17 +1696,6 @@ class IncrementalManager:
         res_base = self._find_resource_base()
         if not res_base:
             logger.warning("无法获取全局新版本资源路径，将尝试使用单个资源的 fromFolder")
-
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        from rich.progress import (
-            BarColumn,
-            DownloadColumn,
-            Progress,
-            TextColumn,
-            TimeRemainingColumn,
-            TransferSpeedColumn,
-        )
 
         game_res_map = {r["dest"]: r for r in game_files}
         repair_count = 0
@@ -1803,14 +1802,17 @@ class IncrementalManager:
         for name in temp_subdirs:
             subdir = self.cache_dir / name
             if subdir.exists():
-                shutil.rmtree(subdir, ignore_errors=True)
-                cleaned += 1
+                try:
+                    shutil.rmtree(subdir)
+                    cleaned += 1
+                except OSError as e:
+                    logger.warning(f"无法清理临时目录 {subdir}: {e}")
         if cleaned:
             logger.debug(f"已清理 {cleaned} 个缓存临时目录")
 
     def _find_resource_base(self) -> Optional[str]:
         """从 indexFile.json 或 API 配置获取资源路径前缀"""
-        download_dir = self.game_folder / ".incremental_download"
+        download_dir = self.download_dir
         index_file = download_dir / "indexFile.json"
         cache_index_file = self.cache_dir / "indexFile.json"
 

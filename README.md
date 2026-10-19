@@ -1,21 +1,21 @@
 
 <div align="center"><h1>WutheringWaves CLI Manager</h1><h3>鸣潮命令行管理器</h3><div align="center">
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.2.5-brightgreen.svg" alt="version 2.2.5">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.0-brightgreen.svg" alt="version 2.3.0">
   <br>
 </div>
 </div>
 
 <div align="center" style="width: 80%;">
     <div style="display: flex; justify-content: space-between; align-items: flex-start; width: 80%;">
-        <img src="https://cdn.jsdelivr.net/gh/timetetng/Pic-Bed@main/ww-example1.png" alt="徽章" style="width: 40%; height: auto;">
-        <img src="https://cdn.jsdelivr.net/gh/timetetng/Pic-Bed@main/ww-example2.png" alt="命令行预览" style="width: 40%; height: auto;">
+        <img src="./docs/images/cli-preview.webp" alt="命令帮助预览" style="width: 40%; height: auto;">
+        <img src="./docs/images/download-preview.webp" alt="下载进度预览" style="width: 40%; height: auto;">
     </div>
 </div>
 
 专为 Linux 用户打造的《鸣潮》客户端命令行管理工具。
-结合了 **完整的下载/校验功能** 与 **秒级服务器切换** 技术。一旦完成“烘焙”，即可在官服 (CN)、B 服 (Bilibili) 之间瞬时切换，无需重新下载庞大的游戏文件。
+提供 **完整的下载/校验功能** 与 **服务器差异缓存切换**。官服 (CN)、B 服 (Bilibili) 之间优先复用缓存与共享资源，无需重新下载完整客户端。
 
-> 🌐 [**English**](./docs/README.en.md)
+> 🌐 [**English**](./docs/README.en.md)（画质包新功能说明尚未同步）
 
 > **国际服因为包体差异不支持快速切换**。
 >
@@ -23,11 +23,11 @@
 
 ## ✨ 核心功能
 
-* **🚀 秒级切换 (`checkout`)**：利用 MD5 快速校验，仅替换差异文件，在不同服务器间瞬间切换。
+* **🚀 快速切换 (`checkout`)**：校验并替换官/B 服差异文件，优先复用本地缓存，保留已安装的画质包。
 * **🛠️ 智能修复 (`sync`)**：校验全量文件 MD5，自动修复损坏文件，下载缺失资源。
-* **📦 完整下载 (`download`)**：从零开始下载任一服务器的纯净客户端。
+* **📦 完整下载 (`download`)**：从零开始下载客户端，默认官服 HD。
+* **🎨 画质包管理 (`resource`)**：安装、校验或删除 HD/SD/UHD，官服/B 服共用画质包。
 * **🔥 预下载/增量更新(`predownload`)**: 预下载开放期下载增量包、维护后应用合并补丁；新版本开启后也可直接增量更新。基于官方启动器解包的补丁二进制(见 release），欢迎测试并提交问题。`incremental` 为其别名。
-* **🎨 资源档位下载(`resource`)**: 下载 3.7+ 画质档位基础包(HD/SD/UHD)，补齐全量清单之外的 `Client/Content/<TIER>/` 资源；清单地址自动从 3.0+ 官方启动器 KRApp.conf 解码。
 * **💾 自动记忆**：自动记录游戏路径，一次设置，永久生效。
 * **⚡️ 现代化 CLI**：基于 `Typer` 构建，支持自动补全和帮助信息。
 * **👯 并行下载**: 使用多线程并行下载，避免 CDN 节点降速，支持断点续传。
@@ -105,7 +105,7 @@ ww -p "$HOME/Games/WutheringWaves" status
 
 #### 1\. 查看状态 (`status`)
 
-检查当前游戏目录属于哪个服务器，以及版本号。
+查看当前游戏目录的服务器、版本、画质包登记与工具当前档位。
 
 ```bash
 ww status
@@ -113,9 +113,9 @@ ww status
 
 #### 2\. 快速切换服务器 (`checkout`)
 
-**秒级**切换服务器（仅限官/b 服）。
+快速切换服务器（仅限官/B 服）。
 
-官服、B 服之间采用**差异文件缓存**机制：首次切换会下载两服差异文件并备份到游戏目录内的 `wwm_server_diff_cache/`，此后任意切换都从优先本地缓存恢复，无需重新下载，失败时回退至 CDN 下载。大版本更新（如 3.4 → 3.5）时会自动重置缓存。
+官服、B 服之间采用**差异文件缓存**机制：首次切换会下载两服差异文件并备份到游戏目录内的 `wwm_server_diff_cache/`，此后切换优先从本地缓存恢复，缺失或校验失败时再从 CDN 下载。大版本更新（如 3.4 → 3.5）时会自动重置缓存。
 
 ```bash
 # 切换到 Bilibili 服
@@ -129,7 +129,7 @@ ww checkout cn --force-sync
 ```
 #### 3\. 同步与修复 (`sync`)
 
-切换服务器或下载中断导致文件缺失时使用。它会联网校验所有文件并下载更新。版本更新请 `ww predownload` 命令预下载/增量更新（`ww predownload --apply` 应用）
+切换服务器或下载中断导致文件缺失时使用。按基础全量清单校验 MD5 并修复，包含 HD；SD/UHD 使用 `ww resource <tier>` 单独校验。版本更新可使用 `ww predownload` 下载补丁，再用 `ww predownload --apply` 应用。
 
 ```bash
 ww sync
@@ -139,11 +139,12 @@ ww sync
 
 #### 4\. 下载完整客户端 (`download`)
 
-使用此命令从零开始下载。
+使用此命令从零开始下载，默认官服 HD。
 
 ```bash
-# 下载完整的官服客户端到配置的目录
-ww download cn
+ww download             # 官服 HD，等同于 ww download cn
+ww download bilibili    # B 服 HD
+ww download global      # 国际服 HD
 ```
 
 #### 5\. 预下载 / 增量更新 (`predownload`，别名 `incremental`)
@@ -162,44 +163,16 @@ ww incremental
 ww incremental --apply
 ```
 
+不同画质档位的增量更新目前仅预留接口，目标是统一处理 `common + 当前档位`，**尚未完成官方跨版本补丁的真实验证**。预下载通常只在版本更新前几天开放；无匹配补丁或配置格式尚未适配时会明确报错，不会自动改下 HD。国际服暂保留原 HD 增量流程。
+
 > [!CAUTION]
 > 1. **预下载开放之后即可开始下载增量包**（新版本开启后此通道会转为直接增量更新）；
 > 2. **如果应用中断，可重试 `ww predownload --apply`**；
-> 3. **应用后若有缺失文件，运行 `ww sync` 修复文件**；
+> 3. **应用后可运行 `ww sync --new` 校验此次增量涉及的文件；基础资源全量修复使用 `ww sync`**；
 > 4. **请确保安装目录有足够磁盘空间（需要两倍的空间复制源文件用于合并补丁）**
 
 
-#### 6\. 资源档位下载 (`resource`)
-
-下载 3.7+ 的画质档位基础包（HD/SD/UHD → `Client/Content/<TIER>/`）。SD/UHD 基础包**不在**常规全量清单中（`ww download`/`ww sync` 下载的是 common + HD），UHD/SD 档需要本命令下载，游戏以 `-krqlv=<tier>` 启动时加载对应目录。
-
-```bash
-# 下载 UHD 档基础包（约 61.5 GiB，支持断点续传，重复执行只补缺失/损坏文件）
-ww resource uhd
-
-# 忽略 MD5 缓存，重新计算全部文件哈希（默认也校验 MD5，但复用未变化文件的缓存）
-ww resource uhd --force-md5
-
-# 离线查看各档位登记状态和启动参数；不把目录存在当作完整安装
-ww status
-
-# 确认后删除整个 UHD 目录、独立缓存及安装记录（包括该目录内自行放置的文件）
-ww resource uhd --remove
-
-# 手动指定 bundle 配置 URL（默认自动从官方启动器 KRApp.conf 解码，需 3.0+ 启动器）
-ww resource uhd --config-url https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10003_<appKey>/G152/official/index.json
-```
-
-> [!NOTE]
-> 1. 档位包始终校验大小和 MD5，使用独立缓存（`wwm_md5_cache_resource_<tier>.json`），不会干扰 `ww sync`；首次校验会读取整个档位包，后续可复用文件属性未变的缓存；
-> 2. 清单 URL 中的 appKey 随官方启动器小版本更新而变化，本命令默认从游戏目录上级的启动器版本目录（如 `3.0.1.0/Assets/KRApp.conf`，Base64+XOR 编码）按当前渠道 (resId/appId) 匹配并自动解码最新地址；
-> 3. 下载/校验全部成功后会登记官方启动器安装记录（`launcherDownloadConfig.json` 的 `bundles` 条目 + `launcherDownloadConfig/<pack>.json` 版本标记），保留其它档位与自定义字段；失败以非零退出码返回，不保留残缺档位的有效安装标记，重跑即可续传；
-> 4. 版本更新后只清理本档位独立缓存曾记录、现已从清单移除的文件；从未登记的用户文件不自动删除。旧版本没有缓存的残留包不会被猜测性清理；
-> 5. **b 服暂无分档资源分发**（其启动器配置不含 resourcePacks），仅官服/国际服可用；
-> 6. 基础下载、同步、切服或应用增量更新后，会提醒已存在的档位独立执行 `ww resource <tier>`。不会自动下载几十 GB 的档位包；档位没有可用增量补丁时，仍按完整清单只下载变化文件。`status` 的“已登记（未校验）”仅表示本地登记存在，不保证完整性或与线上版本一致；
-> 7. 缺失基础包时，官服 3.7.0 实测 `-krqlv=uhd` 启动会在登录界面加载 UI 资源阶段崩溃（`Couldn't find file for package /Game/Aki/UI/UIResources/...` 大量报错后 `EXCEPTION_ACCESS_VIOLATION`，启动约 34 秒）；"游戏内切档会自动回退不崩"的说法对应的是另一条路径（游戏内下载器），与缺目录直启不同。
-
-#### 7\. 获取抽卡记录链接 (`log`)
+#### 6\. 获取抽卡记录链接 (`log`)
 
 可以一键获取抽卡链接，用于导入小程序或者鸣潮机器人。
 
@@ -210,12 +183,29 @@ ww log
 
 > `-o`、`--open`: 获取链接并跳转打开。
 
-#### 8\. 更新工具本身（`update`）
+#### 7\. 更新工具本身（`update`）
 自动检查安装方式并尝试更新
 
 ```bash
 ww update
 ```
+
+#### 8\. 画质包管理 (`resource`)
+
+官服/B 服共用画质包，配置自动获取。国际服未测试通用性暂仅支持默认 HD。
+
+```bash
+ww resource uhd                # 安装、校验并选定 UHD
+ww resource sd                 # 安装、校验并选定 SD
+ww resource hd                 # 安装、校验并选定 HD
+ww resource uhd --force-md5     # 忽略缓存，重新计算全部 MD5
+ww resource uhd --remove        # 确认后删除整个 UHD 目录及登记
+```
+
+* `download` / `sync` 包含 HD；SD/UHD 需要单独安装。
+* 多档位可以共存，最后成功执行的 `resource <tier>` 为工具当前档位，用于选择分包更新；**游戏启动参数需自行设置**。
+* `--remove` 会删除该档位目录中的所有文件，包括自行放入的文件；删除当前档位后需重新选择。
+* 首次使用 UHD 等档位，游戏内仍可能下载对应视频与热更新。
 
 ## 🎮 启动游戏 (Linux)
 
@@ -228,15 +218,13 @@ ww update
 > 缺少该参数（或取值非法）时，游戏会在挂载完 pak 之后直接崩溃：
 > `Fatal error: [File:Unknown] [Line: 54] kuro: Use launcher to start game!`
 >
-> 官方启动器下发的默认值就是 `-krqlv=hd`（“高清画质启动”）。本工具下载的是高清档资源，所以直接用 `hd`：
+> 默认下载的是 HD（高清）资源，使用 `-krqlv=hd`；安装 SD/UHD 后，将参数替换为 `-krqlv=sd` / `-krqlv=uhd`，不要同时设置多个档位：
 >
 > ```bash
 > Client-Win64-Shipping.exe -krqlv=hd
 > ```
->
-> 想玩 UHD/SD 档，先用 [`ww resource`](#6-资源档位下载-resource) 下载对应档位基础包，再把启动参数改为 `-krqlv=uhd` / `-krqlv=sd`。
 
-如果你熟悉 Linux，你可以参考项目中的 `run_ww.sh` 脚本并添加 .desktop 文件绕过 Steam 启动，或者按照以下步骤通过 Steam 启动：
+如果你熟悉 Linux，你可以使用 `lutris` 启动游戏，也可以参考项目中的 `run_ww.sh` 脚本并添加 .desktop 文件绕过 Steam 启动，小白仍然建议按以下步骤通过 Steam 启动：
 
 1. **Steam 设置**：
 
@@ -278,7 +266,7 @@ ww update
 ---
 
 ### Q3: 出现剧情文本错误或素材缺失？
-1.  **执行同步**：优先运行 `ww sync` 命令。
+1.  **执行同步**：优先运行 `ww sync`；使用 SD/UHD 时，再运行对应的 `ww resource sd` / `ww resource uhd`。
 2.  **环境排查**：若同步后仍有问题，通常不在游戏本体，建议尝试更换 **启动方式**、**桌面环境 (DE)** 或 **Wine/Proton 版本**。
 
 ---
@@ -305,22 +293,12 @@ ww update
 ---
 
 ### Q6: 3.7 更新后启动报 `Fatal error: ... kuro: Use launcher to start game!`？
-游戏本体没坏，是**缺少画质档位参数**：3.7 起资源分档（HD/SD/UHD），必须由启动器在命令行上告知档位。在启动脚本 / Steam 启动选项里加上 `-krqlv=hd` 即可，详见上方 [启动游戏 (Linux)](#-启动游戏-linux) 一节的提示。
+游戏本体没坏，是**缺少画质档位参数**：3.7 起资源分档(HD/SD/UHD)，必须由启动器在命令行上告知档位。在启动脚本 / Steam 启动选项里加上 `-krqlv=hd` 即可，详见上方 [启动游戏 (Linux)](#-启动游戏-linux) 一节的提示。
 
 ---
 
 ### 📢 反馈
 任何问题请在 **Issue** 中提出，也欢迎 **PR**。
-
-## 开发验证
-
-```bash
-uv run python -m unittest discover -s tests -v
-uv run ruff check .
-uv run ruff format --check .
-```
-
-档位回归测试使用临时目录与本地 HTTP 服务，覆盖真实文件写入、断点续传、错误响应、MD5、安装登记、缓存和删除确认；不下载官方大型资源，不修改已安装游戏。CI 对 `main`、`dev` 的 PR 均运行这些检查。
 
 ## 致谢
 
@@ -328,6 +306,7 @@ uv run ruff format --check .
 
 * [WutheringWavesTool](https://github.com/leck995/WutheringWavesTool)
 * [LutheringLaves](https://github.com/last-live/LutheringLaves)
+* [wuwa-uhd-tool](https://github.com/TianXyousa/wuwa-uhd-tool)
 * [Wuthering-Waves-Official-Bilibili](https://github.com/Hurry1027/Wuthering-Waves-Official-Bilibili)
 * [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom/releases/): 下载最新版本的 `GE-Proton` 并解压到 `~/.local/share/Steam/steamapps/common/` 目录下，启动 Steam，在**属性-兼容性**中能找到下载的 `GE-Proton` 即说明配置成功。
 * [dwproton](https://dawn.wine/dawn-winery/dwproton/releases): 安装方式同上

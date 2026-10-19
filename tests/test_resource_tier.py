@@ -4,7 +4,6 @@
 运行：uv run python -m unittest discover -s tests -p test_resource_tier.py -v
 """
 
-import base64
 import copy
 import hashlib
 import json
@@ -19,8 +18,9 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from ww_manager.cli import app
+from ww_manager.config import RESOURCE_CONFIG_URLS
 from ww_manager.core import ConfigError, MD5Cache, NetworkError, WGameManager
-from ww_manager.download import download_single_file
+from ww_manager.download import create_download_progress, download_single_file
 
 GOOD = b"official-resource-content"
 DEST = "Client/Content/UHD/test.pak"
@@ -334,17 +334,90 @@ class ResourceTierTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         sync.assert_called_once()
         resource.assert_not_called()
-        self.assertIn("ww resource uhd", "\n".join(logs.output))
+        self.assertIn("UHD", "\n".join(logs.output))
+        self.assertIn("ww resource <tier>", "\n".join(logs.output))
 
-    def test_krapp_channel_matching_without_fallback(self):
-        self.bundle_patch.stop()
-        conf = {"games": [{"resId": "50004", "configUrl": self.url + "global"}]}
-        encoded = base64.b64encode(bytes(b ^ 0x63 for b in json.dumps(conf).encode()))
-        krapp = self.put("KRApp.conf", encoded)
-        with patch.object(self.manager, "_find_krapp_conf", return_value=krapp):
-            with self.assertRaises(ConfigError):
-                self.manager.get_bundle_config()
-        self.bundle_patch.start()
+    def test_cn_and_bilibili_auto_config_without_launcher(self):
+        self.assertFalse(list(self.root.rglob("KRApp.conf")))
+        for server in ("cn", "bilibili"):
+            manager = WGameManager(self.root, server)
+            app_id = manager.config["appId"]
+            with patch.object(manager, "_http_get_json", return_value=self.bundle) as fetch:
+                self.assertEqual(manager.get_bundle_config(), self.bundle)
+            fetch.assert_called_once_with(RESOURCE_CONFIG_URLS[0])
+            self.assertEqual(manager.config["appId"], app_id)
+            self.assertEqual(manager.server_type, server)
+
+    def test_auto_config_tries_other_official_nodes(self):
+        manager = WGameManager(self.root, "cn")
+        with patch.object(manager, "_http_get_json", side_effect=[None, {}, self.bundle]) as fetch:
+            self.assertEqual(manager.get_bundle_config(), self.bundle)
+        self.assertEqual([call.args[0] for call in fetch.call_args_list], list(RESOURCE_CONFIG_URLS))
+
+    def test_invalid_auto_config_fails_without_writing_files(self):
+        manager = WGameManager(self.root, "cn")
+        before = sorted(self.root.rglob("*"))
+        with patch.object(manager, "_http_get_json", return_value=[]):
+            with self.assertRaisesRegex(NetworkError, "官方画质配置"):
+                manager.get_bundle_config()
+        self.assertEqual(sorted(self.root.rglob("*")), before)
+
+    def test_explicit_config_override_does_not_fallback(self):
+        manager = WGameManager(self.root, "cn")
+        with patch.object(manager, "_http_get_json", return_value=None) as fetch:
+            with self.assertRaises(NetworkError):
+                manager.get_bundle_config(self.url)
+        fetch.assert_called_once_with(self.url)
+
+    def test_global_keeps_hd_and_never_uses_cn_quality_config(self):
+        manager = WGameManager(self.root, "global")
+        with patch.object(manager, "_http_get_json") as fetch:
+            self.assertEqual(manager.current_resource_tier(), "hd")
+            with self.assertRaisesRegex(ConfigError, "国际服暂仅支持默认 HD"):
+                manager.download_resource_tier("uhd")
+        fetch.assert_not_called()
+
+    def test_download_defaults_to_cn_hd(self):
+        with (
+            patch("ww_manager.cli.WGameManager") as manager,
+            patch("ww_manager.cli.get_game_path", return_value=self.root),
+        ):
+            result = CliRunner().invoke(app, ["download"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        manager.assert_called_once_with(self.root, "cn")
+        manager.return_value.download_full.assert_called_once()
+
+    def test_download_preserves_positional_server_argument(self):
+        for server in ("cn", "bilibili", "global"):
+            with (
+                self.subTest(server=server),
+                patch("ww_manager.cli.WGameManager") as manager,
+                patch("ww_manager.cli.get_game_path", return_value=self.root),
+            ):
+                result = CliRunner().invoke(app, ["download", server])
+                self.assertEqual(result.exit_code, 0, result.output)
+                manager.assert_called_once_with(self.root, server)
+                manager.return_value.download_full.assert_called_once()
+
+    def test_same_version_checkout_does_not_warn_tier_is_outdated(self):
+        self.manager.download_resource_tier("uhd")
+        cfg = self.read_json("launcherDownloadConfig.json")
+        cfg["version"] = self.bundle["resourcePacks"]["uhd"]["version"]
+        self.manager._write_local_json("launcherDownloadConfig.json", cfg)
+        with patch("ww_manager.core.logger.warning") as warning:
+            self.manager.remind_resource_tiers()
+        warning.assert_not_called()
+
+    def test_download_progress_counts_resume_once(self):
+        for endpoint in ("ok", "ignore-range", "wrong-range"):
+            with self.subTest(endpoint=endpoint), create_download_progress() as progress:
+                path = self.root / "download.pak"
+                self.put("download.pak.temp", GOOD[:5])
+                task = progress.add_task("Total", total=len(GOOD))
+                self.assertTrue(
+                    download_single_file(self.url + endpoint, path, len(GOOD), progress, task, expected_md5=md5(GOOD))
+                )
+                self.assertEqual(progress.tasks[0].completed, len(GOOD))
 
     def test_remove_symlink_cannot_delete_outside(self):
         outside = self.root / "outside"
