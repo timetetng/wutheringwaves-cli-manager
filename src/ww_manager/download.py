@@ -3,8 +3,8 @@
 通用下载模块：提供带进度条的并行下载支持
 """
 
+import hashlib
 import logging
-import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -70,6 +70,7 @@ def download_single_file(
     progress: Optional[Progress] = None,
     overall_task_id: Optional[TaskID] = None,
     resume_support: bool = True,
+    expected_md5: Optional[str] = None,
 ) -> bool:
     """
     下载单个文件，支持断点续传和进度显示
@@ -81,6 +82,7 @@ def download_single_file(
         progress: Rich Progress实例
         overall_task_id: 总任务ID（用于更新总进度）
         resume_support: 是否支持断点续传
+        expected_md5: 可选的清单 MD5，临时文件通过校验后才替换目标
 
     Returns:
         是否成功
@@ -94,73 +96,76 @@ def download_single_file(
         progress.update(task_id, description=f"[{color}]{dest.name}[/{color}]")
 
     temp_file = dest.with_suffix(dest.suffix + ".temp")
-    headers = {"User-Agent": "WW-Manager/2.0"}
 
-    retries = 3
-    success = False
+    def verified() -> bool:
+        if not temp_file.is_file() or temp_file.stat().st_size != expected_size:
+            return False
+        if expected_md5 is None:
+            return True
+        # 官方清单仅提供 MD5，此处用于资源一致性而非安全认证。
+        digest = hashlib.md5(usedforsecurity=False)
+        with temp_file.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest() == expected_md5.lower()
 
-    for attempt in range(retries):
-        try:
-            resume_byte = 0
-            if resume_support and temp_file.exists():
-                resume_byte = temp_file.stat().st_size
+    try:
+        for attempt in range(3):
+            try:
+                if dest.is_symlink() or temp_file.is_symlink():
+                    raise NetworkError("拒绝通过软链接写入下载文件")
+                if expected_size < 0:
+                    raise NetworkError("文件大小不能为负数")
+                if temp_file.exists() and temp_file.stat().st_size >= expected_size:
+                    if verified():
+                        temp_file.replace(dest)
+                        return True
+                    temp_file.unlink()
 
-            if resume_byte == expected_size:
-                if progress and task_id is not None:
-                    progress.update(task_id, completed=expected_size)
-                success = True
-                break
-
-            if resume_byte > 0:
-                headers["Range"] = f"bytes={resume_byte}-"
+                resume_byte = temp_file.stat().st_size if resume_support and temp_file.exists() else 0
+                headers = {"User-Agent": "WW-Manager/2.0"}
+                if resume_byte:
+                    headers["Range"] = f"bytes={resume_byte}-"
                 if progress and task_id is not None:
                     progress.update(task_id, completed=resume_byte)
 
-            mode = "ab" if resume_byte > 0 else "wb"
+                req = Request(url, headers=headers)
+                with urlopen(req, timeout=15) as rsp:
+                    if rsp.status not in (200, 206):
+                        raise NetworkError(f"HTTP {rsp.status}")
+                    if rsp.status == 206:
+                        content_range = rsp.headers.get("Content-Range", "")
+                        if not content_range.startswith(f"bytes {resume_byte}-"):
+                            temp_file.unlink(missing_ok=True)
+                            raise NetworkError(f"无效的 Content-Range: {content_range}")
+                    else:
+                        # CDN 忽略 Range 时从头覆盖，不能把完整响应追加到断点之后。
+                        resume_byte = 0
+                    mode = "ab" if resume_byte else "wb"
+                    with temp_file.open(mode) as stream:
+                        for chunk in iter(lambda: rsp.read(256 * 1024), b""):
+                            stream.write(chunk)
+                            if progress:
+                                if task_id is not None:
+                                    progress.update(task_id, advance=len(chunk))
+                                if overall_task_id is not None:
+                                    progress.update(overall_task_id, advance=len(chunk))
 
-            req = Request(url, headers=headers)
-            with urlopen(req, timeout=15) as rsp:
-                if rsp.status not in (200, 206):
-                    raise NetworkError(f"HTTP {rsp.status}")
-                if resume_byte > 0 and rsp.status == 200:
-                    # 服务器忽略 Range 时重新写临时文件，避免追加出损坏文件
-                    resume_byte = 0
-                    mode = "wb"
-                    if progress and task_id is not None:
-                        progress.update(task_id, completed=0)
-
-                with open(temp_file, mode) as f:
-                    while True:
-                        chunk = rsp.read(1024 * 256)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-
-                        if progress:
-                            chunk_len = len(chunk)
-                            if task_id is not None:
-                                progress.update(task_id, advance=chunk_len)
-                            if overall_task_id is not None:
-                                progress.update(overall_task_id, advance=chunk_len)
-
-            if temp_file.stat().st_size == expected_size:
-                success = True
-                break
-
-        except Exception as e:
-            if attempt == retries - 1:
-                if progress:
-                    progress.console.log(f"[red]下载失败 {dest.name}: {e}[/red]")
-                return False
-            time.sleep(1 + attempt)
-
-    if success:
-        shutil.move(temp_file, dest)
-
-    if progress and task_id is not None:
-        progress.remove_task(task_id)
-
-    return success
+                if verified():
+                    temp_file.replace(dest)
+                    return True
+                if temp_file.stat().st_size >= expected_size:
+                    temp_file.unlink()
+                raise NetworkError(f"文件大小或 MD5 校验失败: {dest.name}")
+            except Exception as e:
+                if attempt == 2:
+                    logger.error(f"下载失败 {dest.name}: {e}")
+                    return False
+                time.sleep(1 + attempt)
+    finally:
+        if progress and task_id is not None:
+            progress.remove_task(task_id)
+    return False
 
 
 def batch_download(
@@ -202,6 +207,7 @@ def batch_download(
                     task["size"],
                     progress,
                     overall_task,
+                    expected_md5=task.get("md5"),
                 )
                 futures[future] = task.get("name", task["path"].name)
 

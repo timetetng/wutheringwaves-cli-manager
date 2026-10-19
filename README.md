@@ -171,26 +171,33 @@ ww incremental --apply
 
 #### 6\. 资源档位下载 (`resource`)
 
-下载 3.7+ 的画质档位基础包（HD/SD/UHD → `Client/Content/<TIER>/`）。分档基础包**不在**常规全量清单中（`ww download`/`ww sync` 下载的是 HD 档），UHD/SD 档需要本命令下载，游戏以 `-krqlv=<tier>` 启动时加载对应目录。
+下载 3.7+ 的画质档位基础包（HD/SD/UHD → `Client/Content/<TIER>/`）。SD/UHD 基础包**不在**常规全量清单中（`ww download`/`ww sync` 下载的是 common + HD），UHD/SD 档需要本命令下载，游戏以 `-krqlv=<tier>` 启动时加载对应目录。
 
 ```bash
 # 下载 UHD 档基础包（约 61.5 GiB，支持断点续传，重复执行只补缺失/损坏文件）
 ww resource uhd
 
-# 强制 MD5 校验（默认只比对文件大小，更快）
+# 忽略 MD5 缓存，重新计算全部文件哈希（默认也校验 MD5，但复用未变化文件的缓存）
 ww resource uhd --force-md5
+
+# 离线查看各档位登记状态和启动参数；不把目录存在当作完整安装
+ww status
+
+# 确认后删除整个 UHD 目录、独立缓存及安装记录（包括该目录内自行放置的文件）
+ww resource uhd --remove
 
 # 手动指定 bundle 配置 URL（默认自动从官方启动器 KRApp.conf 解码，需 3.0+ 启动器）
 ww resource uhd --config-url https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10003_<appKey>/G152/official/index.json
 ```
 
 > [!NOTE]
-> 1. 档位包使用独立的 MD5 缓存（`wwm_md5_cache_resource_<tier>.json`），不会干扰 `ww sync`（该缓存仅在 `--force-md5` 校验或实际发生下载时生成）；
+> 1. 档位包始终校验大小和 MD5，使用独立缓存（`wwm_md5_cache_resource_<tier>.json`），不会干扰 `ww sync`；首次校验会读取整个档位包，后续可复用文件属性未变的缓存；
 > 2. 清单 URL 中的 appKey 随官方启动器小版本更新而变化，本命令默认从游戏目录上级的启动器版本目录（如 `3.0.1.0/Assets/KRApp.conf`，Base64+XOR 编码）按当前渠道 (resId/appId) 匹配并自动解码最新地址；
-> 3. 下载/校验全部成功后会自动登记官方启动器安装记录（`launcherDownloadConfig.json` 的 `bundles` 条目 + `launcherDownloadConfig/<pack>.json` 版本标记），官方启动器可直接识别档位；下载失败不会登记，重跑本命令续传即可；
-> 4. 版本更新后已从清单移除的旧 pak 会在本档位目录内自动清理（仅限 `Client/Content/<TIER>/` 下的 `.pak/.sig/.temp`）；
+> 3. 下载/校验全部成功后会登记官方启动器安装记录（`launcherDownloadConfig.json` 的 `bundles` 条目 + `launcherDownloadConfig/<pack>.json` 版本标记），保留其它档位与自定义字段；失败以非零退出码返回，不保留残缺档位的有效安装标记，重跑即可续传；
+> 4. 版本更新后只清理本档位独立缓存曾记录、现已从清单移除的文件；从未登记的用户文件不自动删除。旧版本没有缓存的残留包不会被猜测性清理；
 > 5. **b 服暂无分档资源分发**（其启动器配置不含 resourcePacks），仅官服/国际服可用；
-> 6. 缺失基础包时，官服 3.7.0 实测 `-krqlv=uhd` 启动会在登录界面加载 UI 资源阶段崩溃（`Couldn't find file for package /Game/Aki/UI/UIResources/...` 大量报错后 `EXCEPTION_ACCESS_VIOLATION`，启动约 34 秒）；"游戏内切档会自动回退不崩"的说法对应的是另一条路径（游戏内下载器），与缺目录直启不同。
+> 6. 基础下载、同步、切服或应用增量更新后，会提醒已存在的档位独立执行 `ww resource <tier>`。不会自动下载几十 GB 的档位包；档位没有可用增量补丁时，仍按完整清单只下载变化文件。`status` 的“已登记（未校验）”仅表示本地登记存在，不保证完整性或与线上版本一致；
+> 7. 缺失基础包时，官服 3.7.0 实测 `-krqlv=uhd` 启动会在登录界面加载 UI 资源阶段崩溃（`Couldn't find file for package /Game/Aki/UI/UIResources/...` 大量报错后 `EXCEPTION_ACCESS_VIOLATION`，启动约 34 秒）；"游戏内切档会自动回退不崩"的说法对应的是另一条路径（游戏内下载器），与缺目录直启不同。
 
 #### 7\. 获取抽卡记录链接 (`log`)
 
@@ -304,6 +311,16 @@ ww update
 
 ### 📢 反馈
 任何问题请在 **Issue** 中提出，也欢迎 **PR**。
+
+## 开发验证
+
+```bash
+uv run python -m unittest discover -s tests -v
+uv run ruff check .
+uv run ruff format --check .
+```
+
+档位回归测试使用临时目录与本地 HTTP 服务，覆盖真实文件写入、断点续传、错误响应、MD5、安装登记、缓存和删除确认；不下载官方大型资源，不修改已安装游戏。CI 对 `main`、`dev` 的 PR 均运行这些检查。
 
 ## 致谢
 

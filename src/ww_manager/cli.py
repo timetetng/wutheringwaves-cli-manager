@@ -252,19 +252,24 @@ def update():
 def status(ctx: typer.Context):
     """查看当前客户端状态"""
     path = get_game_path(ctx)
-    cfg_file = path / "launcherDownloadConfig.json"
-    if not cfg_file.exists():
-        typer.echo("未找到配置文件，无法确定版本。")
-        return
     try:
-        data = json.loads(cfg_file.read_text(encoding="utf-8"))
-        app_id = data.get("appId")
-        server = APPID_TO_SERVER.get(app_id, "未知")
+        cfg_file = path / "launcherDownloadConfig.json"
+        data = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
+        if not isinstance(data, dict):
+            raise ValueError("本地配置不是 JSON 对象")
+        app_id = str(data.get("appId", ""))
+        server = APPID_TO_SERVER.get(app_id, "cn")
         typer.secho(f"目录: {path}", fg="green")
-        typer.echo(f"服务器: {server}")
-        typer.echo(f"版本: {data.get('version')}")
-    except Exception as e:
-        logger.error(f"读取状态失败: {e}")
+        typer.echo(f"服务器: {APPID_TO_SERVER.get(app_id, '未知')}")
+        typer.echo(f"版本: {data.get('version', '未知')}")
+        for state in WGameManager(path, server).resource_tier_status():
+            tier = state["tier"]
+            typer.echo(
+                f"档位 {tier.upper()}: {state['state']} / 版本 {state['version'] or '未知'} / 启动参数 -krqlv={tier}"
+            )
+    except (WWError, OSError, ValueError) as e:
+        typer.secho(f"读取状态失败: {e}", fg="red")
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -288,8 +293,10 @@ def sync(
             success = mgr.verify_new_version()
             if not success:
                 typer.secho("校验发现问题，请根据提示处理", fg="yellow")
+                raise typer.Exit(1)
         else:
             mgr.sync_files(force_check_md5=True)
+        mgr.remind_resource_tiers()
     except WWError as e:
         typer.secho(f"执行失败: {e}", fg="red")
         raise typer.Exit(1)
@@ -302,6 +309,7 @@ def download(ctx: typer.Context, server: ServerType):
     try:
         mgr = WGameManager(path, server.value)
         mgr.download_full()
+        mgr.remind_resource_tiers()
     except WWError as e:
         typer.secho(f"下载失败: {e}", fg="red")
         raise typer.Exit(1)
@@ -315,13 +323,14 @@ def resource(
         Optional[str],
         typer.Option("--config-url", help="手动指定 bundle 配置 URL (默认从启动器 KRApp.conf 解码)"),
     ] = None,
-    force_md5: Annotated[bool, typer.Option("--force-md5", help="强制校验 MD5 (默认仅校验文件大小)")] = False,
+    force_md5: Annotated[bool, typer.Option("--force-md5", help="忽略 MD5 缓存，重新计算所有文件哈希")] = False,
+    remove: Annotated[bool, typer.Option("--remove", help="确认后删除该档位目录、缓存和安装登记")] = False,
 ):
     """下载 3.7+ 资源档位基础包 (→ Client/Content/<TIER>/)
 
-    游戏需以 -krqlv=<tier> 启动参数加载对应档位; HD/SD/UHD 基础包
-    不在常规全量清单中 (缺失时 UHD 档启动即崩溃), 由 3.0+ 启动器的
-    resourcePacks 体系分发。
+    游戏需以 -krqlv=<tier> 启动参数加载对应档位。SD/UHD 基础包
+    不在常规全量清单中；通过 resourcePacks 下载并验证后登记。
+    --remove 经确认后删除所选档位目录、缓存与安装记录。
     """
     path = get_game_path(ctx)
     cfg_file = path / "launcherDownloadConfig.json"
@@ -334,8 +343,17 @@ def resource(
             pass
     try:
         mgr = WGameManager(path, server)
-        mgr.download_resource_tier(tier, config_url=config_url, force_check_md5=force_md5)
-    except WWError as e:
+        if remove:
+            tier = mgr._validate_tier(tier)
+            typer.confirm(
+                f"确定删除 {tier.upper()} 档位吗？这将删除 Client/Content/{tier.upper()}/ "
+                "内所有文件（包括自行放置的文件）、该档位缓存及安装登记；不会删除其它档位。",
+                abort=True,
+            )
+            mgr.remove_resource_tier(tier)
+        else:
+            mgr.download_resource_tier(tier, config_url=config_url, force_check_md5=force_md5)
+    except (WWError, OSError) as e:
         typer.secho(f"执行失败: {e}", fg="red")
         raise typer.Exit(1)
 
@@ -351,6 +369,7 @@ def checkout(
     try:
         mgr = WGameManager(path, server.value)
         mgr.checkout(server.value, force_sync=force_sync)
+        mgr.remind_resource_tiers()
     except WWError as e:
         typer.secho(f"切换失败: {e}", fg="red")
         raise typer.Exit(1)
@@ -391,6 +410,7 @@ def _run_incremental(
             success = mgr.apply_incremental()
             if success:
                 typer.secho("增量更新应用成功！", fg="green")
+                mgr.remind_resource_tiers()
             else:
                 typer.secho("增量更新应用失败", fg="red")
                 raise typer.Exit(1)
