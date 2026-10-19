@@ -1,29 +1,28 @@
 name: Code Quality
 
-# 触发条件：推送到 main 分支，或提交针对 main 分支的 Pull Request
+# 主线和开发分支均运行质量检查与离线测试
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "dev" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "dev" ]
 
 jobs:
   lint-and-format:
-    name: Ruff Check & Format
+    name: Ruff & Offline Tests
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.9"
 
-      # 直接安装 ruff，速度非常快
-      - name: Install Ruff
-        run: pip install ruff
+      - name: Install dependencies
+        run: pip install ruff -e .
 
       # 1. 代码审查 (Lint)
       # 检查是否有错误，如果有则流水线失败
@@ -34,3 +33,6 @@ jobs:
       # --check 参数表示只检查不修改。如果代码未格式化，流水线会失败
       - name: Check Code Formatting
         run: ruff format --check .
+
+      - name: Run offline regression tests
+        run: python -m unittest discover -s tests -v

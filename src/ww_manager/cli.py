@@ -252,19 +252,25 @@ def update():
 def status(ctx: typer.Context):
     """查看当前客户端状态"""
     path = get_game_path(ctx)
-    cfg_file = path / "launcherDownloadConfig.json"
-    if not cfg_file.exists():
-        typer.echo("未找到配置文件，无法确定版本。")
-        return
     try:
-        data = json.loads(cfg_file.read_text(encoding="utf-8"))
-        app_id = data.get("appId")
-        server = APPID_TO_SERVER.get(app_id, "未知")
+        cfg_file = path / "launcherDownloadConfig.json"
+        data = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
+        if not isinstance(data, dict):
+            raise ValueError("本地配置不是 JSON 对象")
+        app_id = str(data.get("appId", ""))
+        server = APPID_TO_SERVER.get(app_id, "cn")
         typer.secho(f"目录: {path}", fg="green")
-        typer.echo(f"服务器: {server}")
-        typer.echo(f"版本: {data.get('version')}")
-    except Exception as e:
-        logger.error(f"读取状态失败: {e}")
+        typer.echo(f"服务器: {APPID_TO_SERVER.get(app_id, '未知')}")
+        typer.echo(f"版本: {data.get('version', '未知')}")
+        for state in WGameManager(path, server).resource_tier_status():
+            tier = state["tier"]
+            typer.echo(
+                f"档位 {tier.upper()}{' [工具当前档位]' if state['active'] else ''}: "
+                f"{state['state']} / 版本 {state['version'] or '未知'} / 启动参数 -krqlv={tier}"
+            )
+    except (WWError, OSError, ValueError) as e:
+        typer.secho(f"读取状态失败: {e}", fg="red")
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -288,22 +294,71 @@ def sync(
             success = mgr.verify_new_version()
             if not success:
                 typer.secho("校验发现问题，请根据提示处理", fg="yellow")
+                raise typer.Exit(1)
         else:
             mgr.sync_files(force_check_md5=True)
+        mgr.remind_resource_tiers()
     except WWError as e:
         typer.secho(f"执行失败: {e}", fg="red")
         raise typer.Exit(1)
 
 
 @app.command()
-def download(ctx: typer.Context, server: ServerType):
-    """[初始化] 下载完整客户端"""
+def download(
+    ctx: typer.Context,
+    server: Annotated[ServerType, typer.Argument(help="目标服务器，默认官服 HD")] = ServerType.cn,
+):
+    """[初始化] 下载完整客户端，默认官服 HD"""
     path = get_game_path(ctx)
     try:
         mgr = WGameManager(path, server.value)
         mgr.download_full()
+        mgr.remind_resource_tiers()
     except WWError as e:
         typer.secho(f"下载失败: {e}", fg="red")
+        raise typer.Exit(1)
+
+
+@app.command()
+def resource(
+    ctx: typer.Context,
+    tier: Annotated[str, typer.Argument(help="资源档位: hd / sd / uhd (必填)")],
+    config_url: Annotated[
+        Optional[str],
+        typer.Option("--config-url", help="覆盖自动获取的官方画质配置地址（通常无需指定）"),
+    ] = None,
+    force_md5: Annotated[bool, typer.Option("--force-md5", help="忽略 MD5 缓存，重新计算所有文件哈希")] = False,
+    remove: Annotated[bool, typer.Option("--remove", help="确认后删除该档位目录、缓存和安装登记")] = False,
+):
+    """下载 3.7+ 资源档位基础包 (→ Client/Content/<TIER>/)
+
+    游戏需以 -krqlv=<tier> 启动参数加载对应档位。SD/UHD 基础包
+    不在常规全量清单中；通过 resourcePacks 下载并验证后登记。
+    --remove 经确认后删除所选档位目录、缓存与安装记录。
+    """
+    path = get_game_path(ctx)
+    cfg_file = path / "launcherDownloadConfig.json"
+    server = "cn"
+    if cfg_file.exists():
+        try:
+            d = json.loads(cfg_file.read_text(encoding="utf-8"))
+            server = APPID_TO_SERVER.get(d.get("appId"), "cn")
+        except Exception:
+            pass
+    try:
+        mgr = WGameManager(path, server)
+        if remove:
+            tier = mgr._validate_tier(tier)
+            typer.confirm(
+                f"确定删除 {tier.upper()} 档位吗？这将删除 Client/Content/{tier.upper()}/ "
+                "内所有文件（包括自行放置的文件）、该档位缓存及安装登记；不会删除其它档位。",
+                abort=True,
+            )
+            mgr.remove_resource_tier(tier)
+        else:
+            mgr.download_resource_tier(tier, config_url=config_url, force_check_md5=force_md5)
+    except (WWError, OSError) as e:
+        typer.secho(f"执行失败: {e}", fg="red")
         raise typer.Exit(1)
 
 
@@ -318,6 +373,7 @@ def checkout(
     try:
         mgr = WGameManager(path, server.value)
         mgr.checkout(server.value, force_sync=force_sync)
+        mgr.remind_resource_tiers()
     except WWError as e:
         typer.secho(f"切换失败: {e}", fg="red")
         raise typer.Exit(1)
@@ -327,6 +383,7 @@ def _run_incremental(
     ctx: typer.Context,
     action: Optional[str],
     apply_flag: bool,
+    config_url: Optional[str] = None,
 ):
     """增量更新核心逻辑（下载增量包 / 应用增量更新）。
 
@@ -362,7 +419,7 @@ def _run_incremental(
                 typer.secho("增量更新应用失败", fg="red")
                 raise typer.Exit(1)
         else:
-            success = mgr.download_incremental()
+            success = mgr.download_incremental(config_url=config_url)
             if success:
                 typer.secho("增量更新资源下载完成！之后可使用 'apply' 命令应用更新。", fg="green")
             else:
@@ -379,6 +436,9 @@ def predownload(
     ctx: typer.Context,
     action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
     apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
+    config_url: Annotated[
+        Optional[str], typer.Option("--config-url", help="覆盖自动获取的分包配置地址（通常无需指定）")
+    ] = None,
 ):
     """
     预下载/增量更新
@@ -386,7 +446,7 @@ def predownload(
     预下载开放期间执行下载增量包，维护后应用合并补丁；新版本开启后也可直接用于增量更新。
     用法：ww predownload 下载增量包，ww predownload --apply 应用更新。
     """
-    _run_incremental(ctx, action, apply_flag)
+    _run_incremental(ctx, action, apply_flag, config_url)
 
 
 @app.command()
@@ -394,13 +454,16 @@ def incremental(
     ctx: typer.Context,
     action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
     apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
+    config_url: Annotated[
+        Optional[str], typer.Option("--config-url", help="覆盖自动获取的分包配置地址（通常无需指定）")
+    ] = None,
 ):
     """
     增量更新（predownload 的别名）
 
     用法与 ww predownload 一致：下载增量包，应用时使用 'apply'。
     """
-    _run_incremental(ctx, action, apply_flag)
+    _run_incremental(ctx, action, apply_flag, config_url)
 
 
 @app.command()

@@ -1,11 +1,13 @@
 #!/bin/bash
+set -euo pipefail
+
 # 从 pyproject.toml 提取版本号
 VERSION=$(grep -m 1 "version =" pyproject.toml | cut -d '"' -f 2)
 REPO="timetetng/wutheringwaves-cli-manager"
 
 # 下载源码并计算校验和
 URL="https://github.com/$REPO/archive/refs/tags/v$VERSION.tar.gz"
-curl -L $URL -o source.tar.gz
+curl --fail --location "$URL" -o source.tar.gz
 SHA256=$(sha256sum source.tar.gz | cut -d ' ' -f 1)
 
 # 生成 PKGBUILD
@@ -21,7 +23,8 @@ depends=(
   'python'
   'python-typer'
 'python-rich'
-  'python-certifi'
+'python-requests'
+'python-certifi'
   'python-typing_extensions'
 )
 makedepends=('python-build' 'python-installer' 'python-hatchling')
