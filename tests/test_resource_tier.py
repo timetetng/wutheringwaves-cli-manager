@@ -21,6 +21,7 @@ from ww_manager.cli import app
 from ww_manager.config import RESOURCE_CONFIG_URLS
 from ww_manager.core import ConfigError, MD5Cache, NetworkError, WGameManager
 from ww_manager.download import create_download_progress, download_single_file
+from ww_manager.resource_updates import ResourceUpdater
 
 GOOD = b"official-resource-content"
 DEST = "Client/Content/UHD/test.pak"
@@ -317,7 +318,7 @@ class ResourceTierTests(unittest.TestCase):
         self.put("launcherDownloadConfig.json", b'{"version":"old"}')
         self.manager._launcher_info = {"default": {"version": "new", "resourcesBasePath": "files"}}
         self.manager._cdn_node = self.url
-        self.manager._game_index = {"resource": [item()]}
+        self.manager._game_index = {"resource": [item("Client/Content/Paks/common.pak")]}
         with patch.object(self.manager, "_batch_download", return_value=1):
             with self.assertRaises(NetworkError):
                 self.manager.sync_files()
@@ -385,7 +386,7 @@ class ResourceTierTests(unittest.TestCase):
             result = CliRunner().invoke(app, ["download"])
         self.assertEqual(result.exit_code, 0, result.output)
         manager.assert_called_once_with(self.root, "cn")
-        manager.return_value.download_full.assert_called_once()
+        manager.return_value.download_full.assert_called_once_with(tier="hd")
 
     def test_download_preserves_positional_server_argument(self):
         for server in ("cn", "bilibili", "global"):
@@ -397,7 +398,174 @@ class ResourceTierTests(unittest.TestCase):
                 result = CliRunner().invoke(app, ["download", server])
                 self.assertEqual(result.exit_code, 0, result.output)
                 manager.assert_called_once_with(self.root, server)
-                manager.return_value.download_full.assert_called_once()
+                manager.return_value.download_full.assert_called_once_with(tier="hd")
+
+    def prepare_full_download(self, tier="uhd"):
+        self.manager._launcher_info = {"default": {"version": "3.8.0", "resourcesBasePath": "channel"}}
+        self.manager._cdn_node = self.url
+        self.manager._game_index = {
+            "resource": [item("Client/Content/Paks/common.pak"), item("Client/Content/HD/hd.pak")]
+        }
+        if tier != "hd":
+            self.bundle["resourcePacks"]["common"] = {"version": "3.8.0"}
+            self.bundle["resourcePacks"][tier] = {"version": "3.8.0", "baseUrl": "files", "indexFile": "manifest.json"}
+            self.bundle["bundles"][tier.upper()] = {"resourcePacks": ["common", tier]}
+            self.server.resources = [item(f"Client/Content/{tier.upper()}/test.pak")]
+
+    def test_full_download_only_selected_tier_and_sync_remembers(self):
+        for tier in ("sd", "uhd"):
+            with self.subTest(tier=tier), tempfile.TemporaryDirectory() as folder:
+                self.manager.game_folder = Path(folder)
+                self.manager.md5_cache = MD5Cache(Path(folder) / "wwm_md5_cache.json", Path(folder))
+                self.prepare_full_download(tier)
+                self.server.requests.clear()
+                self.manager.download_full(tier)
+                root = Path(folder)
+                self.assertEqual((root / "Client/Content/Paks/common.pak").read_bytes(), GOOD)
+                self.assertEqual((root / f"Client/Content/{tier.upper()}/test.pak").read_bytes(), GOOD)
+                self.assertFalse((root / "Client/Content/HD").exists())
+                self.assertEqual(self.manager.current_resource_tier(), tier)
+                self.assertNotIn("hd", self.manager._read_resource_state()["versions"])
+                self.assertIsNone(self.manager.resource_pack_version("hd"))
+                self.assertFalse(any("/HD/" in path for path, _ in self.server.requests))
+                self.manager.sync_files(force_check_md5=True)
+                self.assertFalse((root / "Client/Content/HD").exists())
+                self.assertFalse(any("/HD/" in path for path, _ in self.server.requests))
+
+    def test_default_download_records_hd_without_quality_config(self):
+        self.prepare_full_download("hd")
+        self.bundle_patch.stop()
+        with patch.object(self.manager, "get_bundle_config") as fetch:
+            self.manager.download_full()
+        fetch.assert_not_called()
+        self.assertTrue((self.root / "Client/Content/HD/hd.pak").is_file())
+        self.assertEqual(self.manager.current_resource_tier(), "hd")
+        self.assertEqual(self.manager.resource_pack_version("hd"), "3.8.0")
+
+    def test_bilibili_download_uses_channel_common_and_shared_quality(self):
+        self.prepare_full_download()
+        self.manager.server_type = "bilibili"
+        self.manager.config = WGameManager(self.root, "bilibili").config
+        self.manager.download_full("uhd")
+        self.assertIn(("/channel/Client/Content/Paks/common.pak", None), self.server.requests)
+        self.assertIn(("/files/Client/Content/UHD/test.pak", None), self.server.requests)
+        self.assertEqual(self.read_json("launcherDownloadConfig.json")["appId"], self.manager.config["appId"])
+        self.assertEqual(self.manager._read_resource_state()["common_server"], "bilibili")
+
+    def test_install_version_mismatch_has_no_file_side_effects(self):
+        self.prepare_full_download()
+        self.bundle["resourcePacks"]["common"]["version"] = "3.7.1"
+        with self.assertRaisesRegex(ConfigError, "版本不一致"):
+            self.manager.download_full("uhd")
+        self.assertEqual(list(self.root.iterdir()), [])
+        self.assertEqual(self.server.requests, [("/manifest.json", None)])
+
+    def test_failed_install_does_not_select_or_register_target(self):
+        self.prepare_full_download()
+        self.server.resources = [item("Client/Content/UHD/missing.pak")]
+        with self.assertRaises(NetworkError):
+            self.manager.download_full("uhd")
+        self.assertEqual(self.manager.current_resource_tier(), "hd")
+        self.assertFalse((self.root / "launcherDownloadConfig.json").exists())
+        self.assertFalse((self.root / "launcherDownloadConfig/uhd.json").exists())
+        self.assertIn("uhd", self.manager._read_resource_state()["incomplete"])
+        self.assertNotIn("hd", self.manager._read_resource_state()["versions"])
+        self.server.resources = [item()]
+        self.manager.download_full("uhd")
+        self.assertEqual(self.manager.current_resource_tier(), "uhd")
+        self.assertEqual(self.manager._read_resource_state()["incomplete"], [])
+
+    def test_uhd_sync_preserves_previously_managed_hd(self):
+        self.prepare_full_download()
+        hd = self.put("Client/Content/HD/old.pak", GOOD)
+        self.manager.md5_cache.get(hd)
+        self.manager.download_full("uhd")
+        self.assertEqual(hd.read_bytes(), GOOD)
+        self.manager.sync_files()
+        self.assertEqual(hd.read_bytes(), GOOD)
+
+    def test_corrupt_base_same_size_is_repaired(self):
+        self.prepare_full_download("hd")
+        self.put("Client/Content/Paks/common.pak", b"x" * len(GOOD))
+        self.manager.download_full()
+        self.assertEqual((self.root / "Client/Content/Paks/common.pak").read_bytes(), GOOD)
+
+    def test_global_non_hd_and_unknown_tier_fail_before_network(self):
+        manager = WGameManager(self.root, "global")
+        with patch.object(manager, "_http_get_json") as fetch:
+            for tier in ("sd", "uhd", "invalid"):
+                with self.subTest(tier=tier), self.assertRaises(ConfigError):
+                    manager.download_full(tier)
+        fetch.assert_not_called()
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_incremental_plan_uses_tier_remembered_by_initial_install(self):
+        self.prepare_full_download()
+        self.manager.download_full("uhd")
+        pack = self.bundle["resourcePacks"]["uhd"]
+        pack["version"] = "3.9.0"
+        pack["patchConfig"] = [{"version": "3.8.0", "indexFile": "manifest.json"}]
+        plan = ResourceUpdater(self.manager)._create_plan(None)
+        self.assertEqual(plan["tier"], "uhd")
+        self.assertEqual(set(plan["packs"]), {"common", "uhd"})
+        self.assertEqual(plan["packs"]["uhd"]["from_version"], "3.8.0")
+        self.assertEqual(plan["packs"]["uhd"]["to_version"], "3.9.0")
+
+    def test_bad_base_manifest_rejected_before_writes(self):
+        self.prepare_full_download()
+        invalid = [
+            [item("Client/../escape.pak")],
+            [item("/absolute.pak")],
+            [item("Client/Content")],
+            [item("WWM_resource_state.json")],
+            [item("launcherDownloadConfig/uhd.json")],
+            [item("Client/a.pak"), item("client/A.pak")],
+            [item("Client/a"), item("Client/a/b")],
+            [{**item("Client/a.pak"), "md5": "invalid"}],
+        ]
+        for resources in invalid:
+            with self.subTest(resources=resources):
+                self.manager._game_index = {"resource": resources}
+                with self.assertRaises(ConfigError):
+                    self.manager.download_full("uhd")
+                self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_global_hd_stays_on_own_channel(self):
+        self.prepare_full_download("hd")
+        self.manager.server_type = "global"
+        self.manager.config = WGameManager(self.root, "global").config
+        with patch.object(self.manager, "get_bundle_config") as quality:
+            self.manager.download_full("hd")
+        quality.assert_not_called()
+        self.assertTrue((self.root / "Client/Content/HD/hd.pak").is_file())
+        self.assertEqual(self.read_json("launcherDownloadConfig.json")["appId"], self.manager.config["appId"])
+
+    def test_base_failure_preserves_previous_selection(self):
+        self.prepare_full_download()
+        state = {"active_tier": "sd", "versions": {"common": "3.7.1", "sd": "3.7.1"}, "incomplete": []}
+        self.manager._write_local_json("wwm_resource_state.json", state)
+        with patch.object(self.manager, "_batch_download", return_value=1):
+            with self.assertRaises(NetworkError):
+                self.manager.download_full("uhd")
+        self.assertEqual(self.manager.current_resource_tier(), "sd")
+        self.assertNotIn("uhd", self.manager._read_resource_state()["versions"])
+        self.assertFalse((self.root / "launcherDownloadConfig.json").exists())
+
+    def test_channel_metadata_update_with_removed_active_tier(self):
+        self.prepare_full_download()
+        self.manager._write_local_json(
+            "wwm_resource_state.json", {"active_tier": None, "versions": {}, "incomplete": []}
+        )
+        self.manager._update_local_config()
+        self.assertIsNone(self.manager._read_resource_state()["active_tier"])
+        self.assertNotIn("hd", self.manager._read_resource_state()["versions"])
+
+    def test_download_cli_passes_explicit_tier(self):
+        for tier in ("hd", "sd", "uhd"):
+            with self.subTest(tier=tier), patch.object(self.manager, "download_full") as download:
+                result = self.invoke("download", "cn", tier)
+                self.assertEqual(result.exit_code, 0, result.output)
+                download.assert_called_once_with(tier=tier)
 
     def test_same_version_checkout_does_not_warn_tier_is_outdated(self):
         self.manager.download_resource_tier("uhd")

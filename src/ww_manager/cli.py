@@ -306,13 +306,14 @@ def sync(
 @app.command()
 def download(
     ctx: typer.Context,
-    server: Annotated[ServerType, typer.Argument(help="目标服务器，默认官服 HD")] = ServerType.cn,
+    server: Annotated[ServerType, typer.Argument(help="目标服务器，默认官服")] = ServerType.cn,
+    tier: Annotated[str, typer.Argument(help="画质档位: hd / sd / uhd，默认 HD")] = "hd",
 ):
-    """[初始化] 下载完整客户端，默认官服 HD"""
+    """[初始化] 下载指定档位的完整客户端，并记住档位用于后续更新"""
     path = get_game_path(ctx)
     try:
         mgr = WGameManager(path, server.value)
-        mgr.download_full()
+        mgr.download_full(tier=tier)
         mgr.remind_resource_tiers()
     except WWError as e:
         typer.secho(f"下载失败: {e}", fg="red")

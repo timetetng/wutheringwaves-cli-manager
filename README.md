@@ -1,6 +1,6 @@
 
 <div align="center"><h1>WutheringWaves CLI Manager</h1><h3>鸣潮命令行管理器</h3><div align="center">
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.0-brightgreen.svg" alt="version 2.3.0">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.1-brightgreen.svg" alt="version 2.3.1">
   <br>
 </div>
 </div>
@@ -25,7 +25,7 @@
 
 * **🚀 快速切换 (`checkout`)**：校验并替换官/B 服差异文件，优先复用本地缓存，保留已安装的画质包。
 * **🛠️ 智能修复 (`sync`)**：校验全量文件 MD5，自动修复损坏文件，下载缺失资源。
-* **📦 完整下载 (`download`)**：从零开始下载客户端，默认官服 HD。
+* **📦 完整下载 (`download`)**：从零安装指定画质的客户端，默认官服 HD；自动记住档位供后续更新使用。
 * **🎨 画质包管理 (`resource`)**：安装、校验或删除 HD/SD/UHD，官服/B 服共用画质包。
 * **🔥 预下载/增量更新(`predownload`)**: 预下载开放期下载增量包、维护后应用合并补丁；新版本开启后也可直接增量更新。基于官方启动器解包的补丁二进制(见 release），欢迎测试并提交问题。`incremental` 为其别名。
 * **💾 自动记忆**：自动记录游戏路径，一次设置，永久生效。
@@ -129,7 +129,7 @@ ww checkout cn --force-sync
 ```
 #### 3\. 同步与修复 (`sync`)
 
-切换服务器或下载中断导致文件缺失时使用。按基础全量清单校验 MD5 并修复，包含 HD；SD/UHD 使用 `ww resource <tier>` 单独校验。版本更新可使用 `ww predownload` 下载补丁，再用 `ww predownload --apply` 应用。
+切换服务器或下载中断导致文件缺失时使用。按已记录的当前档位校验公共资源和画质包，修复缺失或损坏文件，不会为 SD/UHD 补下 HD；旧安装未记录档位时默认 HD。版本更新也可使用 `ww predownload` 下载补丁，再用 `ww predownload --apply` 应用。
 
 ```bash
 ww sync
@@ -139,13 +139,16 @@ ww sync
 
 #### 4\. 下载完整客户端 (`download`)
 
-使用此命令从零开始下载，默认官服 HD。
+从零安装 `common + 指定档位`，省略档位时默认 HD。成功后自动记住当前档位，后续 `sync`、`predownload` 和 `incremental` 无需重复指定。
 
 ```bash
-ww download             # 官服 HD，等同于 ww download cn
-ww download bilibili    # B 服 HD
-ww download global      # 国际服 HD
+ww download                 # 官服 HD
+ww download cn uhd          # 官服 UHD，不下载 HD
+ww download bilibili sd     # B 服 SD，不下载 HD
+ww download global          # 国际服暂仅支持 HD
 ```
+
+游戏仍需以对应的 `-krqlv=hd/sd/uhd` 参数启动；已安装的其它档位不会自动删除。
 
 #### 5\. 预下载 / 增量更新 (`predownload`，别名 `incremental`)
 
@@ -202,8 +205,8 @@ ww resource uhd --force-md5     # 忽略缓存，重新计算全部 MD5
 ww resource uhd --remove        # 确认后删除整个 UHD 目录及登记
 ```
 
-* `download` / `sync` 包含 HD；SD/UHD 需要单独安装。
-* 多档位可以共存，最后成功执行的 `resource <tier>` 为工具当前档位，用于选择分包更新；**游戏启动参数需自行设置**。
+* `resource` 用于单独安装、校验或切换档位；`sync` 自动修复当前档位。
+* 多档位可以共存，最后成功执行的 `download <server> <tier>` 或 `resource <tier>` 会记录为工具当前档位；**游戏启动参数需自行设置**。
 * `--remove` 会删除该档位目录中的所有文件，包括自行放入的文件；删除当前档位后需重新选择。
 * 首次使用 UHD 等档位，游戏内仍可能下载对应视频与热更新。
 
@@ -266,7 +269,7 @@ ww resource uhd --remove        # 确认后删除整个 UHD 目录及登记
 ---
 
 ### Q3: 出现剧情文本错误或素材缺失？
-1.  **执行同步**：优先运行 `ww sync`；使用 SD/UHD 时，再运行对应的 `ww resource sd` / `ww resource uhd`。
+1.  **执行同步**：运行 `ww sync`，按工具当前档位校验并修复资源；可用 `ww status` 确认档位。
 2.  **环境排查**：若同步后仍有问题，通常不在游戏本体，建议尝试更换 **启动方式**、**桌面环境 (DE)** 或 **Wine/Proton 版本**。
 
 ---

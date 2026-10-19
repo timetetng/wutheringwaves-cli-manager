@@ -292,13 +292,24 @@ class WGameManager:
                         logger.debug("文件下载失败，详情见下载器错误")
         return failed
 
-    def sync_files(self, force_check_md5=False):
+    def sync_files(self, force_check_md5=False, tier: Optional[str] = None):
+        tier = self._validate_tier(tier) if tier is not None else self.current_resource_tier()
+        if self.server_type == "global" and tier != "hd":
+            raise ConfigError("国际服暂仅支持 HD 档位")
         # 确保获取的是当前版本的配置
         default_info = self.launcher_info["default"]
         res_base = default_info.get("resourcesBasePath") or default_info.get("baseUrl")
         if not res_base:
             raise WWError("无法获取资源路径配置 (resourcesBasePath 和 baseUrl 均为空)")
-        res_list = self.game_index["resource"]
+        prepared = self._prepare_resource_tier(tier) if tier != "hd" else None
+        if prepared:
+            common = prepared["bundle"]["resourcePacks"].get("common", {})
+            version = default_info["version"]
+            if not isinstance(common, dict) or common.get("version") != version or prepared["version"] != version:
+                raise ConfigError("渠道基础包与画质包版本不一致，暂不能组合安装，请稍后重试")
+        res_list = self._base_manifest(self.game_index["resource"], tier)
+        self._read_local_config()
+        self._read_resource_state()
 
         tasks = []
 
@@ -319,20 +330,18 @@ class WGameManager:
             def check_file(item):
                 try:
                     dest_path = self.game_folder / _resource_rel_path(item["dest"])
-                except IncrementalError:
-                    return None, item["dest"]
+                except IncrementalError as e:
+                    raise ConfigError(f"非法基础资源路径: {item['dest']}") from e
                 expected_md5 = item["md5"]
                 expected_size = int(item["size"])
 
-                need_download = False
-                if not dest_path.exists():
-                    need_download = True
-                elif force_check_md5:
-                    # md5_cache 内部已实现线程安全锁，可安全并发调用
-                    if self.md5_cache.get(dest_path) != expected_md5:
-                        need_download = True
-                elif dest_path.stat().st_size != expected_size:
-                    need_download = True
+                if force_check_md5:
+                    self.md5_cache.clear(dest_path)
+                need_download = (
+                    not dest_path.is_file()
+                    or dest_path.stat().st_size != expected_size
+                    or self.md5_cache.get(dest_path) != expected_md5
+                )
 
                 download_info = None
                 if need_download:
@@ -362,16 +371,69 @@ class WGameManager:
                     progress.advance(verify_task)
 
         if tasks:
+            for pack in ("common", "hd") if tier == "hd" else ("common",):
+                self._record_resource_pack(
+                    pack, self.resource_pack_version(pack) or default_info["version"], incomplete=True
+                )
             if self._batch_download(tasks):
-                raise NetworkError("基础资源下载失败，未更新版本记录；请重跑 ww sync")
+                raise NetworkError("基础资源下载失败，未更新版本记录；请重跑下载命令或 ww sync")
         else:
             logger.info("所有文件校验通过，无需下载。")
         self.md5_cache.save()
-        self._update_local_config()
+        if prepared:
+            try:
+                self._install_resource_tier(tier, prepared, force_check_md5)
+            except NetworkError as e:
+                raise NetworkError(f"组合安装未完成，请重跑原 download/sync 命令续传: {e}") from e
+        self._update_local_config(tier=tier)
+        state = self._read_resource_state()
+        state["active_tier"] = tier
+        self._write_local_json("wwm_resource_state.json", state)
 
         # Issue #19: 清理已从 manifest 移除的旧文件（如升级后残留的旧 pak）。
         # UE 会挂载 Paks 目录下所有 .pak，过期文件会覆盖新文件导致启动失败。
-        self._cleanup_stale_files(res_list)
+        self._cleanup_stale_files(res_list, tier=tier)
+
+    def _base_manifest(self, resources: Any, tier: str) -> List[dict]:
+        """保留当前渠道的公共文件；非 HD 安装不带入全量清单中的 HD。"""
+        if not isinstance(resources, list) or not resources:
+            raise ConfigError("基础资源清单为空或格式错误")
+        result = []
+        seen = set()
+        for item in resources:
+            try:
+                dest = item["dest"]
+                if not isinstance(dest, str) or dest.startswith(("/", "\\")):
+                    raise ValueError("dest 必须为相对路径")
+                rel = _resource_rel_path(dest)
+                parts = tuple(p.lower() for p in rel.parts)
+                if parts in (("client",), ("client", "content")):
+                    raise ValueError("不能将资源目录作为文件写入")
+                if parts[0].startswith((".", "wwm_", "launcherdownloadconfig")):
+                    raise ValueError("基础资源不能覆盖管理记录")
+                if len(parts) >= 3 and parts[:2] == ("client", "content") and parts[2] in self.RESOURCE_TIERS:
+                    if tier != "hd" or parts[2] != "hd":
+                        continue
+                size = int(item["size"])
+                md5 = item["md5"]
+                key = rel.as_posix().lower()
+                if size < 0 or not isinstance(md5, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", md5):
+                    raise ValueError("文件大小或 MD5 非法")
+                if key in seen or any(":" in p or "\x00" in p for p in rel.parts):
+                    raise ValueError("重复或非法路径")
+                path = self._managed_path(rel.as_posix())
+                self._managed_path(rel.as_posix() + ".temp")
+                if path.exists() and not path.is_file():
+                    raise ValueError("目标不是普通文件")
+                seen.add(key)
+                result.append({**item, "dest": rel.as_posix(), "size": size, "md5": md5.lower()})
+            except (KeyError, TypeError, ValueError, IncrementalError) as e:
+                raise ConfigError(f"非法基础资源清单项 {item!r}: {e}") from e
+        if not result:
+            raise ConfigError("基础资源清单未包含公共文件")
+        if any(parent.as_posix().lower() in seen for i in result for parent in Path(i["dest"]).parents):
+            raise ConfigError("基础资源清单包含文件/目录路径冲突")
+        return result
 
     # --- 3.7+ 资源档位 (HD/SD/UHD) 基础包下载 ---
 
@@ -476,8 +538,8 @@ class WGameManager:
         if pack in versions and (pack != "common" or state.get("common_server") == self.server_type):
             return versions[pack]
         cfg = self._read_local_config()
-        if pack in ("common", "hd"):
-            # 旧安装的主清单为 common + HD；其它档位不能借用游戏主版本。
+        if pack == "common" or (pack == "hd" and state["active_tier"] == "hd"):
+            # 旧安装默认 HD；显式选择其它档位后不能假定 HD 也已安装。
             return cfg.get("version")
         record = cfg.get("bundles", {}).get(pack.upper(), {})
         marker = self._managed_path(f"launcherDownloadConfig/{pack}.json")
@@ -549,6 +611,11 @@ class WGameManager:
     ) -> None:
         """下载并验证档位基础包；缓存仅省略未变化文件的重复哈希。"""
         tier = self._validate_tier(tier)
+        prepared = self._prepare_resource_tier(tier, config_url)
+        self._install_resource_tier(tier, prepared, force_check_md5)
+
+    def _prepare_resource_tier(self, tier: str, config_url: Optional[str] = None) -> dict:
+        """只读预检，组合安装须在公共文件下载前确认画质清单有效。"""
         self._read_resource_state()
         bundle = self.get_bundle_config(config_url)
         if not isinstance(bundle, dict):
@@ -578,10 +645,15 @@ class WGameManager:
         if not isinstance(manifest, dict):
             raise NetworkError("无法下载资源档位清单")
         resources = self._tier_manifest(tier, manifest.get("resource"))
-
-        # 安装记录和缓存也必须在预检阶段验证，不能下载到一半才发现路径不安全。
-        cfg = self._read_local_config()
+        self._read_local_config()
         self._managed_path(f"launcherDownloadConfig/{tier}.json")
+        self._managed_path(f"wwm_md5_cache_resource_{tier}.json")
+        return {"bundle": bundle, "version": version, "resources": resources, "cdn": cdn, "base": base}
+
+    def _install_resource_tier(self, tier: str, prepared: dict, force_check_md5: bool = False) -> None:
+        bundle, version = prepared["bundle"], prepared["version"]
+        resources, cdn, base = prepared["resources"], prepared["cdn"], prepared["base"]
+        cfg = self._read_local_config()
         cache_path = self._managed_path(f"wwm_md5_cache_resource_{tier}.json")
         cache = MD5Cache(cache_path, self.game_folder)
         tasks = []
@@ -603,6 +675,7 @@ class WGameManager:
         self.game_folder.mkdir(parents=True, exist_ok=True)
         if tasks:
             # 正式文件即将改变，旧安装标记不能继续宣称该档位完整。
+            self._record_resource_pack(tier, self.resource_pack_version(tier) or version, incomplete=True)
             self._unregister_installed_tier(tier, cfg)
             failed = self._batch_download(tasks)
             for task in tasks:
@@ -738,7 +811,7 @@ class WGameManager:
                 "请用 ww status 查看，ww resource <tier> 校验修复"
             )
 
-    def _cleanup_stale_files(self, res_list) -> None:
+    def _cleanup_stale_files(self, res_list, tier: str = "hd") -> None:
         """删除磁盘上已从当前 manifest 移除的旧文件（Issue #19）。
 
         只清理「本工具曾管理过、现已废弃」的文件：
@@ -773,6 +846,14 @@ class WGameManager:
             for dirpath, dirnames, filenames in os.walk(scan_root):
                 # 跳过隐藏目录与 Saved/ 目录（玩家截图/存档/运行时资源由游戏自身管理）
                 dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != "Saved"]
+                relative = Path(dirpath).relative_to(self.game_folder)
+                if tuple(p.lower() for p in relative.parts) == ("client", "content"):
+                    # 未选中的画质包仍属于有效安装，不能当作过期公共文件清理。
+                    dirnames[:] = [
+                        d
+                        for d in dirnames
+                        if d.lower() not in self.RESOURCE_TIERS or (tier == "hd" and d.lower() == "hd")
+                    ]
                 for name in filenames:
                     if name.startswith(".") or name.endswith((".temp", ".bak", ".tmp")):
                         continue
@@ -795,13 +876,11 @@ class WGameManager:
         if removed:
             logger.info(f"清理完成: 共删除 {len(removed)} 个已废弃文件")
 
-    def download_full(self):
-        """下载完整客户端"""
-        logger.info(f"准备下载 {self.server_type} 服完整客户端到: {self.game_folder}")
-
-        # 确保游戏根目录存在
-        self.game_folder.mkdir(parents=True, exist_ok=True)
-        self.sync_files(force_check_md5=False)
+    def download_full(self, tier: str = "hd"):
+        """按显式档位初始化，成功后记住选择供后续同步使用。"""
+        tier = self._validate_tier(tier)
+        logger.info(f"准备下载 {self.server_type} 服 {tier.upper()} 客户端到: {self.game_folder}")
+        self.sync_files(force_check_md5=False, tier=tier)
 
         logger.info(f"{self.server_type} 服完整客户端下载完毕！")
 
@@ -1073,7 +1152,7 @@ class WGameManager:
             shutil.copy2(t["path"], cache_path)
         return len(tasks)
 
-    def _update_local_config(self):
+    def _update_local_config(self, tier: Optional[str] = None):
         # 优先使用 launcher_info 中的版本，如果获取不到则保持原状或报错
         if self._launcher_info:
             v = self.launcher_info["default"]["version"]
@@ -1082,7 +1161,8 @@ class WGameManager:
             cfg.update({"version": v, "appId": self.config["appId"], "group": "default"})
             self._write_local_json("launcherDownloadConfig.json", cfg)
             self._record_resource_pack("common", v)
-            self._record_resource_pack("hd", v)
+            if (tier or self._read_resource_state()["active_tier"]) == "hd":
+                self._record_resource_pack("hd", v)
             logger.info(f"本地配置已更新: {self.server_type} ({v})")
 
     def apply_incremental_update(self, dry_run: bool = False) -> bool:
