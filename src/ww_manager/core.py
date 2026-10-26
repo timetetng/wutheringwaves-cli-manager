@@ -379,12 +379,32 @@ class WGameManager:
                 raise NetworkError("基础资源下载失败，未更新版本记录；请重跑下载命令或 ww sync")
         else:
             logger.info("所有文件校验通过，无需下载。")
+        # 下载器返回成功并不等于正式文件一定完整，登记前再次核对。
+        for task in tasks:
+            self.md5_cache.clear(task["path"])
+        for item in res_list:
+            path = self._managed_path(item["dest"])
+            if (
+                not path.is_file()
+                or path.stat().st_size != item["size"]
+                or self.md5_cache.get(path) != item["md5"]
+            ):
+                self.md5_cache.save()
+                raise NetworkError(f"基础资源校验失败: {item['dest']}；请重跑下载命令或 ww sync")
         self.md5_cache.save()
         if prepared:
             try:
                 self._install_resource_tier(tier, prepared, force_check_md5)
             except NetworkError as e:
                 raise NetworkError(f"组合安装未完成，请重跑原 download/sync 命令续传: {e}") from e
+        if tier == "hd" and any(
+            tuple(p.lower() for p in Path(item["dest"]).parts[:3]) == ("client", "content", "hd")
+            for item in res_list
+        ):
+            # HD 已包含在渠道全量清单中，无需再拉取独立画质配置。
+            self._register_installed_tier(
+                tier, default_info["version"], {"bundles": {"HD": {"resourcePacks": ["common", "hd"]}}}
+            )
         self._update_local_config(tier=tier)
         state = self._read_resource_state()
         state["active_tier"] = tier
@@ -758,7 +778,7 @@ class WGameManager:
             registered = bool(version and data.get("version") == version and data.get("packName") == tier)
             present = directory.is_dir() and any(directory.iterdir())
             state = (
-                "已登记（未校验）" if registered and present else ("未登记/不完整" if present or version else "未安装")
+                "已安装" if registered and present else ("未登记/不完整" if present or version else "未安装")
             )
             if tier in selection.get("incomplete", []):
                 state = "更新未完成"
@@ -808,7 +828,7 @@ class WGameManager:
         if outdated:
             logger.warning(
                 f"档位 {', '.join(t.upper() for t in outdated)} 未确认与基础版本 {version} 同步；"
-                "请用 ww status 查看，ww resource <tier> 校验修复"
+                "请用 ww resource 查看，ww resource <tier> 校验修复"
             )
 
     def _cleanup_stale_files(self, res_list, tier: str = "hd") -> None:

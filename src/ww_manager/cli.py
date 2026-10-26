@@ -14,12 +14,16 @@ from typing import Optional
 from urllib.request import Request, urlopen
 
 import typer
+from rich.console import Console
+from rich.table import Table
 from typing_extensions import Annotated
 
 from ww_manager.config import APPID_TO_SERVER, load_app_config, save_app_config
 from ww_manager.core import WGameManager, WWError, decrypt_client_log, is_log_encrypted
 
 __version__ = metadata.version("ww-manager")
+
+TIER_NAMES = {"sd": "标清", "hd": "高清", "uhd": "极致"}
 
 
 def parse_version(version_str: str) -> tuple:
@@ -259,15 +263,15 @@ def status(ctx: typer.Context):
             raise ValueError("本地配置不是 JSON 对象")
         app_id = str(data.get("appId", ""))
         server = APPID_TO_SERVER.get(app_id, "cn")
-        typer.secho(f"目录: {path}", fg="green")
-        typer.echo(f"服务器: {APPID_TO_SERVER.get(app_id, '未知')}")
-        typer.echo(f"版本: {data.get('version', '未知')}")
-        for state in WGameManager(path, server).resource_tier_status():
-            tier = state["tier"]
-            typer.echo(
-                f"档位 {tier.upper()}{' [工具当前档位]' if state['active'] else ''}: "
-                f"{state['state']} / 版本 {state['version'] or '未知'} / 启动参数 -krqlv={tier}"
-            )
+        tier = WGameManager(path, server)._read_resource_state()["active_tier"]
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style="cyan", no_wrap=True)
+        table.add_column(overflow="fold")
+        table.add_row("目录", str(path))
+        table.add_row("服务器", APPID_TO_SERVER.get(app_id, "未知"))
+        table.add_row("版本", str(data.get("version", "未知")))
+        table.add_row("当前默认档位", f"{tier.upper()} · {TIER_NAMES[tier]}" if tier else "未选择")
+        Console().print(table, markup=False)
     except (WWError, OSError, ValueError) as e:
         typer.secho(f"读取状态失败: {e}", fg="red")
         raise typer.Exit(1)
@@ -323,7 +327,7 @@ def download(
 @app.command()
 def resource(
     ctx: typer.Context,
-    tier: Annotated[str, typer.Argument(help="资源档位: hd / sd / uhd (必填)")],
+    tier: Annotated[Optional[str], typer.Argument(help="资源档位: sd 标清 / hd 高清 / uhd 极致；省略查看列表")] = None,
     config_url: Annotated[
         Optional[str],
         typer.Option("--config-url", help="覆盖自动获取的官方画质配置地址（通常无需指定）"),
@@ -331,10 +335,10 @@ def resource(
     force_md5: Annotated[bool, typer.Option("--force-md5", help="忽略 MD5 缓存，重新计算所有文件哈希")] = False,
     remove: Annotated[bool, typer.Option("--remove", help="确认后删除该档位目录、缓存和安装登记")] = False,
 ):
-    """下载 3.7+ 资源档位基础包 (→ Client/Content/<TIER>/)
+    """查看、安装、校验或删除画质档位
 
-    游戏需以 -krqlv=<tier> 启动参数加载对应档位。SD/UHD 基础包
-    不在常规全量清单中；通过 resourcePacks 下载并验证后登记。
+    不带档位时只读展示本地安装记录，不进行实时文件校验。
+    指定档位后校验并修复，游戏需以 -krqlv=<tier> 启动。
     --remove 经确认后删除所选档位目录、缓存与安装记录。
     """
     path = get_game_path(ctx)
@@ -348,7 +352,24 @@ def resource(
             pass
     try:
         mgr = WGameManager(path, server)
-        if remove:
+        if tier is None:
+            if remove or force_md5 or config_url is not None:
+                raise WWError("使用操作选项时须指定档位，例如 ww resource hd --force-md5")
+            table = Table(box=None, padding=(0, 2))
+            for heading in ("档位", "安装情况", "版本", "默认"):
+                table.add_column(heading)
+            for state in mgr.resource_tier_status():
+                name = state["tier"]
+                table.add_row(
+                    f"{name.upper()} · {TIER_NAMES[name]}",
+                    state["state"],
+                    state["version"] or "—",
+                    "●" if state["active"] else "",
+                )
+            console = Console()
+            console.print(table, markup=False)
+            console.print("本地安装记录；校验并修复：ww resource <tier>", style="dim", markup=False)
+        elif remove:
             tier = mgr._validate_tier(tier)
             typer.confirm(
                 f"确定删除 {tier.upper()} 档位吗？这将删除 Client/Content/{tier.upper()}/ "

@@ -292,10 +292,10 @@ class ResourceTierTests(unittest.TestCase):
     def test_status_offline_and_unregistered_directory(self):
         self.put(DEST, GOOD)
         with patch.object(self.manager, "_http_get_json", side_effect=AssertionError("状态不应联网")):
-            result = self.invoke("status")
+            result = self.invoke("resource")
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("未登记/不完整", result.output)
-        self.assertIn("-krqlv=uhd", result.output)
+        self.assertIn("UHD · 极致", result.output)
 
     def test_status_bad_marker_is_incomplete(self):
         self.put(DEST, GOOD)
@@ -441,6 +441,57 @@ class ResourceTierTests(unittest.TestCase):
         self.assertTrue((self.root / "Client/Content/HD/hd.pak").is_file())
         self.assertEqual(self.manager.current_resource_tier(), "hd")
         self.assertEqual(self.manager.resource_pack_version("hd"), "3.8.0")
+        self.assertEqual(self.read_json("launcherDownloadConfig/hd.json"), {"packName": "hd", "version": "3.8.0"})
+        states = self.manager.resource_tier_status()
+        self.assertEqual(next(s for s in states if s["tier"] == "hd")["state"], "已安装")
+        with patch("ww_manager.core.logger.warning") as warning:
+            self.manager.remind_resource_tiers()
+        warning.assert_not_called()
+
+    def test_hd_bilibili_install_verifies_and_registers(self):
+        self.prepare_full_download("hd")
+        self.manager.server_type = "bilibili"
+        self.manager.config = WGameManager(self.root, "bilibili").config
+        self.manager.download_full()
+        result = self.invoke("status")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(len(result.output.strip().splitlines()), 4)
+        for text in (str(self.root), "bilibili", "3.8.0", "当前默认档位", "HD · 高清"):
+            self.assertIn(text, result.output)
+        self.assertNotIn("未校验", result.output)
+        self.assertNotIn("SD", result.output)
+        self.server.requests.clear()
+        self.manager.download_full()
+        self.assertEqual(self.server.requests, [])
+
+    def test_base_success_without_valid_files_does_not_register(self):
+        self.prepare_full_download("hd")
+        with patch.object(self.manager, "_batch_download", return_value=0):
+            with self.assertRaisesRegex(NetworkError, "基础资源校验失败"):
+                self.manager.download_full()
+        self.assertFalse((self.root / "launcherDownloadConfig/hd.json").exists())
+        self.assertFalse((self.root / "launcherDownloadConfig.json").exists())
+        self.assertIn("hd", self.manager._read_resource_state()["incomplete"])
+
+    def test_verified_resource_listing_is_not_unverified(self):
+        self.manager.download_resource_tier("uhd")
+        result = self.invoke("resource")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("已安装", result.output)
+        self.assertNotIn("未校验", result.output)
+        self.assertIn("SD · 标清", result.output)
+        self.assertIn("HD · 高清", result.output)
+        self.assertIn("UHD · 极致", result.output)
+
+    def test_status_without_install_or_selection(self):
+        result = self.invoke("status")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("未知", result.output)
+        self.assertIn("HD · 高清", result.output)
+        self.manager._write_local_json("wwm_resource_state.json", {"active_tier": None, "versions": {}})
+        result = self.invoke("status")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("未选择", result.output)
 
     def test_bilibili_download_uses_channel_common_and_shared_quality(self):
         self.prepare_full_download()
@@ -608,7 +659,18 @@ class ResourceTierTests(unittest.TestCase):
 
     def test_missing_tier_cli_does_not_download(self):
         result = self.invoke("resource")
-        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("安装情况", result.output)
+        self.assertEqual(self.server.requests, [])
+
+    def test_resource_action_options_require_tier(self):
+        for option in ("--remove", "--force-md5", "--config-url"):
+            args = ["resource", option]
+            if option == "--config-url":
+                args.append("https://example.invalid/config.json")
+            result = self.invoke(*args)
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("须指定档位", result.output)
         self.assertEqual(self.server.requests, [])
 
     def test_downloader_range_resume(self):
