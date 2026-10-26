@@ -13,13 +13,15 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from typer.testing import CliRunner
 
 from ww_manager.cli import app
 from ww_manager.config import RESOURCE_CONFIG_URLS
-from ww_manager.core import ConfigError, MD5Cache, NetworkError, WGameManager
+from ww_manager.core import ConfigError, DiskSpaceError, MD5Cache, NetworkError, WGameManager
+from ww_manager.menu import MenuOption
 from ww_manager.download import create_download_progress, download_single_file
 from ww_manager.resource_updates import ResourceUpdater
 
@@ -378,15 +380,16 @@ class ResourceTierTests(unittest.TestCase):
                 manager.download_resource_tier("uhd")
         fetch.assert_not_called()
 
-    def test_download_defaults_to_cn_hd(self):
+    def test_download_without_server_requires_interactive_terminal(self):
         with (
             patch("ww_manager.cli.WGameManager") as manager,
             patch("ww_manager.cli.get_game_path", return_value=self.root),
+            patch("ww_manager.cli._interactive_terminal", return_value=False),
         ):
             result = CliRunner().invoke(app, ["download"])
-        self.assertEqual(result.exit_code, 0, result.output)
-        manager.assert_called_once_with(self.root, "cn")
-        manager.return_value.download_full.assert_called_once_with(tier="hd")
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("非交互环境", result.output)
+        manager.assert_not_called()
 
     def test_download_preserves_positional_server_argument(self):
         for server in ("cn", "bilibili", "global"):
@@ -398,7 +401,7 @@ class ResourceTierTests(unittest.TestCase):
                 result = CliRunner().invoke(app, ["download", server])
                 self.assertEqual(result.exit_code, 0, result.output)
                 manager.assert_called_once_with(self.root, server)
-                manager.return_value.download_full.assert_called_once_with(tier="hd")
+                manager.return_value.download_full.assert_called_once_with(tier="hd", force_space=False)
 
     def prepare_full_download(self, tier="uhd"):
         self.manager._launcher_info = {"default": {"version": "3.8.0", "resourcesBasePath": "channel"}}
@@ -616,7 +619,7 @@ class ResourceTierTests(unittest.TestCase):
             with self.subTest(tier=tier), patch.object(self.manager, "download_full") as download:
                 result = self.invoke("download", "cn", tier)
                 self.assertEqual(result.exit_code, 0, result.output)
-                download.assert_called_once_with(tier=tier)
+                download.assert_called_once_with(tier=tier, force_space=False)
 
     def test_same_version_checkout_does_not_warn_tier_is_outdated(self):
         self.manager.download_resource_tier("uhd")
@@ -672,6 +675,356 @@ class ResourceTierTests(unittest.TestCase):
             self.assertNotEqual(result.exit_code, 0)
             self.assertIn("须指定档位", result.output)
         self.assertEqual(self.server.requests, [])
+
+    def test_disk_space_uses_nearest_existing_target_parent(self):
+        manager = WGameManager(self.root / "new" / "game", "cn")
+        with patch("ww_manager.core.shutil.disk_usage", return_value=SimpleNamespace(free=123)) as usage:
+            self.assertEqual(manager.available_disk_space(), 123)
+        usage.assert_called_once_with(self.root)
+        self.assertFalse((self.root / "new").exists())
+
+    def test_disk_space_can_read_real_temporary_filesystem(self):
+        free = self.manager.available_disk_space()
+        self.assertIsInstance(free, int)
+        assert free is not None
+        self.assertGreaterEqual(free, 0)
+
+    def test_resource_space_refusal_preserves_existing_files_and_records(self):
+        old = self.put(DEST, b"old")
+        cfg = self.put("launcherDownloadConfig.json", b'{"bundles":{"UHD":{"version":"old"}}}')
+        marker = self.put("launcherDownloadConfig/uhd.json", b'{"packName":"uhd","version":"old"}')
+        with patch.object(self.manager, "available_disk_space", return_value=0):
+            result = self.invoke("resource", "uhd")
+        self.assertNotEqual(result.exit_code, 0, result.output)
+        for text in ("空间不足", "差额", "--force"):
+            self.assertIn(text, result.output)
+        self.assertEqual(old.read_bytes(), b"old")
+        self.assertEqual(cfg.read_bytes(), b'{"bundles":{"UHD":{"version":"old"}}}')
+        self.assertEqual(marker.read_bytes(), b'{"packName":"uhd","version":"old"}')
+        self.assertFalse((self.root / "wwm_resource_state.json").exists())
+        self.assertEqual(self.server.requests, [("/manifest.json", None)])
+
+    def test_resource_force_bypasses_space_only(self):
+        with patch.object(self.manager, "available_disk_space", return_value=0):
+            result = self.invoke("resource", "uhd", "--force")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual((self.root / DEST).read_bytes(), GOOD)
+        self.registered()
+
+    def test_resource_force_does_not_bypass_post_download_verification(self):
+        with (
+            patch.object(self.manager, "available_disk_space", return_value=0),
+            patch.object(self.manager, "_batch_download", return_value=0),
+        ):
+            result = self.invoke("resource", "uhd", "--force")
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("档位文件校验失败", result.output)
+        self.assertFalse((self.root / "launcherDownloadConfig/uhd.json").exists())
+
+    def test_space_exactly_equal_to_pending_files_is_accepted(self):
+        self.server.resources = [item(), item("Client/Content/UHD/second.pak")]
+        self.put(DEST, GOOD)
+        with patch.object(self.manager, "available_disk_space", return_value=len(GOOD)):
+            self.manager.download_resource_tier("uhd")
+        self.assertEqual((self.root / "Client/Content/UHD/second.pak").read_bytes(), GOOD)
+        self.assertNotIn(("/files/" + DEST, None), self.server.requests)
+
+    def test_installed_explicit_verification_needs_no_free_space(self):
+        self.manager.download_resource_tier("uhd")
+        self.server.requests.clear()
+        with patch.object(self.manager, "available_disk_space", return_value=0):
+            self.manager.download_resource_tier("uhd")
+        self.assertEqual(self.server.requests, [("/manifest.json", None)])
+
+    def test_full_download_checks_combined_size_before_any_payload(self):
+        self.prepare_full_download("uhd")
+        with patch.object(self.manager, "available_disk_space", return_value=len(GOOD)):
+            with self.assertRaises(DiskSpaceError):
+                self.manager.download_full("uhd")
+        self.assertEqual(self.server.requests, [("/manifest.json", None)])
+        self.assertFalse((self.root / "Client").exists())
+        self.assertFalse((self.root / "wwm_resource_state.json").exists())
+
+    def test_full_hd_download_checks_space(self):
+        self.prepare_full_download("hd")
+        with patch.object(self.manager, "available_disk_space", return_value=len(GOOD)):
+            result = self.invoke("download", "bilibili")
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("空间不足", result.output)
+        self.assertEqual(self.server.requests, [])
+        self.assertFalse((self.root / "Client").exists())
+
+    def test_full_download_force_propagates_to_combined_install(self):
+        self.prepare_full_download("uhd")
+        with patch.object(self.manager, "available_disk_space", return_value=0):
+            result = self.invoke("download", "bilibili", "uhd", "--force")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual((self.root / DEST).read_bytes(), GOOD)
+        self.registered()
+
+    def test_unknown_disk_space_warns_without_claiming_sufficient(self):
+        with (
+            patch("ww_manager.core.shutil.disk_usage", side_effect=OSError("unavailable")),
+            patch("ww_manager.core.logger.warning") as warning,
+        ):
+            self.manager.download_resource_tier("uhd")
+        self.assertTrue(any("无法保证空间充足" in str(call) for call in warning.call_args_list))
+        self.registered()
+
+    def test_menu_preview_uses_official_sizes_without_writing(self):
+        self.server.resources = [dict(item(), size="24")]
+        rows = self.manager.resource_menu_data()
+        uhd = next(row for row in rows if row["tier"] == "uhd")
+        self.assertEqual(uhd["total_size"], 24)
+        self.assertEqual(uhd["download_size"], 24)
+        self.assertIsNone(uhd["error"])
+        self.assertFalse(uhd["installed"])
+        self.assertEqual(list(self.root.iterdir()), [])
+        self.assertEqual(self.server.requests, [("/manifest.json", None)])
+
+    def test_menu_select_installed_changes_default_without_hash_or_download(self):
+        self.manager.download_resource_tier("uhd")
+        state = self.manager._read_resource_state()
+        state["active_tier"] = "hd"
+        self.manager._write_local_json("wwm_resource_state.json", state)
+        self.server.requests.clear()
+        prepared = self.manager._prepare_resource_tier("uhd")
+        self.server.requests.clear()
+        with patch.object(MD5Cache, "get", side_effect=AssertionError("不得重复校验")):
+            self.manager.select_resource_tier("uhd", prepared)
+        self.assertEqual(self.manager.current_resource_tier(), "uhd")
+        self.assertEqual(self.server.requests, [])
+
+    def test_menu_outdated_tier_is_not_treated_as_ready(self):
+        self.manager.download_resource_tier("uhd")
+        self.bundle["resourcePacks"]["uhd"]["version"] = "3.9.0"
+        row = next(row for row in self.manager.resource_menu_data() if row["tier"] == "uhd")
+        self.assertFalse(row["installed"])
+        self.manager.select_resource_tier("uhd", row["prepared"])
+        self.assertEqual(self.manager.resource_pack_version("uhd"), "3.9.0")
+
+    def test_menu_cancel_is_read_only(self):
+        with (
+            patch("ww_manager.cli._interactive_terminal", return_value=True),
+            patch("ww_manager.cli.build_selection_menu") as menu,
+        ):
+            menu.return_value.run.return_value = None
+            result = self.invoke("resource")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(list(self.root.iterdir()), [])
+        options = menu.call_args.args[0]
+        uhd = next(option for option in options if option.key == "uhd")
+        self.assertIn("完整包", uhd.details)
+        self.assertIn("本次下载", uhd.details)
+        self.assertEqual(uhd.description_style, "fg:ansired bold")
+
+    def test_menu_select_uninstalled_downloads_and_registers(self):
+        with (
+            patch("ww_manager.cli._interactive_terminal", return_value=True),
+            patch("ww_manager.cli.build_selection_menu") as menu,
+        ):
+            menu.return_value.run.return_value = MenuOption("uhd", "UHD")
+            result = self.invoke("resource")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.registered()
+        self.assertEqual(self.manager.current_resource_tier(), "uhd")
+
+    def test_menu_force_unblocks_space_but_not_unavailable_tiers(self):
+        with (
+            patch("ww_manager.cli._interactive_terminal", return_value=True),
+            patch.object(self.manager, "available_disk_space", return_value=0),
+            patch("ww_manager.cli.build_selection_menu") as menu,
+        ):
+            menu.return_value.run.return_value = None
+            result = self.invoke("resource")
+            self.assertEqual(result.exit_code, 0, result.output)
+            options = menu.call_args.args[0]
+            self.assertIn("空间不足", next(o for o in options if o.key == "uhd").blocked_reason or "")
+            result = self.invoke("resource", "--force")
+            self.assertEqual(result.exit_code, 0, result.output)
+            options = menu.call_args.args[0]
+            self.assertIsNone(next(o for o in options if o.key == "uhd").blocked_reason)
+            self.assertIsNotNone(next(o for o in options if o.key == "sd").blocked_reason)
+
+    def test_menu_force_passes_through_to_real_installer(self):
+        with (
+            patch("ww_manager.cli._interactive_terminal", return_value=True),
+            patch.object(self.manager, "available_disk_space", return_value=0),
+            patch("ww_manager.cli.build_selection_menu") as menu,
+        ):
+            menu.return_value.run.return_value = MenuOption("uhd", "UHD")
+            result = self.invoke("resource", "--force")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.registered()
+
+    def test_menu_remove_defaults_to_cancel_even_with_force(self):
+        self.manager.download_resource_tier("uhd")
+        before = {p.relative_to(self.root): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        with (
+            patch("ww_manager.cli._interactive_terminal", return_value=True),
+            patch("ww_manager.cli.build_selection_menu") as menu,
+        ):
+            menu.return_value.run.side_effect = [MenuOption("uhd", "极致", action="remove"), None]
+            result = self.invoke("resource", "--force", input="\n")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(str(self.root / "Client/Content/UHD"), result.output)
+        self.assertIn("自行放置的文件", result.output)
+        self.assertIn("[y/N]", result.output)
+        self.assertEqual(menu.call_count, 2)
+        self.assertEqual(menu.call_args.kwargs["initial_key"], "uhd")
+        after = {p.relative_to(self.root): p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        self.assertEqual(after, before)
+
+    def test_menu_remove_confirmed_removes_only_highlighted_tier_and_refreshes(self):
+        self.manager.download_resource_tier("uhd")
+        self.put("Client/Content/UHD/custom-note.txt", b"custom")
+        hd = self.put("Client/Content/HD/keep.pak", b"keep-hd")
+        common = self.put("Client/Content/Paks/common.pak", b"keep-common")
+        with (
+            patch("ww_manager.cli._interactive_terminal", return_value=True),
+            patch("ww_manager.cli.build_selection_menu") as menu,
+        ):
+            menu.return_value.run.side_effect = [MenuOption("uhd", "极致", action="remove"), None]
+            result = self.invoke("resource", input="y\n")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertFalse((self.root / "Client/Content/UHD").exists())
+        self.assertFalse((self.root / "launcherDownloadConfig/uhd.json").exists())
+        self.assertIsNone(self.manager._read_resource_state()["active_tier"])
+        self.assertEqual(hd.read_bytes(), b"keep-hd")
+        self.assertEqual(common.read_bytes(), b"keep-common")
+        self.assertEqual(menu.call_count, 2)
+        self.assertIsNone(menu.call_args.args[1])
+        uhd = next(option for option in menu.call_args.args[0] if option.key == "uhd")
+        self.assertIn("未安装", uhd.description)
+
+    def test_menu_can_remove_local_tier_when_its_remote_manifest_is_unavailable(self):
+        self.manager.download_resource_tier("uhd")
+        self.bundle["resourcePacks"].clear()
+        with (
+            patch("ww_manager.cli._interactive_terminal", return_value=True),
+            patch("ww_manager.cli.build_selection_menu") as menu,
+        ):
+            menu.return_value.run.side_effect = [MenuOption("uhd", "极致", action="remove"), None]
+            result = self.invoke("resource", input="y\n")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertFalse((self.root / "Client/Content/UHD").exists())
+
+    def test_menu_rechecks_space_at_actual_install(self):
+        prepared = self.manager._prepare_resource_tier("uhd")
+        with patch.object(self.manager, "available_disk_space", return_value=0):
+            with self.assertRaises(DiskSpaceError):
+                self.manager.select_resource_tier("uhd", prepared)
+        self.assertFalse((self.root / "Client").exists())
+
+    def test_unknown_download_size_warns_but_known_shortage_still_refuses(self):
+        with (
+            patch.object(self.manager, "available_disk_space", return_value=0),
+            patch("ww_manager.core.logger.warning") as warning,
+        ):
+            self.manager._check_download_space([{"size": None}])
+            self.assertTrue(any("大小未知" in str(call) for call in warning.call_args_list))
+            with self.assertRaises(DiskSpaceError):
+                self.manager._check_download_space([{"size": 1}, {"size": None}])
+
+    def test_zero_byte_file_is_not_reported_as_unknown_size(self):
+        with (
+            patch.object(self.manager, "available_disk_space", return_value=0),
+            patch("ww_manager.core.logger.warning") as warning,
+        ):
+            self.manager._check_download_space([{"size": 0}])
+        warning.assert_not_called()
+
+    def test_sync_refuses_space_and_force_can_repair(self):
+        self.prepare_full_download("hd")
+        with patch.object(self.manager, "available_disk_space", return_value=0):
+            result = self.invoke("sync")
+            self.assertNotEqual(result.exit_code, 0, result.output)
+            self.assertIn("空间不足", result.output)
+            self.assertEqual(self.server.requests, [])
+            result = self.invoke("sync", "--force")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.manager.resource_pack_version("hd"), "3.8.0")
+
+    def test_sync_new_passes_force_to_repair(self):
+        with patch.object(self.manager, "verify_new_version", return_value=True) as verify:
+            result = self.invoke("sync", "--new", "--force")
+        self.assertEqual(result.exit_code, 0, result.output)
+        verify.assert_called_once_with(force_space=True)
+
+    def checkout_contexts(self):
+        self.put(DEST, b"old")
+        self.put("launcherDownloadConfig.json", b'{"appId":"10003","version":"3.8.0"}')
+        source = {"resource": [item(data=b"old")], "version": "3.8.0"}
+        target = {
+            "resource": [item()], "version": "3.8.0", "cdn": self.url, "res_base": "files",
+            "info": {"default": {"version": "3.8.0"}},
+        }
+        return {"cn": source, "bilibili": target}
+
+    def test_checkout_refuses_before_backups_or_game_changes(self):
+        contexts = self.checkout_contexts()
+        before = (self.root / "launcherDownloadConfig.json").read_bytes()
+        with (
+            patch.object(self.manager, "_fetch_server_context", side_effect=contexts.__getitem__),
+            patch.object(self.manager, "available_disk_space", return_value=0),
+        ):
+            result = self.invoke("checkout", "bilibili")
+        self.assertNotEqual(result.exit_code, 0, result.output)
+        self.assertIn("空间不足", result.output)
+        self.assertEqual((self.root / DEST).read_bytes(), b"old")
+        self.assertEqual((self.root / "launcherDownloadConfig.json").read_bytes(), before)
+        self.assertFalse(self.manager.diff_cache_dir.exists())
+        self.assertEqual(self.server.requests, [])
+
+    def test_checkout_force_downloads_diff_and_verifies(self):
+        contexts = self.checkout_contexts()
+        with (
+            patch.object(self.manager, "_fetch_server_context", side_effect=contexts.__getitem__),
+            patch.object(self.manager, "available_disk_space", return_value=0),
+        ):
+            result = self.invoke("checkout", "bilibili", "--force")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual((self.root / DEST).read_bytes(), GOOD)
+        self.assertEqual(self.read_json("launcherDownloadConfig.json")["appId"], self.manager.config["appId"])
+
+    def test_checkout_cache_only_does_not_require_download_space(self):
+        contexts = self.checkout_contexts()
+        cached = self.manager._server_cache_path("bilibili", DEST)
+        cached.parent.mkdir(parents=True)
+        cached.write_bytes(GOOD)
+        with (
+            patch.object(self.manager, "_fetch_server_context", side_effect=contexts.__getitem__),
+            patch.object(self.manager, "available_disk_space", return_value=0),
+        ):
+            self.manager.checkout("bilibili")
+        self.assertEqual((self.root / DEST).read_bytes(), GOOD)
+        self.assertEqual(self.server.requests, [])
+
+    def test_checkout_space_refusal_preserves_cache_due_for_reset(self):
+        contexts = self.checkout_contexts()
+        cached = self.manager._server_cache_path("bilibili", DEST)
+        cached.parent.mkdir(parents=True)
+        cached.write_bytes(GOOD)
+        self.manager._save_cache_manifest({"major_minor": [3, 7]})
+        with (
+            patch.object(self.manager, "_fetch_server_context", side_effect=contexts.__getitem__),
+            patch.object(self.manager, "available_disk_space", return_value=0),
+        ):
+            with self.assertRaises(DiskSpaceError):
+                self.manager.checkout("bilibili")
+        self.assertEqual(cached.read_bytes(), GOOD)
+        self.assertEqual(self.manager._load_cache_manifest()["major_minor"], [3, 7])
+        self.assertEqual((self.root / DEST).read_bytes(), b"old")
+
+    def test_checkout_force_sync_propagates_space_bypass(self):
+        contexts = self.checkout_contexts()
+        with (
+            patch.object(self.manager, "_fetch_server_context", side_effect=contexts.__getitem__),
+            patch.object(self.manager, "sync_files") as sync,
+        ):
+            result = self.invoke("checkout", "bilibili", "--force-sync", "--force")
+        self.assertEqual(result.exit_code, 0, result.output)
+        sync.assert_called_once_with(force_check_md5=True, force_space=True)
 
     def test_downloader_range_resume(self):
         path = self.root / "download.pak"

@@ -45,6 +45,9 @@ from ww_manager.download import (
     RAINBOW_COLORS,
     NetworkError,
     RainbowBarColumn,
+    DownloadSpaceError,
+    available_disk_space,
+    check_space_requirement,
     create_download_progress,
     download_single_file,
 )
@@ -269,12 +272,15 @@ class IncrementalManager:
     """统一的增量更新管理器，支持 cn、global、bilibili"""
 
     def __init__(
-        self, game_folder: Path, server_type: str, api_data: Dict, cdn_base: str, pack_name: Optional[str] = None
+        self, game_folder: Path, server_type: str, api_data: Dict, cdn_base: str, pack_name: Optional[str] = None,
+        *, force_space: bool = False, space_check: Optional[Callable[[List[dict], bool], None]] = None,
     ):
         self.game_folder = game_folder
         self.server_type = server_type
         self.cdn_base = cdn_base.rstrip("/")
         self.api_data = api_data
+        self.force_space = force_space
+        self._space_check = space_check
         self.cache_dir = game_folder / ".ww_manager_cache"
         self.download_dir = game_folder / ".incremental_download"
         if pack_name is not None:
@@ -483,6 +489,53 @@ class IncrementalManager:
             verified = dest in self._verified_staged_patch_dests
         return verified and staged_path.exists() and staged_path.stat().st_size == expected_size
 
+    def check_download_space(self, tasks: List[dict]) -> None:
+        if not tasks:
+            return
+        if self._space_check is not None:
+            self._space_check(tasks, self.force_space)
+            return
+        try:
+            check_space_requirement(tasks, available_disk_space(self.game_folder), self.force_space)
+        except DownloadSpaceError as e:
+            raise IncrementalError(str(e)) from e
+
+    def pending_download_tasks(self) -> List[dict]:
+        """只读预检待传输资源；供多包合计检查和国际服下载复用。"""
+        if self._index_file is None:
+            url = self.get_index_url()
+            self._index_file = _http_get_json(url) if url else None
+        if not self._index_file:
+            raise IncrementalError("无法获取增量更新索引，未开始下载")
+        resources = self._index_file.get("resource", [])
+        by_dest = {item["dest"]: item for item in resources if item.get("dest")}
+        tasks = []
+        for group in self.get_group_infos():
+            dest = group.get("dest")
+            if not dest:
+                continue
+            item = by_dest.get(dest, {})
+            size = int(item.get("size") or 0)
+            if not size:
+                size = _get_krpdiff_size(self._build_krpdiff_url(dest)) or 0
+            path = self.download_dir / _resource_rel_path(dest)
+            md5 = item.get("md5")
+            if path.is_file() and (not size or path.stat().st_size == size):
+                if md5 and _calculate_file_md5(path) == md5:
+                    continue
+                if size and not md5:
+                    continue
+            tasks.append({"path": path, "size": size or None})
+        for item in resources:
+            if _is_diff_resource(item["dest"]):
+                continue
+            size, md5 = int(item["size"]), item["md5"]
+            game_path = self.game_folder / _resource_rel_path(item["dest"])
+            staged = self._get_staged_complete_path(self.download_dir, item["dest"])
+            if not self._is_file_verified(game_path, size, md5) and not self._is_file_verified(staged, size, md5):
+                tasks.append({"path": staged, "size": size})
+        return tasks
+
     def download_incremental(self) -> bool:
         """下载增量更新包"""
         current_version = self.get_current_version()
@@ -513,6 +566,8 @@ class IncrementalManager:
         # 分包热修复允许空清单，也允许只有完整文件或删除项而没有二进制差分组。
         logger.debug(f"找到 {len(group_infos)} 个增量更新组")
 
+        # 在写下载记录、清理失效缓存或启动任意下载线程前检查整批资源。
+        self.check_download_space(self.pending_download_tasks())
         download_dir = self.download_dir
         download_dir.mkdir(parents=True, exist_ok=True)
 
@@ -766,6 +821,7 @@ class IncrementalManager:
         overall_task_id: Optional[TaskID] = None,
     ) -> bool:
         """已知大小的文件复用通用下载器；旧接口保留无大小信息的兼容路径。"""
+        self.check_download_space([{"path": dest, "size": expected_size or None}])
         if expected_size > 0:
             return download_single_file(url, dest, expected_size, progress, overall_task_id, expected_md5=expected_md5)
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1445,6 +1501,7 @@ class IncrementalManager:
         if self._is_file_verified(staged_path, expected_size, expected_md5):
             self._mark_staged_patch_verified(dest)
             return True
+        self.check_download_space([{"path": staged_path, "size": expected_size}])
         if staged_path.exists():
             staged_path.unlink()
 
@@ -1486,6 +1543,8 @@ class IncrementalManager:
             return False
 
         staged_path = self._get_fallback_download_path(dest)
+        if not self._is_file_verified(staged_path, expected_size, expected_md5):
+            self.check_download_space([{"path": staged_path, "size": expected_size}])
         if staged_path.exists() and not self._is_file_verified(staged_path, expected_size, expected_md5):
             staged_path.unlink()
 
@@ -1680,12 +1739,11 @@ class IncrementalManager:
         logger.info(f"校验完成: 正常={ok_count}, 不一致={len(inconsistent_files)}, 缺失={len(missing_files)}")
 
         delete_files = index_data.get("deleteFiles", [])
-        if delete_files:
-            self._apply_delete_files(delete_files)
-
         target_version = self._get_cached_target_version(download_dir)
 
         if not inconsistent_files and not missing_files:
+            if delete_files:
+                self._apply_delete_files(delete_files)
             logger.info("所有游戏文件状态正常")
             self._update_local_version(target_version or index_data)
             return True
@@ -1701,6 +1759,15 @@ class IncrementalManager:
         repair_count = 0
         fail_count = 0
         total_size = sum(int(game_res_map[d]["size"]) for d in repair_needed)
+        pending = []
+        for dest in repair_needed:
+            item = game_res_map[dest]
+            staged = self._get_repair_download_path(dest)
+            if not self._is_file_verified(staged, int(item["size"]), item["md5"]):
+                pending.append({"path": staged, "size": int(item["size"])})
+        self.check_download_space(pending)
+        if delete_files:
+            self._apply_delete_files(delete_files)
 
         with Progress(
             TextColumn("[bold blue]{task.description}"),
@@ -1726,8 +1793,10 @@ class IncrementalManager:
                 if self._is_file_verified(final_path, expected_size, expected_md5):
                     return True, dest, expected_size
 
-                if staged_path.exists() and not self._is_file_verified(staged_path, expected_size, expected_md5):
-                    staged_path.unlink()
+                if not self._is_file_verified(staged_path, expected_size, expected_md5):
+                    self.check_download_space([{"path": staged_path, "size": expected_size}])
+                    if staged_path.exists():
+                        staged_path.unlink()
 
                 url = self._build_resource_url(item, res_base)
                 if not url:
@@ -1851,6 +1920,7 @@ class IncrementalManager:
         overall_task_id: Optional[TaskID] = None,
     ) -> bool:
         """下载完整文件并验证 MD5，支持进度条"""
+        self.check_download_space([{"path": dest, "size": expected_size}])
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         task_id = None
@@ -1912,6 +1982,7 @@ class IncrementalManager:
         suppress_success_log: bool = False,
     ) -> bool:
         """下载文件并验证 MD5"""
+        self.check_download_space([{"path": dest, "size": expected_size}])
 
         def emit_error(msg: str):
             if error_callback:

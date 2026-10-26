@@ -5,6 +5,7 @@
 
 import hashlib
 import logging
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -49,6 +50,45 @@ class NetworkError(Exception):
     """网络相关错误"""
 
     pass
+
+
+class DownloadSpaceError(Exception):
+    """下载前已确认目标文件系统空间不足。"""
+
+
+def available_disk_space(target: Path) -> Optional[int]:
+    try:
+        while not target.exists() and target != target.parent:
+            target = target.parent
+        return shutil.disk_usage(target).free
+    except OSError as e:
+        logger.warning(f"无法读取目标磁盘可用空间，无法保证空间充足: {e}")
+        return None
+
+
+def format_bytes(size: int) -> str:
+    return f"{size / 1024**3:.2f} GiB ({size:,} 字节)"
+
+
+def space_shortage(required: int, free: Optional[int]) -> Optional[str]:
+    if free is None or required <= free:
+        return None
+    return (
+        f"空间不足：需下载 {format_bytes(required)}，可用 {format_bytes(free)}，"
+        f"差额 {format_bytes(required - free)}；可使用 --force 仅绕过空间检查"
+    )
+
+
+def check_space_requirement(tasks: List[dict], free: Optional[int], force_space: bool = False) -> None:
+    """按待下载文件清单求和，不扣续传、不计解压与预留；未知大小只警告。"""
+    if any(task.get("size") is None for task in tasks):
+        logger.warning("部分下载文件大小未知，仅检查已知大小，无法保证空间充足")
+    required = sum(int(task.get("size") or 0) for task in tasks)
+    shortage = space_shortage(required, free)
+    if shortage:
+        if not force_space:
+            raise DownloadSpaceError(shortage)
+        logger.warning(f"{shortage}；已通过 --force 强制继续，文件校验仍然有效")
 
 
 class RainbowBarColumn(BarColumn):
@@ -245,6 +285,11 @@ __all__ = [
     "create_download_progress",
     "download_single_file",
     "batch_download",
+    "available_disk_space",
+    "format_bytes",
+    "space_shortage",
+    "check_space_requirement",
+    "DownloadSpaceError",
     "NetworkError",
     "RAINBOW_COLORS",
     "RainbowBarColumn",

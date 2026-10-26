@@ -13,7 +13,7 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from ww_manager.cli import app
-from ww_manager.core import ConfigError, NetworkError, WGameManager, WWError
+from ww_manager.core import ConfigError, DiskSpaceError, NetworkError, WGameManager, WWError
 from ww_manager.resource_updates import HISTORY, PLAN, PackIncrementalManager, ResourceUpdater
 
 OLD = b"old-release-data"
@@ -147,7 +147,7 @@ class ResourceUpdateTests(unittest.TestCase):
     def test_without_launcher_incremental_routes_to_auto_config(self):
         with patch("ww_manager.resource_updates.ResourceUpdater.download", return_value=True) as download:
             self.assertTrue(self.owner.download_incremental())
-        download.assert_called_once_with(None)
+        download.assert_called_once_with(None, force_space=False)
 
     def test_global_incremental_keeps_original_hd_engine(self):
         self.owner.server_type = "global"
@@ -516,6 +516,150 @@ class ResourceUpdateTests(unittest.TestCase):
         self.owner._record_resource_pack("uhd", SOURCE)
         with self.assertRaisesRegex(ConfigError, "拒绝使用旧记录"):
             self.updater.verify()
+
+    def test_incremental_space_checks_both_packs_before_first_payload(self):
+        with patch.object(self.owner, "available_disk_space", return_value=len(NEW)):
+            with self.assertRaisesRegex(DiskSpaceError, "空间不足"):
+                self.owner.download_incremental()
+        self.assertFalse((self.root / PLAN).exists())
+        self.assertFalse(any(url.startswith("/files/") for url in self.server.requested))
+        for pack in ("common", "uhd"):
+            self.assertEqual((self.root / destination(pack)).read_bytes(), OLD)
+            self.assertEqual(self.owner.resource_pack_version(pack), SOURCE)
+
+    def test_incremental_exact_space_is_allowed(self):
+        with patch.object(self.owner, "available_disk_space", return_value=2 * len(NEW)):
+            self.assertTrue(self.owner.download_incremental())
+        self.assertTrue(self.read_json(PLAN)["ready"])
+
+    def test_incremental_force_allows_download_but_keeps_game_unchanged(self):
+        with patch.object(self.owner, "available_disk_space", return_value=0):
+            self.assertTrue(self.owner.download_incremental(force_space=True))
+        self.assertTrue(self.read_json(PLAN)["ready"])
+        self.assertEqual((self.root / destination("common")).read_bytes(), OLD)
+        self.assertEqual((self.root / destination("uhd")).read_bytes(), OLD)
+
+    def test_incremental_force_still_rejects_bad_md5(self):
+        self.server.payloads[f"/files/{destination('common')}"] = b"x" * len(NEW)
+        with patch.object(self.owner, "available_disk_space", return_value=0):
+            with self.assertRaises(WWError):
+                self.owner.download_incremental(force_space=True)
+        self.assertFalse(self.read_json(PLAN)["ready"])
+        self.assertEqual(self.owner.resource_pack_version("common"), SOURCE)
+
+    def test_ready_incremental_cache_requires_no_space(self):
+        self.assertTrue(self.updater.download())
+        self.server.requested.clear()
+        with patch.object(self.owner, "available_disk_space", return_value=0):
+            self.assertTrue(self.updater.download())
+        self.assertEqual(self.server.requested, [])
+
+    def test_new_version_repair_refuses_before_download_and_force_can_repair(self):
+        self.assertTrue(self.updater.download())
+        self.assertTrue(self.updater.apply())
+        self.put(destination("common"), OLD)
+        self.server.requested.clear()
+        with patch.object(self.owner, "available_disk_space", return_value=0):
+            with self.assertRaises(DiskSpaceError):
+                self.owner.verify_new_version()
+            self.assertEqual(self.server.requested, [])
+            self.assertEqual((self.root / destination("common")).read_bytes(), OLD)
+            self.assertTrue(self.owner.verify_new_version(force_space=True))
+        self.assertEqual((self.root / destination("common")).read_bytes(), NEW)
+
+    def test_fallback_refuses_before_deleting_staged_cache(self):
+        plan = self.updater._create_plan(None)
+        engine = PackIncrementalManager(self.owner, "uhd", plan["packs"]["uhd"], plan)
+        item = file_item(destination("uhd"))
+        staged = self.put(".ww_manager_cache/partial.pak", b"partial")
+        self.server.requested.clear()
+        with patch.object(self.owner, "available_disk_space", return_value=0):
+            with self.assertRaises(DiskSpaceError):
+                engine._download_full_file_to_stage(item, staged)
+            with self.assertRaises(DiskSpaceError):
+                engine._download_full_file(item, self.root / destination("uhd"))
+        self.assertEqual(staged.read_bytes(), b"partial")
+        self.assertEqual((self.root / destination("uhd")).read_bytes(), OLD)
+        self.assertEqual(self.server.requested, [])
+
+    def test_fallback_force_reaches_download_and_verification(self):
+        plan = self.updater._create_plan(None)
+        engine = PackIncrementalManager(self.owner, "uhd", plan["packs"]["uhd"], plan, force_space=True)
+        with patch.object(self.owner, "available_disk_space", return_value=0):
+            self.assertTrue(engine._download_full_file(file_item(destination("uhd")), self.root / destination("uhd")))
+        self.assertEqual((self.root / destination("uhd")).read_bytes(), NEW)
+
+    def test_global_incremental_checks_space_and_supports_force(self):
+        self.owner.server_type = "global"
+        self.owner._launcher_info = {"default": {"version": TARGET, "config": {
+            "patchConfig": [{"version": SOURCE, "indexFile": "patch/common.json", "baseUrl": "files"}],
+        }}}
+        self.owner._cdn_node = self.url
+        with patch.object(self.owner, "available_disk_space", return_value=0):
+            with self.assertRaises(DiskSpaceError):
+                self.owner.download_incremental()
+            self.assertFalse((self.root / ".incremental_download/indexFile.json").exists())
+            self.assertFalse(any(url.startswith("/files/") for url in self.server.requested))
+            self.assertTrue(self.owner.download_incremental(force_space=True))
+        self.assertEqual((self.root / ".incremental_download/resources" / destination("common")).read_bytes(), NEW)
+
+    def test_patch_transport_size_not_output_size_is_checked(self):
+        diff = b"patch"
+        self.set_index("uhd", {"resource": [file_item("uhd.krpdiff", diff)], "groupInfos": [{
+            "dest": "uhd.krpdiff", "srcFiles": [file_item(destination("uhd"), OLD)],
+            "dstFiles": [file_item(destination("uhd"))],
+        }]})
+        plan = self.updater._create_plan(None)
+        engine = PackIncrementalManager(self.owner, "uhd", plan["packs"]["uhd"], plan)
+        tasks = engine.pending_download_tasks()
+        self.assertEqual(sum(task["size"] for task in tasks), len(diff))
+        self.put(".incremental_download/packs/uhd/uhd.krpdiff", diff)
+        self.assertEqual(engine.pending_download_tasks(), [])
+
+    def test_apply_fallback_checks_space_and_force_can_resume(self):
+        diff = b"patch-transport"
+        self.server.payloads["/files/uhd.krpdiff"] = diff
+        self.set_index("uhd", {"resource": [file_item("uhd.krpdiff", diff)], "groupInfos": [{
+            "dest": "uhd.krpdiff", "srcFiles": [file_item(destination("uhd"), OLD)],
+            "dstFiles": [file_item(destination("uhd"))],
+        }]})
+        self.assertTrue(self.owner.download_incremental())
+        # 模拟 hpatchz 失败，触发完整资源回退，不执行真实外部程序。
+        self.server.requested.clear()
+        with (
+            patch.object(self.owner, "available_disk_space", return_value=0),
+            patch("ww_manager.incremental.check_hpatchz_requirements", return_value=(True, "")),
+            patch("ww_manager.incremental.get_hpatchz_path", return_value=self.root / "fixture-hpatchz"),
+            patch.object(PackIncrementalManager, "_run_hpatchz", return_value=False),
+        ):
+            with self.assertRaises(WWError):
+                self.owner.apply_incremental()
+            self.assertEqual((self.root / destination("uhd")).read_bytes(), OLD)
+            self.assertNotIn(f"/files/{destination('uhd')}", self.server.requested)
+            self.assertTrue((self.root / PLAN).exists())
+            self.assertTrue(self.owner.apply_incremental(force_space=True))
+        self.assertEqual((self.root / destination("uhd")).read_bytes(), NEW)
+        self.assertEqual(self.owner.resource_pack_version("uhd"), TARGET)
+
+    def test_incremental_cli_force_download_and_apply_dispatch(self):
+        for name in ("_auto_install_completion", "setup_logging", "check_pypi_version_silent", "save_app_config"):
+            mocked = patch(f"ww_manager.cli.{name}")
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        with (
+            patch("ww_manager.cli.load_app_config", return_value={"latest_available_version": "999.0"}),
+            patch("ww_manager.cli.get_game_path", return_value=self.root),
+            patch("ww_manager.cli.WGameManager", return_value=self.owner),
+            patch.object(self.owner, "download_incremental", return_value=True) as download,
+            patch.object(self.owner, "apply_incremental", return_value=True) as apply,
+        ):
+            for command in ("incremental", "predownload"):
+                result = CliRunner().invoke(app, [command, "--force"])
+                self.assertEqual(result.exit_code, 0, result.output)
+                download.assert_called_with(config_url=None, force_space=True)
+                result = CliRunner().invoke(app, [command, "--apply", "--force"], input="y\n")
+                self.assertEqual(result.exit_code, 0, result.output)
+                apply.assert_called_with(force_space=True)
 
     def test_incremental_cli_routes_config_and_does_not_request_resource_after_apply(self):
         for name in ("_auto_install_completion", "setup_logging", "check_pypi_version_silent", "save_app_config"):

@@ -31,7 +31,15 @@ from ww_manager.config import (
     SERVER_DIFF_CACHE_VERSION,
     parse_major_minor,
 )
-from ww_manager.download import create_download_progress, download_single_file
+from ww_manager.download import (
+    DownloadSpaceError,
+    available_disk_space,
+    check_space_requirement,
+    create_download_progress,
+    download_single_file,
+    format_bytes,
+    space_shortage,
+)
 from ww_manager.incremental import (
     IncrementalError,
     IncrementalManager,
@@ -78,6 +86,10 @@ class NetworkError(WWError):
     """网络相关错误"""
 
     pass
+
+
+class DiskSpaceError(WWError):
+    """下载前确认目标文件系统空间不足。"""
 
 
 class ConfigError(WWError):
@@ -292,7 +304,7 @@ class WGameManager:
                         logger.debug("文件下载失败，详情见下载器错误")
         return failed
 
-    def sync_files(self, force_check_md5=False, tier: Optional[str] = None):
+    def sync_files(self, force_check_md5=False, tier: Optional[str] = None, force_space: bool = False):
         tier = self._validate_tier(tier) if tier is not None else self.current_resource_tier()
         if self.server_type == "global" and tier != "hd":
             raise ConfigError("国际服暂仅支持 HD 档位")
@@ -370,6 +382,9 @@ class WGameManager:
                     progress.update(verify_task, description=f"[cyan]校验中: {file_name}[/cyan]")
                     progress.advance(verify_task)
 
+        # 组合安装在写入基础资源前检查公共文件与所选档位的合计需求。
+        tier_tasks = self._resource_download_tasks(tier, prepared, force_check_md5) if prepared else []
+        self._check_download_space(tasks + tier_tasks, force_space)
         if tasks:
             for pack in ("common", "hd") if tier == "hd" else ("common",):
                 self._record_resource_pack(
@@ -394,7 +409,7 @@ class WGameManager:
         self.md5_cache.save()
         if prepared:
             try:
-                self._install_resource_tier(tier, prepared, force_check_md5)
+                self._install_resource_tier(tier, prepared, force_check_md5, force_space=force_space)
             except NetworkError as e:
                 raise NetworkError(f"组合安装未完成，请重跑原 download/sync 命令续传: {e}") from e
         if tier == "hd" and any(
@@ -628,16 +643,93 @@ class WGameManager:
         tier: str,
         config_url: Optional[str] = None,
         force_check_md5: bool = False,
+        force_space: bool = False,
     ) -> None:
-        """下载并验证档位基础包；缓存仅省略未变化文件的重复哈希。"""
+        """下载并验证档位基础包；force_space 只绕过空间检查。"""
         tier = self._validate_tier(tier)
         prepared = self._prepare_resource_tier(tier, config_url)
-        self._install_resource_tier(tier, prepared, force_check_md5)
+        self._install_resource_tier(tier, prepared, force_check_md5, force_space=force_space)
 
-    def _prepare_resource_tier(self, tier: str, config_url: Optional[str] = None) -> dict:
+    def available_disk_space(self) -> Optional[int]:
+        """读取目标目录所在文件系统；未建目录时检查最近的现有父目录。"""
+        return available_disk_space(self.game_folder)
+
+    @staticmethod
+    def format_bytes(size: int) -> str:
+        return format_bytes(size)
+
+    def space_shortage(self, required: int, free: Optional[int]) -> Optional[str]:
+        return space_shortage(required, free)
+
+    def _check_download_space(self, tasks: List[dict], force_space: bool = False) -> None:
+        if not tasks:
+            return
+        try:
+            check_space_requirement(tasks, self.available_disk_space(), force_space)
+        except DownloadSpaceError as e:
+            raise DiskSpaceError(str(e)) from e
+
+    def _resource_download_tasks(
+        self, tier: str, prepared: dict, force_check_md5: bool = False, *, cache: Optional[MD5Cache] = None,
+    ) -> List[dict]:
+        if cache is None:
+            cache = MD5Cache(self._managed_path(f"wwm_md5_cache_resource_{tier}.json"), self.game_folder)
+        tasks = []
+        for item in prepared["resources"]:
+            path = self._managed_path(item["dest"])
+            if force_check_md5:
+                cache.clear(path)
+            valid = path.is_file() and path.stat().st_size == item["size"] and cache.get(path) == item["md5"]
+            if not valid:
+                source = f"{prepared['base'].strip('/')}/{item['source']}"
+                tasks.append({
+                    "url": quote(urljoin(prepared["cdn"], source), safe=":/"),
+                    "path": path, "size": item["size"], "md5": item["md5"],
+                })
+        return tasks
+
+    def _tier_is_current(self, tier: str, version: str) -> bool:
+        state = next(s for s in self.resource_tier_status() if s["tier"] == tier)
+        return state["state"] == "已安装" and state["version"] == version
+
+    def resource_menu_data(self) -> List[dict]:
+        """只读获取官方清单与本地情况；不保存哈希缓存或改变安装记录。"""
+        bundle = self.get_bundle_config()
+        logger.info("正在读取各档位清单与本地文件，首次可能需要一些时间...")
+        states = {s["tier"]: s for s in self.resource_tier_status()}
+        rows = []
+        for tier in ("sd", "hd", "uhd"):
+            state = states[tier]
+            try:
+                prepared = self._prepare_resource_tier(tier, bundle=bundle)
+                installed = self._tier_is_current(tier, prepared["version"])
+                tasks = [] if installed else self._resource_download_tasks(tier, prepared)
+                rows.append({
+                    **state, "installed": installed, "prepared": prepared,
+                    "total_size": sum(i["size"] for i in prepared["resources"]),
+                    "download_size": sum(t["size"] for t in tasks), "error": None,
+                })
+            except (WWError, OSError) as e:
+                rows.append({**state, "installed": False, "prepared": None, "error": str(e)})
+        return rows
+
+    def select_resource_tier(self, tier: str, prepared: dict, force_space: bool = False) -> None:
+        """菜单确认：同版本完整登记仅切换默认；其它情况校验、修复后选定。"""
+        tier = self._validate_tier(tier)
+        if self._tier_is_current(tier, prepared["version"]):
+            state = self._read_resource_state()
+            state["active_tier"] = tier
+            self._write_local_json("wwm_resource_state.json", state)
+            logger.info(f"已选定 {tier.upper()} 默认档位（未重复校验）；游戏仍需以 -krqlv={tier} 启动")
+        else:
+            self._install_resource_tier(tier, prepared, force_space=force_space)
+
+    def _prepare_resource_tier(
+        self, tier: str, config_url: Optional[str] = None, *, bundle: Optional[dict] = None,
+    ) -> dict:
         """只读预检，组合安装须在公共文件下载前确认画质清单有效。"""
         self._read_resource_state()
-        bundle = self.get_bundle_config(config_url)
+        bundle = self.get_bundle_config(config_url) if bundle is None else bundle
         if not isinstance(bundle, dict):
             raise ConfigError("资源档位配置必须为 JSON 对象")
         packs = bundle.get("resourcePacks") or {}
@@ -649,6 +741,8 @@ class WGameManager:
         if tier not in packs:
             raise ConfigError(f"当前渠道不提供 {tier} 档位包，可用: {', '.join(packs) or '无'}")
         pack = packs[tier]
+        if not isinstance(pack, dict):
+            raise ConfigError("档位配置必须为 JSON 对象")
         try:
             version = pack["version"]
             base = pack["baseUrl"]
@@ -670,28 +764,17 @@ class WGameManager:
         self._managed_path(f"wwm_md5_cache_resource_{tier}.json")
         return {"bundle": bundle, "version": version, "resources": resources, "cdn": cdn, "base": base}
 
-    def _install_resource_tier(self, tier: str, prepared: dict, force_check_md5: bool = False) -> None:
+    def _install_resource_tier(
+        self, tier: str, prepared: dict, force_check_md5: bool = False, *, force_space: bool = False,
+    ) -> None:
         bundle, version = prepared["bundle"], prepared["version"]
-        resources, cdn, base = prepared["resources"], prepared["cdn"], prepared["base"]
+        resources = prepared["resources"]
         cfg = self._read_local_config()
         cache_path = self._managed_path(f"wwm_md5_cache_resource_{tier}.json")
         cache = MD5Cache(cache_path, self.game_folder)
-        tasks = []
         logger.info(f"正在校验 {tier.upper()} v{version}: {len(resources)} 个文件")
-        for item in resources:
-            path = self._managed_path(item["dest"])
-            if force_check_md5:
-                cache.clear(path)
-            valid = path.is_file() and path.stat().st_size == item["size"] and cache.get(path) == item["md5"]
-            if not valid:
-                tasks.append(
-                    {
-                        "url": quote(urljoin(cdn, f"{base.strip('/')}/{item['source']}"), safe=":/"),
-                        "path": path,
-                        "size": item["size"],
-                        "md5": item["md5"],
-                    }
-                )
+        tasks = self._resource_download_tasks(tier, prepared, force_check_md5, cache=cache)
+        self._check_download_space(tasks, force_space)
         self.game_folder.mkdir(parents=True, exist_ok=True)
         if tasks:
             # 正式文件即将改变，旧安装标记不能继续宣称该档位完整。
@@ -896,15 +979,15 @@ class WGameManager:
         if removed:
             logger.info(f"清理完成: 共删除 {len(removed)} 个已废弃文件")
 
-    def download_full(self, tier: str = "hd"):
+    def download_full(self, tier: str = "hd", force_space: bool = False):
         """按显式档位初始化，成功后记住选择供后续同步使用。"""
         tier = self._validate_tier(tier)
         logger.info(f"准备下载 {self.server_type} 服 {tier.upper()} 客户端到: {self.game_folder}")
-        self.sync_files(force_check_md5=False, tier=tier)
+        self.sync_files(force_check_md5=False, tier=tier, force_space=force_space)
 
         logger.info(f"{self.server_type} 服完整客户端下载完毕！")
 
-    def checkout(self, target_server: str, force_sync: bool = False):
+    def checkout(self, target_server: str, force_sync: bool = False, force_space: bool = False):
         """切换服务器。
 
         官服/B服适用"差异缓存"切换：
@@ -940,16 +1023,16 @@ class WGameManager:
             logger.info(f"当前已在 {dst} 服，无需切换差异文件")
             if force_sync:
                 logger.info("检测到强制同步，执行全量校验同步...")
-                self.sync_files(force_check_md5=True)
+                self.sync_files(force_check_md5=True, force_space=force_space)
             self._update_local_config()
             return
 
         if participate and not force_sync:
-            self._checkout_via_cache(src, dst, src_ctx, dst_ctx)
+            self._checkout_via_cache(src, dst, src_ctx, dst_ctx, force_space=force_space)
         else:
             label = "非差异缓存适用(国际服)" if not participate else "强制同步"
             logger.info(f"{src} -> {dst}: {label}，执行全量校验同步...")
-            self.sync_files(force_check_md5=True)
+            self.sync_files(force_check_md5=True, force_space=force_space)
             self._update_local_config()
 
     # 差异缓存
@@ -1020,14 +1103,24 @@ class WGameManager:
                 same.append(d)
         return same, diff_or_new, only_src
 
-    def _checkout_via_cache(self, src: str, dst: str, src_ctx, dst_ctx) -> None:
+    def _checkout_via_cache(self, src: str, dst: str, src_ctx, dst_ctx, *, force_space: bool = False) -> None:
         same, diff_or_new, only_src = self._compute_diff_sets(src_ctx["resource"], dst_ctx["resource"])
 
         # 大版本更新判定：major.minor 变化则重置清空差异缓存
         major = parse_major_minor(dst_ctx["version"])
         manifest = self._load_cache_manifest()
         cached_major = tuple(manifest.get("major_minor") or ())
-        if major and cached_major and tuple(major) != cached_major:
+        reset_cache = bool(major and cached_major and tuple(major) != cached_major)
+        dst_map = {item["dest"]: item for item in dst_ctx["resource"]}
+        pending = []
+        for dest in diff_or_new:
+            item = dst_map[dest]
+            cache = self._server_cache_path(dst, dest)
+            if reset_cache or self._safe_md5(cache) != item["md5"]:
+                pending.append({"path": self.game_folder / _resource_rel_path(dest), "size": int(item["size"])})
+        # 在清缓存、备份或恢复第一个游戏文件之前拒绝明显不足的下载。
+        self._check_download_space(pending, force_space)
+        if reset_cache and major is not None:
             logger.info(
                 f"检测到大版本更新 {'.'.join(map(str, cached_major))} -> {'.'.join(map(str, major))}，重置差异缓存..."
             )
@@ -1055,7 +1148,7 @@ class WGameManager:
                 to_download.append((d, item["size"], item["md5"]))
 
         # 2) 下载缺失/失效的目标服版本并回填缓存
-        downloaded = self._download_diff_dst(dst, to_download, dst_ctx)
+        downloaded = self._download_diff_dst(dst, to_download, dst_ctx, force_space=force_space)
 
         # 3) 隔离仅源服存在的文件（备份到缓存后从游戏目录移除）
         for d in only_src:
@@ -1141,7 +1234,7 @@ class WGameManager:
         self.md5_cache.clear(game_path)
         logger.debug(f"已隔离仅{src}存在的文件: {dest}")
 
-    def _download_diff_dst(self, dst: str, to_download, dst_ctx) -> int:
+    def _download_diff_dst(self, dst: str, to_download, dst_ctx, *, force_space: bool = False) -> int:
         """下载目标服差异文件到游戏目录并回填缓存。to_download: (dest, size, md5)。"""
         if not to_download:
             return 0
@@ -1161,6 +1254,7 @@ class WGameManager:
                 }
             )
 
+        self._check_download_space(tasks, force_space)
         if self._batch_download(tasks):
             raise NetworkError("差异资源下载失败，未登记服务器切换；请重试")
 
@@ -1185,7 +1279,7 @@ class WGameManager:
                 self._record_resource_pack("hd", v)
             logger.info(f"本地配置已更新: {self.server_type} ({v})")
 
-    def apply_incremental_update(self, dry_run: bool = False) -> bool:
+    def apply_incremental_update(self, dry_run: bool = False, force_space: bool = False) -> bool:
         """旧接口保留，调用新的统一管理器"""
         is_ok, error_msg = check_hpatchz_requirements()
         if not is_ok:
@@ -1201,6 +1295,8 @@ class WGameManager:
             self.server_type,
             self.launcher_info,
             self.cdn_node,
+            force_space=force_space,
+            space_check=self._check_download_space,
         )
 
         try:
@@ -1209,19 +1305,21 @@ class WGameManager:
             logger.error(f"增量更新失败: {e}")
             return False
 
-    def download_incremental(self, config_url: Optional[str] = None) -> bool:
+    def download_incremental(self, config_url: Optional[str] = None, force_space: bool = False) -> bool:
         """统一下载 common + 当前档位，未开放的分包渠道不降级到 HD。"""
         from .resource_updates import ResourceUpdater
 
         updater = ResourceUpdater(self)
         if self.server_type != "global" or updater.has_pending_plan():
-            return updater.download(config_url)
+            return updater.download(config_url, force_space=force_space)
         logger.info("国际服使用默认 HD 基础增量")
         manager = IncrementalManager(
             self.game_folder,
             self.server_type,
             self.launcher_info,
             self.cdn_node,
+            force_space=force_space,
+            space_check=self._check_download_space,
         )
         try:
             return manager.download_incremental()
@@ -1229,13 +1327,13 @@ class WGameManager:
             logger.error(f"增量包下载失败: {e}")
             return False
 
-    def apply_incremental(self) -> bool:
-        """应用已固定的分包更新计划，应用阶段不重新选择线上目标。"""
+    def apply_incremental(self, force_space: bool = False) -> bool:
+        """应用已固定的分包更新计划；回退下载也检查空间。"""
         from .resource_updates import ResourceUpdater
 
         updater = ResourceUpdater(self)
         if updater.has_pending_plan():
-            return updater.apply()
+            return updater.apply(force_space=force_space)
         if self.current_resource_tier() != "hd":
             raise ConfigError("未找到当前档位的分包更新计划，请先运行 ww incremental")
         manager = IncrementalManager(
@@ -1243,6 +1341,8 @@ class WGameManager:
             self.server_type,
             self.launcher_info,
             self.cdn_node,
+            force_space=force_space,
+            space_check=self._check_download_space,
         )
         try:
             success = manager.apply_incremental()
@@ -1256,13 +1356,13 @@ class WGameManager:
             logger.error(f"增量更新应用失败: {e}")
             return False
 
-    def verify_new_version(self) -> bool:
-        """校验已应用更新的文件，不混用其它档位索引。"""
+    def verify_new_version(self, force_space: bool = False) -> bool:
+        """校验并修复已应用更新的文件，不混用其它档位索引。"""
         from .resource_updates import HISTORY, ResourceUpdater
 
         updater = ResourceUpdater(self)
         if updater.has_pending_plan() or self._managed_path(HISTORY).is_file():
-            return updater.verify()
+            return updater.verify(force_space=force_space)
         if self.current_resource_tier() != "hd":
             raise ConfigError("没有所选档位的分包更新记录，请使用 ww resource <tier> 全量校验")
         manager = IncrementalManager(
@@ -1270,6 +1370,8 @@ class WGameManager:
             self.server_type,
             self.launcher_info,
             self.cdn_node,
+            force_space=force_space,
+            space_check=self._check_download_space,
         )
         try:
             return manager.verify_new_version()

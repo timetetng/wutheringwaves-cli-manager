@@ -14,12 +14,14 @@ from typing import Optional
 from urllib.request import Request, urlopen
 
 import typer
+from prompt_toolkit.application import Application
 from rich.console import Console
 from rich.table import Table
 from typing_extensions import Annotated
 
 from ww_manager.config import APPID_TO_SERVER, load_app_config, save_app_config
 from ww_manager.core import WGameManager, WWError, decrypt_client_log, is_log_encrypted
+from ww_manager.menu import MenuOption, MenuShortcut, build_selection_menu
 
 __version__ = metadata.version("ww-manager")
 
@@ -109,7 +111,7 @@ def get_game_path(ctx: typer.Context) -> Path:
         typer.secho("错误: 未设置游戏路径。请使用 --path 指定。", fg="red")
         raise typer.Exit(1)
     if not p.exists():
-        if ctx.invoked_subcommand != "download":
+        if ctx.invoked_subcommand != "download" and ctx.info_name != "download":
             typer.secho(f"错误: 路径不存在 {p}", fg="red")
             raise typer.Exit(1)
     return p
@@ -280,6 +282,7 @@ def status(ctx: typer.Context):
 @app.command()
 def sync(
     ctx: typer.Context,
+    force: Annotated[bool, typer.Option("--force", help="仅绕过下载空间检查，不跳过文件校验")] = False,
     check_new: Annotated[bool, typer.Option("--new", help="校验并修复新版本文件状态（用于增量更新应用后）")] = False,
 ):
     """全量校验并修复文件"""
@@ -295,49 +298,162 @@ def sync(
     try:
         mgr = WGameManager(path, server)
         if check_new:
-            success = mgr.verify_new_version()
+            success = mgr.verify_new_version(force_space=force)
             if not success:
                 typer.secho("校验发现问题，请根据提示处理", fg="yellow")
                 raise typer.Exit(1)
         else:
-            mgr.sync_files(force_check_md5=True)
+            mgr.sync_files(force_check_md5=True, force_space=force)
         mgr.remind_resource_tiers()
     except WWError as e:
         typer.secho(f"执行失败: {e}", fg="red")
         raise typer.Exit(1)
 
 
+def _run_menu(application: Application[Optional[MenuOption]]) -> Optional[MenuOption]:
+    try:
+        return application.run()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+def _local_server(path: Path) -> Optional[str]:
+    try:
+        data = json.loads((path / "launcherDownloadConfig.json").read_text(encoding="utf-8"))
+        return APPID_TO_SERVER.get(str(data.get("appId", ""))) if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _select_server(path: Path, *, title: str) -> Optional[ServerType]:
+    names = {"cn": "官服", "bilibili": "哔哩哔哩服", "global": "国际服"}
+    selected = _run_menu(build_selection_menu(
+        [MenuOption(key, f"{key} · {name}") for key, name in names.items()],
+        _local_server(path), title=title, current_label="当前服务器",
+    ))
+    return ServerType(selected.key) if selected is not None else None
+
+
+def _confirm_resource_removal(manager: WGameManager, tier: str) -> bool:
+    directory = manager.game_folder / "Client" / "Content" / tier.upper()
+    try:
+        return typer.confirm(
+            f"确定删除 {tier.upper()} · {TIER_NAMES[tier]} 档位吗？\n目录：{directory}\n"
+            "将删除该目录内所有文件（包括自行放置的文件）、该档位缓存及安装登记。\n"
+            "若为当前默认档位，也将清除默认选择；其它档位与公共资源保留。",
+            default=False,
+        )
+    except (typer.Abort, EOFError, KeyboardInterrupt):
+        return False
+
+
 @app.command()
 def download(
     ctx: typer.Context,
-    server: Annotated[ServerType, typer.Argument(help="目标服务器，默认官服")] = ServerType.cn,
+    server: Annotated[Optional[ServerType], typer.Argument(help="目标服务器；省略进入服务器与档位菜单")] = None,
     tier: Annotated[str, typer.Argument(help="画质档位: hd / sd / uhd，默认 HD")] = "hd",
+    force: Annotated[bool, typer.Option("--force", help="仅绕过磁盘空间不足检查，不跳过文件校验")] = False,
 ):
-    """[初始化] 下载指定档位的完整客户端，并记住档位用于后续更新"""
+    """[初始化] 下载完整客户端；无参数依次选择服务器和资源档位"""
     path = get_game_path(ctx)
     try:
+        if server is None:
+            if not _interactive_terminal():
+                raise WWError("非交互环境请指定服务器和档位，例如 ww download bilibili HD")
+            server = _select_server(path, title="下载客户端 · 1/2 选择服务器")
+            if server is None:
+                return
+            choice = _run_menu(build_selection_menu(
+                [MenuOption(
+                    key, f"{key.upper()} · {name}",
+                    blocked_reason="国际服暂仅支持默认 HD"
+                    if server == ServerType.global_server and key != "hd" else None,
+                ) for key, name in TIER_NAMES.items()],
+                "hd", title=f"下载客户端 · 2/2 选择资源档位 · {server.value}", current_label="默认下载",
+            ))
+            if choice is None:
+                return
+            tier = choice.key
         mgr = WGameManager(path, server.value)
-        mgr.download_full(tier=tier)
+        mgr.download_full(tier=tier, force_space=force)
         mgr.remind_resource_tiers()
-    except WWError as e:
+    except (WWError, OSError) as e:
         typer.secho(f"下载失败: {e}", fg="red")
         raise typer.Exit(1)
+
+
+def run_resource_menu(manager: WGameManager, *, force_space: bool = False) -> None:
+    """展示档位；删除动作经额外确认后执行并刷新菜单。"""
+    focused_key = None
+    while True:
+        rows = manager.resource_menu_data()
+        free = manager.available_disk_space()
+        options = []
+        for row in rows:
+            tier = row["tier"]
+            if row["error"]:
+                description = "× 暂不可用"
+                details = "大小未知（无法获取有效清单）"
+                blocked = row["error"]
+            else:
+                version = row["prepared"]["version"]
+                description = (
+                    f"✓ 已安装 · v{version}" if row["installed"]
+                    else f"× {row['state']} · 目标 v{version}"
+                )
+                if row["state"] == "已安装" and not row["installed"]:
+                    description = f"× 需更新 · v{row['version']} → v{version}"
+                details = (
+                    f"完整包 {row['total_size'] / 1024**3:.2f} GiB"
+                    f" · 本次下载 {row['download_size'] / 1024**3:.2f} GiB"
+                )
+                blocked = None if force_space else manager.space_shortage(row["download_size"], free)
+            options.append(MenuOption(
+                key=tier, label=f"{tier.upper()} · {TIER_NAMES[tier]}", description=description,
+                details=details, blocked_reason=blocked,
+                description_style="fg:ansigreen bold" if row["installed"] else "fg:ansired bold",
+            ))
+        space = f"{free / 1024**3:.2f} GiB" if free is not None else "未知（无法检查）"
+        subtitle = f"可用空间 {space} · 不计解压与预留空间"
+        if force_space:
+            subtitle += " · --force 已绕过空间拦截"
+        current = manager._read_resource_state()["active_tier"]
+        selected = _run_menu(build_selection_menu(
+            options, current, title="画质档位", subtitle=subtitle, initial_key=focused_key,
+            shortcuts=[MenuShortcut("d", "删除高亮档位", "remove")],
+        ))
+        if selected is None:
+            return
+        if selected.action == "remove":
+            focused_key = selected.key
+            if _confirm_resource_removal(manager, selected.key):
+                manager.remove_resource_tier(selected.key)
+            continue
+        row = next(row for row in rows if row["tier"] == selected.key)
+        manager.select_resource_tier(selected.key, row["prepared"], force_space=force_space)
+        return
+
+
+def _interactive_terminal() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
 
 
 @app.command()
 def resource(
     ctx: typer.Context,
-    tier: Annotated[Optional[str], typer.Argument(help="资源档位: sd 标清 / hd 高清 / uhd 极致；省略查看列表")] = None,
+    tier: Annotated[Optional[str], typer.Argument(help="资源档位: sd 标清 / hd 高清 / uhd 极致；省略打开选择菜单")] = None,
     config_url: Annotated[
         Optional[str],
         typer.Option("--config-url", help="覆盖自动获取的官方画质配置地址（通常无需指定）"),
     ] = None,
     force_md5: Annotated[bool, typer.Option("--force-md5", help="忽略 MD5 缓存，重新计算所有文件哈希")] = False,
     remove: Annotated[bool, typer.Option("--remove", help="确认后删除该档位目录、缓存和安装登记")] = False,
+    force: Annotated[bool, typer.Option("--force", help="仅绕过磁盘空间不足检查，不跳过文件校验")] = False,
 ):
     """查看、安装、校验或删除画质档位
 
-    不带档位时只读展示本地安装记录，不进行实时文件校验。
+    不带档位时进入菜单；非交互终端仅展示本地安装记录。
+    菜单中已安装且版本匹配的档位直接选定，不重复校验。
     指定档位后校验并修复，游戏需以 -krqlv=<tier> 启动。
     --remove 经确认后删除所选档位目录、缓存与安装记录。
     """
@@ -355,6 +471,9 @@ def resource(
         if tier is None:
             if remove or force_md5 or config_url is not None:
                 raise WWError("使用操作选项时须指定档位，例如 ww resource hd --force-md5")
+            if _interactive_terminal():
+                run_resource_menu(mgr, force_space=force)
+                return
             table = Table(box=None, padding=(0, 2))
             for heading in ("档位", "安装情况", "版本", "默认"):
                 table.add_column(heading)
@@ -371,14 +490,13 @@ def resource(
             console.print("本地安装记录；校验并修复：ww resource <tier>", style="dim", markup=False)
         elif remove:
             tier = mgr._validate_tier(tier)
-            typer.confirm(
-                f"确定删除 {tier.upper()} 档位吗？这将删除 Client/Content/{tier.upper()}/ "
-                "内所有文件（包括自行放置的文件）、该档位缓存及安装登记；不会删除其它档位。",
-                abort=True,
-            )
+            if not _confirm_resource_removal(mgr, tier):
+                raise typer.Abort()
             mgr.remove_resource_tier(tier)
         else:
-            mgr.download_resource_tier(tier, config_url=config_url, force_check_md5=force_md5)
+            mgr.download_resource_tier(
+                tier, config_url=config_url, force_check_md5=force_md5, force_space=force,
+            )
     except (WWError, OSError) as e:
         typer.secho(f"执行失败: {e}", fg="red")
         raise typer.Exit(1)
@@ -387,14 +505,21 @@ def resource(
 @app.command()
 def checkout(
     ctx: typer.Context,
-    server: ServerType,
+    server: Annotated[Optional[ServerType], typer.Argument(help="目标服务器；省略进入选择菜单")] = None,
     force_sync: Annotated[bool, typer.Option("--force-sync", help="切换后强制同步")] = False,
+    force: Annotated[bool, typer.Option("--force", help="仅绕过下载空间检查，不跳过文件校验")] = False,
 ):
-    """切换服务器"""
+    """切换服务器；无参数进入服务器选择菜单"""
     path = get_game_path(ctx)
     try:
+        if server is None:
+            if not _interactive_terminal():
+                raise WWError("非交互环境请指定服务器，例如 ww checkout bilibili")
+            server = _select_server(path, title="切换服务器")
+            if server is None:
+                return
         mgr = WGameManager(path, server.value)
-        mgr.checkout(server.value, force_sync=force_sync)
+        mgr.checkout(server.value, force_sync=force_sync, force_space=force)
         mgr.remind_resource_tiers()
     except WWError as e:
         typer.secho(f"切换失败: {e}", fg="red")
@@ -406,6 +531,7 @@ def _run_incremental(
     action: Optional[str],
     apply_flag: bool,
     config_url: Optional[str] = None,
+    force_space: bool = False,
 ):
     """增量更新核心逻辑（下载增量包 / 应用增量更新）。
 
@@ -434,14 +560,14 @@ def _run_incremental(
             typer.confirm(
                 "确定要应用增量更新吗？\n这将会修改现有的游戏文件，请确保游戏目前已维护或更新完毕。", abort=True
             )
-            success = mgr.apply_incremental()
+            success = mgr.apply_incremental(force_space=force_space)
             if success:
                 typer.secho("增量更新应用成功！", fg="green")
             else:
                 typer.secho("增量更新应用失败", fg="red")
                 raise typer.Exit(1)
         else:
-            success = mgr.download_incremental(config_url=config_url)
+            success = mgr.download_incremental(config_url=config_url, force_space=force_space)
             if success:
                 typer.secho("增量更新资源下载完成！之后可使用 'apply' 命令应用更新。", fg="green")
             else:
@@ -456,6 +582,7 @@ def _run_incremental(
 @app.command()
 def predownload(
     ctx: typer.Context,
+    force: Annotated[bool, typer.Option("--force", help="仅绕过下载空间检查，不跳过文件校验")] = False,
     action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
     apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
     config_url: Annotated[
@@ -468,12 +595,13 @@ def predownload(
     预下载开放期间执行下载增量包，维护后应用合并补丁；新版本开启后也可直接用于增量更新。
     用法：ww predownload 下载增量包，ww predownload --apply 应用更新。
     """
-    _run_incremental(ctx, action, apply_flag, config_url)
+    _run_incremental(ctx, action, apply_flag, config_url, force_space=force)
 
 
 @app.command()
 def incremental(
     ctx: typer.Context,
+    force: Annotated[bool, typer.Option("--force", help="仅绕过下载空间检查，不跳过文件校验")] = False,
     action: Annotated[Optional[str], typer.Argument(help="输入 'apply' 以应用已下载的增量包")] = None,
     apply_flag: Annotated[bool, typer.Option("--apply", help="应用已下载的增量包")] = False,
     config_url: Annotated[
@@ -485,7 +613,7 @@ def incremental(
 
     用法与 ww predownload 一致：下载增量包，应用时使用 'apply'。
     """
-    _run_incremental(ctx, action, apply_flag, config_url)
+    _run_incremental(ctx, action, apply_flag, config_url, force_space=force)
 
 
 @app.command()

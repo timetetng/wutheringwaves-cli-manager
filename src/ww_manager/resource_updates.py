@@ -21,7 +21,7 @@ def _digest(data: Dict) -> str:
 class PackIncrementalManager(IncrementalManager):
     """给现有引擎绑定独立包的版本、配置和缓存，禁止写主版本。"""
 
-    def __init__(self, owner: WGameManager, name: str, entry: Dict, plan: Dict):
+    def __init__(self, owner: WGameManager, name: str, entry: Dict, plan: Dict, *, force_space: bool = False):
         self.owner = owner
         self.pack_name = name
         self.entry = entry
@@ -33,7 +33,8 @@ class PackIncrementalManager(IncrementalManager):
             owner._managed_path(f".incremental_download/packs/{name}/{metadata}")
         owner._managed_path(f".ww_manager_cache/packs/{name}/indexFile.json")
         super().__init__(
-            owner.game_folder, owner.server_type, {"default": {"config": entry["config"]}}, plan["cdn"], name
+            owner.game_folder, owner.server_type, {"default": {"config": entry["config"]}}, plan["cdn"], name,
+            force_space=force_space, space_check=owner._check_download_space,
         )
         self._index_file = entry.get("index")
 
@@ -280,18 +281,26 @@ class ResourceUpdater:
             raise ConfigError("没有可用分包更新：预下载尚未开放或当前版本已是最新，未创建更新计划")
         return plan
 
-    def download(self, config_url: Optional[str] = None) -> bool:
+    def download(self, config_url: Optional[str] = None, *, force_space: bool = False) -> bool:
         try:
             # 已有计划按原目标续传，避免预下载维护前后线上配置改变导致缓存串用。
             plan = self._read_plan() if self.has_pending_plan() else self._create_plan(config_url)
             self._validate_sources(plan)
-            self.owner._write_local_json(PLAN, plan)
+            engines = []
+            pending = []
             for name in ("common", plan["tier"]):
                 entry = plan["packs"][name]
                 if self.owner.resource_pack_version(name) == entry["to_version"]:
                     continue
+                engine = PackIncrementalManager(self.owner, name, entry, plan, force_space=force_space)
+                pending.extend(engine.pending_download_tasks())
+                engines.append(engine)
+            self.owner._check_download_space(pending, force_space)
+            self.owner._write_local_json(PLAN, plan)
+            for engine in engines:
+                name, entry = engine.pack_name, engine.entry
                 logger.info(f"下载 {name}: {entry['from_version']} → {entry['to_version']}")
-                if not PackIncrementalManager(self.owner, name, entry, plan).download_incremental():
+                if not engine.download_incremental():
                     raise NetworkError(f"{name} 下载失败，游戏未更新；重跑 ww incremental 可续传")
             plan["ready"] = True
             self.owner._write_local_json(PLAN, plan)
@@ -307,7 +316,7 @@ class ResourceUpdater:
             if entry["from_version"] != entry["to_version"]:
                 PackIncrementalManager(self.owner, name, entry, plan).validate_index(entry["index"])
 
-    def apply(self) -> bool:
+    def apply(self, *, force_space: bool = False) -> bool:
         try:
             plan = self._read_plan()
             if not plan.get("ready"):
@@ -317,7 +326,7 @@ class ResourceUpdater:
             for name, entry in plan["packs"].items():
                 if self.owner.resource_pack_version(name) == entry["to_version"]:
                     continue
-                engine = PackIncrementalManager(self.owner, name, entry, plan)
+                engine = PackIncrementalManager(self.owner, name, entry, plan, force_space=force_space)
                 directory = engine.download_dir
                 info = json.loads((directory / "version_info.json").read_text(encoding="utf-8"))
                 index = json.loads((directory / "indexFile.json").read_text(encoding="utf-8"))
@@ -340,7 +349,7 @@ class ResourceUpdater:
                 if name != "common":
                     self.owner._unregister_installed_tier(name, self.owner._read_local_config())
                 logger.info(f"应用 {name}: {entry['from_version']} → {entry['to_version']}")
-                if not PackIncrementalManager(self.owner, name, entry, plan).apply_incremental():
+                if not PackIncrementalManager(self.owner, name, entry, plan, force_space=force_space).apply_incremental():
                     raise WWError(f"{name} 应用未完成；主版本未升级，请勿启动游戏，重跑 ww incremental --apply 续作")
             cfg = self.owner._read_local_config()
             cfg.update(
@@ -358,7 +367,7 @@ class ResourceUpdater:
         except (OSError, ValueError, IncrementalError) as e:
             raise WWError(f"分包增量应用失败: {e}；请勿启动游戏，可重跑命令继续") from e
 
-    def verify(self) -> bool:
+    def verify(self, *, force_space: bool = False) -> bool:
         if self.has_pending_plan():
             raise ConfigError("分包更新尚未应用完成；请先运行 ww incremental --apply，再校验新版本")
         plan = self._read_plan(HISTORY)
@@ -369,7 +378,7 @@ class ResourceUpdater:
             if entry["from_version"] == entry["to_version"]:
                 logger.info(f"{name} 此次无更新文件；不等同于全量校验")
                 continue
-            engine = PackIncrementalManager(self.owner, name, entry, plan)
+            engine = PackIncrementalManager(self.owner, name, entry, plan, force_space=force_space)
             engine.validate_index(entry["index"])
             if not entry["index"].get("groupInfos") and not entry["index"].get("resource"):
                 logger.info(f"{name} 此次没有可校验的新文件；不等同于全量校验")

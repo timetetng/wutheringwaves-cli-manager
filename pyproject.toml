@@ -10,6 +10,7 @@ dependencies = [
     "rich",
     "typing-extensions>=4.15.0",
     "requests>=2.31.0",
+    "prompt-toolkit>=3.0.48,<4",
 ]
 
 [project.scripts]
