@@ -13,7 +13,7 @@
 
 本项目只负责客户端的下载、更新和文件管理，不负责启动游戏。启动方式见下方[启动游戏](#启动游戏)。
 
-[English](docs/README.en.md)（尚未同步近期功能）
+[English](docs/README.en.md)
 
 ## 安装
 
