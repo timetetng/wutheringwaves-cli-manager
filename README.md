@@ -1,317 +1,163 @@
-
-<div align="center"><h1>WutheringWaves CLI Manager</h1><h3>鸣潮命令行管理器</h3><div align="center">
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.1-brightgreen.svg" alt="version 2.3.1">
-  <br>
-</div>
-</div>
-
-<div align="center" style="width: 80%;">
-    <div style="display: flex; justify-content: space-between; align-items: flex-start; width: 80%;">
-        <img src="./docs/images/cli-preview.webp" alt="命令帮助预览" style="width: 40%; height: auto;">
-        <img src="./docs/images/download-preview.webp" alt="下载进度预览" style="width: 40%; height: auto;">
-    </div>
+<div align="center">
+  <h1>WutheringWaves CLI Manager</h1>
+  <h3>鸣潮命令行管理器</h3>
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.2-brightgreen.svg" alt="version 2.3.2">
 </div>
 
-专为 Linux 用户打造的《鸣潮》客户端命令行管理工具。
-提供 **完整的下载/校验功能** 与 **服务器差异缓存切换**。官服 (CN)、B 服 (Bilibili) 之间优先复用缓存与共享资源，无需重新下载完整客户端。
+<p align="center">
+  <img src="docs/images/cli-preview.webp" alt="命令帮助预览" width="45%">
+  <img src="docs/images/download-preview.webp" alt="下载进度预览" width="45%">
+</p>
 
-> 🌐 [**English**](./docs/README.en.md)（画质包新功能说明尚未同步）
+鸣潮命令行管理工具，用于下载客户端、更新和修复文件、管理画质资源包及切换服务器。
 
-> **国际服因为包体差异不支持快速切换**。
->
-> 最新版本经过测试，兼容 Windows11。
+本项目只负责客户端的下载、更新和文件管理，不负责启动游戏。启动方式见下方[启动游戏](#启动游戏)。
 
-## ✨ 核心功能
+[English](docs/README.en.md)（尚未同步近期功能）
 
-* **🚀 快速切换 (`checkout`)**：校验并替换官/B 服差异文件，优先复用本地缓存，保留已安装的画质包。
-* **🛠️ 智能修复 (`sync`)**：校验全量文件 MD5，自动修复损坏文件，下载缺失资源。
-* **📦 完整下载 (`download`)**：从零安装指定画质的客户端，默认官服 HD；自动记住档位供后续更新使用。
-* **🎨 画质包管理 (`resource`)**：安装、校验或删除 HD/SD/UHD，官服/B 服共用画质包。
-* **🔥 预下载/增量更新(`predownload`)**: 预下载开放期下载增量包、维护后应用合并补丁；新版本开启后也可直接增量更新。基于官方启动器解包的补丁二进制(见 release），欢迎测试并提交问题。`incremental` 为其别名。
-* **💾 自动记忆**：自动记录游戏路径，一次设置，永久生效。
-* **⚡️ 现代化 CLI**：基于 `Typer` 构建，支持自动补全和帮助信息。
-* **👯 并行下载**: 使用多线程并行下载，避免 CDN 节点降速，支持断点续传。
+## 安装
 
+### uv（推荐）
 
-## 🔧 安装指南
+安装 uv（已安装可跳过）：
 
-本工具支持通过多种方式安装，推荐使用 [**uv**](https://github.com/astral-sh/uv) 进行管理。
+```bash
+# Linux / macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-###  AUR
+```powershell
+# Windows PowerShell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+安装后重新打开终端，再安装本工具：
+
+```bash
+uv tool install ww-manager
+```
+
+### AUR
 
 ```bash
 yay -S ww-manager
 ```
 
----
+### 源码安装
 
-### 🚀 使用 uv
+需要 Git 和 uv：
 
-#### 1. 安装 uv
-
-* **Linux / macOS:**
-    ```bash
-    curl -LsSf https://astral.sh/uv/install.sh | sh
-    ```
-* **Windows:**
-    ```pwsh
-    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-    ```
-
->  **提示**：安装完成后，请**重启终端**以使环境变量生效。
-
-#### 2. 安装工具
-
-* 方式一：从 PyPI 安装 （推荐）
-```bash
-uv tool install ww-manager
-```
-
-* 方式二：从本地源码构建
 ```bash
 git clone https://github.com/timetetng/wutheringwaves-cli-manager.git
 cd wutheringwaves-cli-manager
-
-# 在源码目录下执行安装
 uv tool install .
 ```
 
-#### 3. 更新工具
+### 更新与卸载
+
+更新工具：
 
 ```bash
 ww update
 ```
 
-#### 4. 卸载工具
+卸载 uv 安装的工具（包括上述源码安装方式）：
 
 ```bash
 uv tool uninstall ww-manager
 ```
 
-## 📖 使用说明
-
-首次运行时，需要指定游戏路径（只需指定一次，后续会自动记忆）：
+卸载 AUR 安装的工具：
 
 ```bash
-# 创建安装目录(如果你还没有创建游戏目录)
-mkdir -p "$HOME/Games/WutheringWaves"
-# 初始化路径
-ww -p "$HOME/Games/WutheringWaves" status
+yay -R ww-manager
 ```
 
-> `-p`、`--path` 参数用于指定安装路径。
+## 快速上手
 
-### 常用命令
+首次使用时指定游戏安装目录，工具会记住该路径：
 
-#### 1\. 查看状态 (`status`)
+```bash
+ww -p "$HOME/Games/WutheringWaves" download
+```
 
-查看当前游戏目录的服务器、版本、画质包登记与工具当前档位。
+按菜单选择服务器和画质档位，确认后下载。已有游戏文件也可以使用此目录，正确文件会复用。
+
+Windows 路径示例：
+
+```powershell
+ww -p "D:\Games\WutheringWaves" download
+```
+
+查看当前状态：
 
 ```bash
 ww status
 ```
 
-#### 2\. 快速切换服务器 (`checkout`)
+后续使用无需重复指定路径。需要更换目录时，再通过 `-p` 指定。
 
-快速切换服务器（仅限官/B 服）。
+## 启动游戏
 
-官服、B 服之间采用**差异文件缓存**机制：首次切换会下载两服差异文件并备份到游戏目录内的 `wwm_server_diff_cache/`，此后切换优先从本地缓存恢复，缺失或校验失败时再从 CDN 下载。大版本更新（如 3.4 → 3.5）时会自动重置缓存。
+启动时需要在参数中指定已安装的画质档位：
+
+| 档位 | 启动参数 |
+|---|---|
+| SD · 标清 | `-krqlv=sd` |
+| HD · 高清 | `-krqlv=hd` |
+| UHD · 极致 | `-krqlv=uhd` |
+
+例如，安装 HD 后使用 `-krqlv=hd`。工具切换默认档位不会自动修改你的游戏启动配置。
+
+Linux 启动方式和常见问题见 [Linux 启动指南](docs/linux.md)。
+
+## 常用命令
+
+| 命令 | 用途 |
+|---|---|
+| `ww download` | 下载客户端，菜单选择服务器和画质 |
+| `ww resource` | 管理画质资源包 |
+| `ww checkout` | 切换服务器 |
+| `ww status` | 查看游戏和工具状态 |
+| `ww predownload` | 下载增量更新 |
+| `ww predownload --apply` | 应用已下载的增量更新 |
+| `ww sync` | 校验并修复文件 |
+| `ww log` | 获取抽卡记录链接 |
+| `ww update` | 更新工具 |
+
+`download`、`resource`、`checkout` 不带参数时进入菜单，也可以直接指定参数：
 
 ```bash
-# 切换到 Bilibili 服
-ww checkout bilibili
-# 切换到 官服
+ww download bilibili HD
+ww resource UHD
 ww checkout cn
-# 切换到 国际服（包体差异过大，需要完整下载，不适用差异缓存）
-ww checkout global
-# 强制全量校验同步（兜底）
-ww checkout cn --force-sync
 ```
-#### 3\. 同步与修复 (`sync`)
 
-切换服务器或下载中断导致文件缺失时使用。按已记录的当前档位校验公共资源和画质包，修复缺失或损坏文件，不会为 SD/UHD 补下 HD；旧安装未记录档位时默认 HD。版本更新也可使用 `ww predownload` 下载补丁，再用 `ww predownload --apply` 应用。
+菜单使用 ↑↓ 选择、回车确认、Esc 取消。资源菜单中按 `d` 可以删除高亮档位，删除前需要确认。
+
+服务器参数：`cn` 官服、`bilibili` B 服、`global` 国际服。`incremental` 是 `predownload` 的别名。
+
+查看具体参数：
 
 ```bash
-ww sync
+ww --help
+ww resource --help
 ```
 
-> 同步完成时自动清理版本更新后残留的旧文件（如旧 pak），避免旧文件覆盖新文件导致启动失败；用户文件与运行时资源不受影响。
+## 详细文档
 
-#### 4\. 下载完整客户端 (`download`)
+- [Linux 启动与常见问题](docs/linux.md)
+- [在 Linux 上运行官方启动器](docs/wuwa-launcher.md)
 
-从零安装 `common + 指定档位`，省略档位时默认 HD。成功后自动记住当前档位，后续 `sync`、`predownload` 和 `incremental` 无需重复指定。
+## 反馈
 
-```bash
-ww download                 # 官服 HD
-ww download cn uhd          # 官服 UHD，不下载 HD
-ww download bilibili sd     # B 服 SD，不下载 HD
-ww download global          # 国际服暂仅支持 HD
-```
-
-游戏仍需以对应的 `-krqlv=hd/sd/uhd` 参数启动；已安装的其它档位不会自动删除。
-
-#### 5\. 预下载 / 增量更新 (`predownload`，别名 `incremental`)
-
-在新版本预下载开放期间通过本命令提前下载增量包，维护后应用合并补丁。新版本开启后同样可执行本命令直接增量更新（不再依赖全量 sync 同步文件）。`incremental` 与 `predownload` 等价，可互换使用。
-
-```bash
-# 下载增量包（预下载开放期提前下载；新版本开启后也可直接下载增量包更新）
-ww predownload
-
-# 应用增量更新（维护后合并补丁）
-ww predownload --apply
-
-# incremental 别名用法相同
-ww incremental
-ww incremental --apply
-```
-
-不同画质档位的增量更新目前仅预留接口，目标是统一处理 `common + 当前档位`，**尚未完成官方跨版本补丁的真实验证**。预下载通常只在版本更新前几天开放；无匹配补丁或配置格式尚未适配时会明确报错，不会自动改下 HD。国际服暂保留原 HD 增量流程。
-
-> [!CAUTION]
-> 1. **预下载开放之后即可开始下载增量包**（新版本开启后此通道会转为直接增量更新）；
-> 2. **如果应用中断，可重试 `ww predownload --apply`**；
-> 3. **应用后可运行 `ww sync --new` 校验此次增量涉及的文件；基础资源全量修复使用 `ww sync`**；
-> 4. **请确保安装目录有足够磁盘空间（需要两倍的空间复制源文件用于合并补丁）**
-
-
-#### 6\. 获取抽卡记录链接 (`log`)
-
-可以一键获取抽卡链接，用于导入小程序或者鸣潮机器人。
-
-```bash
-# 使用前需点开 唤取-唤取记录 以更新日志文件
-ww log
-```
-
-> `-o`、`--open`: 获取链接并跳转打开。
-
-#### 7\. 更新工具本身（`update`）
-自动检查安装方式并尝试更新
-
-```bash
-ww update
-```
-
-#### 8\. 画质包管理 (`resource`)
-
-官服/B 服共用画质包，配置自动获取。国际服未测试通用性暂仅支持默认 HD。
-
-```bash
-ww resource uhd                # 安装、校验并选定 UHD
-ww resource sd                 # 安装、校验并选定 SD
-ww resource hd                 # 安装、校验并选定 HD
-ww resource uhd --force-md5     # 忽略缓存，重新计算全部 MD5
-ww resource uhd --remove        # 确认后删除整个 UHD 目录及登记
-```
-
-* `resource` 用于单独安装、校验或切换档位；`sync` 自动修复当前档位。
-* 多档位可以共存，最后成功执行的 `download <server> <tier>` 或 `resource <tier>` 会记录为工具当前档位；**游戏启动参数需自行设置**。
-* `--remove` 会删除该档位目录中的所有文件，包括自行放入的文件；删除当前档位后需重新选择。
-* 首次使用 UHD 等档位，游戏内仍可能下载对应视频与热更新。
-
-## 🎮 启动游戏 (Linux)
-
-本工具仅负责文件管理。启动游戏推荐使用 Steam + Proton。
-
-> [!IMPORTANT]
-> **3.7 起启动必须带画质档位参数：`-krqlv=<hd|sd|uhd>`**
->
-> 3.7 把游戏资源改成了分档打包（`Client/Content/HD/`、`SD/`、`UHD/`），需要通过参数指定档位。
-> 缺少该参数（或取值非法）时，游戏会在挂载完 pak 之后直接崩溃：
-> `Fatal error: [File:Unknown] [Line: 54] kuro: Use launcher to start game!`
->
-> 默认下载的是 HD（高清）资源，使用 `-krqlv=hd`；安装 SD/UHD 后，将参数替换为 `-krqlv=sd` / `-krqlv=uhd`，不要同时设置多个档位：
->
-> ```bash
-> Client-Win64-Shipping.exe -krqlv=hd
-> ```
-
-如果你熟悉 Linux，你可以使用 `lutris` 启动游戏，也可以参考项目中的 `run_ww.sh` 脚本并添加 .desktop 文件绕过 Steam 启动，小白仍然建议按以下步骤通过 Steam 启动：
-
-1. **Steam 设置**：
-
-      * 添加“非 Steam 游戏”，指向 `安装目录/Client/Binaries/Win64/Client-Win64-Shipping.exe`。
-      * 在兼容性中强制使用 `dwproton` （如果 ACE 警告频繁请尝试切换 proton）
-
-2. **启动参数**：
-    在 Steam 启动选项中添加：
-
-    ```bash
-    steamdeck=1 -krqlv=hd
-    ```
-
-## 🛠️ 常见问题 (FAQ)
-
-> [!TIP]
-> 由于 Linux 用户环境各异，以下解决方案均来自社区，仅供参考。
-
----
-
-### Q1: 被 ACE 反作弊警告下线如何解决？
-* **推荐方案**：使用 `dwproton` 或添加环境变量 `steamdeck=1`。
-* **效果说明**：能有效减少被检测次数，但无法完全杜绝。
-* **实验性方案**：社区提到使用 *卡拉彼丘* 的 ACE 组件替换原文件，此方法**未验证**，感兴趣可自行研究。
-
----
-
-### Q2: 上线 10 分钟就被踢下线，需要重新登录？
-这通常是启动环境识别问题。若更换启动方式无效，**官服用户**可尝试 bilibili 用户 `@神麤詭末` 提供的方案：
-
-1.  **定位文件**：`安装目录/Client/Binaries/Win64/ThirdParty/KrPcSdk_Mainland/KRSDKRes/KRSDKConfig.json`
-2.  **修改字段**：将 `KR_ChannelId` 从官服的 `19` 修改为 Steam 的 `205`。
-3.  **启动提示**：启动时若弹出“网络错误”，直接点击 **重试** 即可。
-
-> [!CAUTION]
-> 1. **修改前请务必备份原文件**，以免出错无法修复！
-> 2. 此方法 **Bilibili 服无法使用**。
-
----
-
-### Q3: 出现剧情文本错误或素材缺失？
-1.  **执行同步**：运行 `ww sync`，按工具当前档位校验并修复资源；可用 `ww status` 确认档位。
-2.  **环境排查**：若同步后仍有问题，通常不在游戏本体，建议尝试更换 **启动方式**、**桌面环境 (DE)** 或 **Wine/Proton 版本**。
-
----
-
-### Q4: 登录框无法聚焦输入？
-以 ArchLinux 中通过 Steam 启动的鸣潮为例，按照以下步骤操作即可：
-1. `sudo pacman -S protontricks` 安装 `protontricks`；
-2. 运行 `protontricks --gui`，在弹出的列表里找到鸣潮；
-3. 选择 `Select the default wineprefix -> Run winecfg`;
-4. 此时弹出 wincfg 窗口，在窗口中找到**显示 (Graphics)**栏，下方勾选**虚拟桌面 (Emulate a virtual desktop)** 并自行设置一个分辨率；
-5. 应用退出后重启游戏，此时应该可以正常输入并登录；
-6. 登录完成后，重新运行 `protontricks` 取消虚拟桌面即可。
-
----
-
-### Q5: 除了本项目，还有其他下载更新鸣潮的方式吗？
-当然👌，给希望在 Linux 上使用官方启动器的用户的解决方案：
-
-[在 Linux 上运行鸣潮官方启动器](./docs/wuwa-launcher.md)
-
-> [!NOTE]
-> 原链接来自 [MoYingJi QwQ](https://site.moyingji.one/linux/gaming/workarounds/wuwa-launcher)，原作者博客域名即将过期，已归档镜像至本仓库 `docs/wuwa-launcher.md`。
-
----
-
-### Q6: 3.7 更新后启动报 `Fatal error: ... kuro: Use launcher to start game!`？
-游戏本体没坏，是**缺少画质档位参数**：3.7 起资源分档(HD/SD/UHD)，必须由启动器在命令行上告知档位。在启动脚本 / Steam 启动选项里加上 `-krqlv=hd` 即可，详见上方 [启动游戏 (Linux)](#-启动游戏-linux) 一节的提示。
-
----
-
-### 📢 反馈
-任何问题请在 **Issue** 中提出，也欢迎 **PR**。
+使用中遇到问题，可以提交 Issue，附上执行命令、工具版本和相关日志。也欢迎提交 PR.
 
 ## 致谢
 
-感谢以下优秀项目：
-
-* [WutheringWavesTool](https://github.com/leck995/WutheringWavesTool)
-* [LutheringLaves](https://github.com/last-live/LutheringLaves)
-* [wuwa-uhd-tool](https://github.com/TianXyousa/wuwa-uhd-tool)
-* [Wuthering-Waves-Official-Bilibili](https://github.com/Hurry1027/Wuthering-Waves-Official-Bilibili)
-* [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom/releases/): 下载最新版本的 `GE-Proton` 并解压到 `~/.local/share/Steam/steamapps/common/` 目录下，启动 Steam，在**属性-兼容性**中能找到下载的 `GE-Proton` 即说明配置成功。
-* [dwproton](https://dawn.wine/dawn-winery/dwproton/releases): 安装方式同上
-
-<!-- end list -->
+- [WutheringWavesTool](https://github.com/leck995/WutheringWavesTool)
+- [LutheringLaves](https://github.com/last-live/LutheringLaves)
+- [wuwa-uhd-tool](https://github.com/TianXyousa/wuwa-uhd-tool)
+- [Wuthering-Waves-Official-Bilibili](https://github.com/Hurry1027/Wuthering-Waves-Official-Bilibili)
+- [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom)
+- [dwproton](https://dawn.wine/dawn-winery/dwproton/releases)

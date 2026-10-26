@@ -151,6 +151,7 @@ class ResourceUpdateTests(unittest.TestCase):
 
     def test_global_incremental_keeps_original_hd_engine(self):
         self.owner.server_type = "global"
+        self.choose("hd")
         self.owner._launcher_info = {"default": {"version": TARGET}}
         self.owner._cdn_node = self.url
         with (
@@ -591,6 +592,7 @@ class ResourceUpdateTests(unittest.TestCase):
 
     def test_global_incremental_checks_space_and_supports_force(self):
         self.owner.server_type = "global"
+        self.choose("hd")
         self.owner._launcher_info = {"default": {"version": TARGET, "config": {
             "patchConfig": [{"version": SOURCE, "indexFile": "patch/common.json", "baseUrl": "files"}],
         }}}

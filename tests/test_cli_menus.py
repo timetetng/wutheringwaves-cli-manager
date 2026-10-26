@@ -93,6 +93,25 @@ class CommandMenuTests(unittest.TestCase):
                 self.assertIn("国际服", option.blocked_reason or "")
         self.factory.assert_not_called()
 
+    def test_global_menu_labels_untested_and_requires_separate_opt_in(self):
+        for flags, allowed in ((["--force"], False), (["--allow-untested"], True)):
+            with self.subTest(flags=flags):
+                self.menu.return_value.run.side_effect = [MenuOption("global", "国际服"), None]
+                result = self.invoke("download", *flags)
+                self.assertEqual(result.exit_code, 0, result.output)
+                for option in self.menu.call_args_list[-1].args[0]:
+                    if option.key != "hd":
+                        self.assertIn("未验证", option.description)
+                        self.assertEqual(option.blocked_reason is None, allowed)
+                self.factory.assert_not_called()
+
+    def test_global_download_opt_in_configures_manager_without_redefining_force(self):
+        self.manager.server_type = "global"
+        result = self.invoke("download", "global", "UHD", "--allow-untested")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue(self.manager.allow_untested)
+        self.manager.download_full.assert_called_once_with(tier="UHD", force_space=False)
+
     def test_first_download_can_choose_menu_for_nonexistent_directory(self):
         target = self.root / "not-created" / "game"
         self.menu.return_value.run.return_value = None

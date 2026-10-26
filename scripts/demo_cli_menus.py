@@ -106,6 +106,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--command", choices=("resource", "download", "checkout"), default="resource")
     parser.add_argument("--low-space", action="store_true", help="模拟仅剩 5 GiB（默认 80 GiB）")
     parser.add_argument("--force", action="store_true", help="演示绕过空间检查；仍然不会真实下载")
+    parser.add_argument("--allow-untested", action="store_true", help="演示允许国际服未验证档位；仍然不会真实下载")
     args = parser.parse_args(argv)
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         print("请在交互终端直接运行，不要通过管道或重定向运行。", file=sys.stderr)
@@ -132,6 +133,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             path, server, free_bytes,
         )))
         command = [args.command] + (["--force"] if args.force else [])
+        if args.allow_untested:
+            command.append("--allow-untested")
         try:
             result = app(args=command, prog_name="ww", standalone_mode=False)
             return result if isinstance(result, int) else 0

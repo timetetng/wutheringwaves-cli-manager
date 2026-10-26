@@ -195,6 +195,7 @@ class WGameManager:
         self.game_folder = game_folder.resolve()
         self.server_type = server_type
         self.config = SERVER_CONFIGS[server_type]
+        self.allow_untested = False
 
         self.md5_cache = MD5Cache(self.game_folder / "wwm_md5_cache.json", self.game_folder)
 
@@ -307,7 +308,7 @@ class WGameManager:
     def sync_files(self, force_check_md5=False, tier: Optional[str] = None, force_space: bool = False):
         tier = self._validate_tier(tier) if tier is not None else self.current_resource_tier()
         if self.server_type == "global" and tier != "hd":
-            raise ConfigError("国际服暂仅支持 HD 档位")
+            self._require_untested_resources()
         # 确保获取的是当前版本的配置
         default_info = self.launcher_info["default"]
         res_base = default_info.get("resourcesBasePath") or default_info.get("baseUrl")
@@ -474,10 +475,13 @@ class WGameManager:
 
     RESOURCE_TIERS = ("hd", "sd", "uhd")
 
+    def _require_untested_resources(self) -> None:
+        if self.server_type == "global" and not self.allow_untested:
+            raise ConfigError("国际服复用国服画质清单尚未验证；如接受兼容性风险，请使用 --allow-untested")
+
     def get_bundle_config(self, config_url: Optional[str] = None) -> Dict[str, Any]:
-        """自动获取官服/B服共用的画质配置，不依赖本地启动器。"""
-        if self.server_type == "global":
-            raise ConfigError("国际服暂仅支持默认 HD，请使用 ww download global 或 ww sync")
+        """获取国服画质配置；国际服必须显式允许未经验证的清单复用。"""
+        self._require_untested_resources()
         if config_url is not None and (not isinstance(config_url, str) or not config_url):
             raise ConfigError("资源档位配置地址为空")
         logger.info("正在获取资源档位配置...")
@@ -560,8 +564,6 @@ class WGameManager:
             raise ConfigError(f"无法读取档位选择记录，拒绝猜测当前档位: {e}") from e
 
     def current_resource_tier(self) -> str:
-        if self.server_type == "global":
-            return "hd"
         tier = self._read_resource_state()["active_tier"]
         if tier is None:
             raise ConfigError("当前档位已被移除，请先运行 ww resource <tier> 选择档位")
@@ -694,9 +696,15 @@ class WGameManager:
 
     def resource_menu_data(self) -> List[dict]:
         """只读获取官方清单与本地情况；不保存哈希缓存或改变安装记录。"""
+        states = {s["tier"]: s for s in self.resource_tier_status()}
+        if self.server_type == "global" and not self.allow_untested:
+            return [
+                {**states[tier], "installed": False, "prepared": None,
+                 "error": "国际服复用国服清单未验证；须使用 ww resource --allow-untested"}
+                for tier in ("sd", "hd", "uhd")
+            ]
         bundle = self.get_bundle_config()
         logger.info("正在读取各档位清单与本地文件，首次可能需要一些时间...")
-        states = {s["tier"]: s for s in self.resource_tier_status()}
         rows = []
         for tier in ("sd", "hd", "uhd"):
             state = states[tier]
@@ -715,6 +723,7 @@ class WGameManager:
 
     def select_resource_tier(self, tier: str, prepared: dict, force_space: bool = False) -> None:
         """菜单确认：同版本完整登记仅切换默认；其它情况校验、修复后选定。"""
+        self._require_untested_resources()
         tier = self._validate_tier(tier)
         if self._tier_is_current(tier, prepared["version"]):
             state = self._read_resource_state()
@@ -728,6 +737,7 @@ class WGameManager:
         self, tier: str, config_url: Optional[str] = None, *, bundle: Optional[dict] = None,
     ) -> dict:
         """只读预检，组合安装须在公共文件下载前确认画质清单有效。"""
+        self._require_untested_resources()
         self._read_resource_state()
         bundle = self.get_bundle_config(config_url) if bundle is None else bundle
         if not isinstance(bundle, dict):
@@ -1312,6 +1322,8 @@ class WGameManager:
         updater = ResourceUpdater(self)
         if self.server_type != "global" or updater.has_pending_plan():
             return updater.download(config_url, force_space=force_space)
+        if self.current_resource_tier() != "hd":
+            raise ConfigError("国际服实验性档位的增量更新尚未验证；请用 ww resource <tier> --allow-untested 校验更新档位")
         logger.info("国际服使用默认 HD 基础增量")
         manager = IncrementalManager(
             self.game_folder,

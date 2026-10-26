@@ -26,6 +26,7 @@ from ww_manager.menu import MenuOption, MenuShortcut, build_selection_menu
 __version__ = metadata.version("ww-manager")
 
 TIER_NAMES = {"sd": "标清", "hd": "高清", "uhd": "极致"}
+UNTESTED_HELP = "允许国际服复用国服画质清单（未验证，不保证兼容）"
 
 
 def parse_version(version_str: str) -> tuple:
@@ -151,7 +152,7 @@ def main(
     path: Annotated[Optional[Path], typer.Option("--path", "-p", help="游戏安装目录")] = None,
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="显示详细调试日志")] = False,
     version: Annotated[
-        Optional[bool], typer.Option("--version", callback=version_callback, is_eager=True, help="显示版本号")
+        Optional[bool], typer.Option("--version", callback=version_callback, is_eager=True, help="显示工具版本号")
     ] = None,
 ):
     """
@@ -199,7 +200,7 @@ def _is_ww_manager_repo(path: Path) -> bool:
 
 @app.command()
 def update():
-    """更新 ww-manager"""
+    """更新工具"""
     typer.echo("开始检测更新环境...")
     current_dir = Path.cwd()
     script_phys_dir = Path(__file__).resolve().parent.parent
@@ -256,7 +257,7 @@ def update():
 
 @app.command()
 def status(ctx: typer.Context):
-    """查看当前客户端状态"""
+    """查看状态"""
     path = get_game_path(ctx)
     try:
         cfg_file = path / "launcherDownloadConfig.json"
@@ -271,8 +272,13 @@ def status(ctx: typer.Context):
         table.add_column(overflow="fold")
         table.add_row("目录", str(path))
         table.add_row("服务器", APPID_TO_SERVER.get(app_id, "未知"))
-        table.add_row("版本", str(data.get("version", "未知")))
+        table.add_row("游戏版本", str(data.get("version", "未知")))
         table.add_row("当前默认档位", f"{tier.upper()} · {TIER_NAMES[tier]}" if tier else "未选择")
+        tool_version = __version__
+        latest = load_app_config().get("latest_available_version")
+        if isinstance(latest, str) and parse_version(latest) > parse_version(__version__):
+            tool_version += f" → {latest}（可更新：ww update）"
+        table.add_row("工具版本", tool_version)
         Console().print(table, markup=False)
     except (WWError, OSError, ValueError) as e:
         typer.secho(f"读取状态失败: {e}", fg="red")
@@ -284,8 +290,12 @@ def sync(
     ctx: typer.Context,
     force: Annotated[bool, typer.Option("--force", help="仅绕过下载空间检查，不跳过文件校验")] = False,
     check_new: Annotated[bool, typer.Option("--new", help="校验并修复新版本文件状态（用于增量更新应用后）")] = False,
+    allow_untested: Annotated[bool, typer.Option("--allow-untested", help=UNTESTED_HELP)] = False,
 ):
-    """全量校验并修复文件"""
+    """校验并修复文件
+
+    按当前默认档位校验公共资源与画质包，修复缺失或损坏的文件。
+    """
     path = get_game_path(ctx)
     cfg_file = path / "launcherDownloadConfig.json"
     server = "cn"
@@ -297,6 +307,7 @@ def sync(
             pass
     try:
         mgr = WGameManager(path, server)
+        _configure_untested(mgr, allow_untested)
         if check_new:
             success = mgr.verify_new_version(force_space=force)
             if not success:
@@ -308,6 +319,12 @@ def sync(
     except WWError as e:
         typer.secho(f"执行失败: {e}", fg="red")
         raise typer.Exit(1)
+
+
+def _configure_untested(manager: WGameManager, allowed: bool) -> None:
+    manager.allow_untested = allowed
+    if allowed and manager.server_type == "global":
+        logger.warning("国际服将复用国服画质清单（未验证）；MD5 仅确认文件与清单一致，不代表游戏兼容")
 
 
 def _run_menu(application: Application[Optional[MenuOption]]) -> Optional[MenuOption]:
@@ -352,9 +369,14 @@ def download(
     ctx: typer.Context,
     server: Annotated[Optional[ServerType], typer.Argument(help="目标服务器；省略进入服务器与档位菜单")] = None,
     tier: Annotated[str, typer.Argument(help="画质档位: hd / sd / uhd，默认 HD")] = "hd",
+    allow_untested: Annotated[bool, typer.Option("--allow-untested", help=UNTESTED_HELP)] = False,
     force: Annotated[bool, typer.Option("--force", help="仅绕过磁盘空间不足检查，不跳过文件校验")] = False,
 ):
-    """[初始化] 下载完整客户端；无参数依次选择服务器和资源档位"""
+    """下载客户端
+
+    不带参数时，依次选择服务器与画质档位；也可直接指定，如 ww download bilibili HD。
+    成功后记住默认档位。游戏启动参数需自行设置。
+    """
     path = get_game_path(ctx)
     try:
         if server is None:
@@ -366,8 +388,10 @@ def download(
             choice = _run_menu(build_selection_menu(
                 [MenuOption(
                     key, f"{key.upper()} · {name}",
-                    blocked_reason="国际服暂仅支持默认 HD"
-                    if server == ServerType.global_server and key != "hd" else None,
+                    description="未验证 · 国服清单" if server == ServerType.global_server and key != "hd" else "",
+                    description_style="fg:ansiyellow" if server == ServerType.global_server and key != "hd" else "",
+                    blocked_reason="国际服其他档位未验证；如接受复用国服清单的风险，请加 --allow-untested"
+                    if server == ServerType.global_server and key != "hd" and not allow_untested else None,
                 ) for key, name in TIER_NAMES.items()],
                 "hd", title=f"下载客户端 · 2/2 选择资源档位 · {server.value}", current_label="默认下载",
             ))
@@ -375,6 +399,7 @@ def download(
                 return
             tier = choice.key
         mgr = WGameManager(path, server.value)
+        _configure_untested(mgr, allow_untested)
         mgr.download_full(tier=tier, force_space=force)
         mgr.remind_resource_tiers()
     except (WWError, OSError) as e:
@@ -392,7 +417,7 @@ def run_resource_menu(manager: WGameManager, *, force_space: bool = False) -> No
         for row in rows:
             tier = row["tier"]
             if row["error"]:
-                description = "× 暂不可用"
+                description = "× 未验证 · 国服清单" if manager.server_type == "global" else "× 暂不可用"
                 details = "大小未知（无法获取有效清单）"
                 blocked = row["error"]
             else:
@@ -408,6 +433,8 @@ def run_resource_menu(manager: WGameManager, *, force_space: bool = False) -> No
                     f" · 本次下载 {row['download_size'] / 1024**3:.2f} GiB"
                 )
                 blocked = None if force_space else manager.space_shortage(row["download_size"], free)
+            if manager.server_type == "global" and "未验证" not in description:
+                description += " · 未验证（国服清单）"
             options.append(MenuOption(
                 key=tier, label=f"{tier.upper()} · {TIER_NAMES[tier]}", description=description,
                 details=details, blocked_reason=blocked,
@@ -446,16 +473,17 @@ def resource(
         Optional[str],
         typer.Option("--config-url", help="覆盖自动获取的官方画质配置地址（通常无需指定）"),
     ] = None,
+    allow_untested: Annotated[bool, typer.Option("--allow-untested", help=UNTESTED_HELP)] = False,
     force_md5: Annotated[bool, typer.Option("--force-md5", help="忽略 MD5 缓存，重新计算所有文件哈希")] = False,
     remove: Annotated[bool, typer.Option("--remove", help="确认后删除该档位目录、缓存和安装登记")] = False,
     force: Annotated[bool, typer.Option("--force", help="仅绕过磁盘空间不足检查，不跳过文件校验")] = False,
 ):
-    """查看、安装、校验或删除画质档位
+    """下载画质资源包
 
     不带档位时进入菜单；非交互终端仅展示本地安装记录。
-    菜单中已安装且版本匹配的档位直接选定，不重复校验。
+    菜单中已安装且版本匹配的档位直接选定，不重复校验；按 d 可删除高亮档位。
     指定档位后校验并修复，游戏需以 -krqlv=<tier> 启动。
-    --remove 经确认后删除所选档位目录、缓存与安装记录。
+    --remove 或菜单删除均需确认，会删除档位目录内全部文件、缓存与安装记录。
     """
     path = get_game_path(ctx)
     cfg_file = path / "launcherDownloadConfig.json"
@@ -468,6 +496,7 @@ def resource(
             pass
     try:
         mgr = WGameManager(path, server)
+        _configure_untested(mgr, allow_untested)
         if tier is None:
             if remove or force_md5 or config_url is not None:
                 raise WWError("使用操作选项时须指定档位，例如 ww resource hd --force-md5")
@@ -480,7 +509,7 @@ def resource(
             for state in mgr.resource_tier_status():
                 name = state["tier"]
                 table.add_row(
-                    f"{name.upper()} · {TIER_NAMES[name]}",
+                    f"{name.upper()} · {TIER_NAMES[name]}" + (" · 国服清单未验证" if server == "global" else ""),
                     state["state"],
                     state["version"] or "—",
                     "●" if state["active"] else "",
@@ -509,7 +538,11 @@ def checkout(
     force_sync: Annotated[bool, typer.Option("--force-sync", help="切换后强制同步")] = False,
     force: Annotated[bool, typer.Option("--force", help="仅绕过下载空间检查，不跳过文件校验")] = False,
 ):
-    """切换服务器；无参数进入服务器选择菜单"""
+    """切换服务器
+
+    不带参数时选择目标服务器；也可直接指定，如 ww checkout bilibili。
+    官服与 B 服优先复用差异缓存，国际服使用全量校验同步。
+    """
     path = get_game_path(ctx)
     try:
         if server is None:
@@ -589,16 +622,15 @@ def predownload(
         Optional[str], typer.Option("--config-url", help="覆盖自动获取的分包配置地址（通常无需指定）")
     ] = None,
 ):
-    """
-    预下载/增量更新
+    """下载或应用增量更新
 
-    预下载开放期间执行下载增量包，维护后应用合并补丁；新版本开启后也可直接用于增量更新。
-    用法：ww predownload 下载增量包，ww predownload --apply 应用更新。
+    直接运行下载增量包，维护后用 ww predownload --apply 应用更新。
+    新版本开启后也可下载可用的增量更新。incremental 为兼容别名。
     """
     _run_incremental(ctx, action, apply_flag, config_url, force_space=force)
 
 
-@app.command()
+@app.command(hidden=True)
 def incremental(
     ctx: typer.Context,
     force: Annotated[bool, typer.Option("--force", help="仅绕过下载空间检查，不跳过文件校验")] = False,
@@ -621,7 +653,10 @@ def log(
     ctx: typer.Context,
     open_browser: Annotated[bool, typer.Option("--open", "-o", help="使用默认浏览器打开链接")] = False,
 ):
-    """获取抽卡分析链接"""
+    """获取抽卡记录链接
+
+    先在游戏中打开抽卡记录，再运行本命令。
+    """
     path = get_game_path(ctx)
     log_file = path / "Client/Saved/Logs/Client.log"
     if not log_file.exists():

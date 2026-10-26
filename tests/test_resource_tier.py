@@ -376,9 +376,136 @@ class ResourceTierTests(unittest.TestCase):
         manager = WGameManager(self.root, "global")
         with patch.object(manager, "_http_get_json") as fetch:
             self.assertEqual(manager.current_resource_tier(), "hd")
-            with self.assertRaisesRegex(ConfigError, "国际服暂仅支持默认 HD"):
+            with self.assertRaisesRegex(ConfigError, "未验证.*--allow-untested"):
                 manager.download_resource_tier("uhd")
         fetch.assert_not_called()
+
+    def use_global_server(self):
+        self.manager.server_type = "global"
+        self.manager.config = WGameManager(self.root, "global").config
+
+    def test_global_force_alone_does_not_allow_unverified_resource(self):
+        self.use_global_server()
+        with self.assertRaisesRegex(ConfigError, "--allow-untested"):
+            self.manager.download_resource_tier("uhd", force_space=True)
+        with self.assertRaisesRegex(ConfigError, "--allow-untested"):
+            self.manager._prepare_resource_tier("uhd", bundle=self.bundle)
+        self.assertEqual(list(self.root.iterdir()), [])
+        self.assertEqual(self.server.requests, [])
+
+    def test_global_menu_without_opt_in_shows_unverified_without_network(self):
+        self.use_global_server()
+        rows = self.manager.resource_menu_data()
+        self.assertTrue(all("未验证" in row["error"] for row in rows))
+        self.assertEqual(self.server.requests, [])
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_global_resource_menu_force_does_not_unlock_unverified_options(self):
+        self.use_global_server()
+        with (
+            patch("ww_manager.cli._interactive_terminal", return_value=True),
+            patch("ww_manager.cli.build_selection_menu") as menu,
+        ):
+            menu.return_value.run.return_value = None
+            result = self.invoke("resource", "--force")
+        self.assertEqual(result.exit_code, 0, result.output)
+        for option in menu.call_args.args[0]:
+            self.assertIn("未验证", option.description)
+            self.assertIsNotNone(option.blocked_reason)
+        self.assertEqual(self.server.requests, [])
+
+    def test_global_local_resource_listing_labels_unverified_reuse(self):
+        self.use_global_server()
+        self.put("launcherDownloadConfig.json", json.dumps({"appId": self.manager.config["appId"]}).encode())
+        result = self.invoke("resource")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("未验证", result.output)
+        self.assertEqual(self.server.requests, [])
+
+    def test_global_can_explicitly_fetch_same_cn_bundle_source(self):
+        self.use_global_server()
+        self.manager.allow_untested = True
+        self.bundle_patch.stop()
+        with patch.object(self.manager, "_http_get_json", return_value=self.bundle) as fetch:
+            self.assertEqual(self.manager.get_bundle_config(), self.bundle)
+        fetch.assert_called_once_with(RESOURCE_CONFIG_URLS[0])
+
+    def test_global_allowed_resource_preserves_channel_and_selected_tier(self):
+        self.use_global_server()
+        self.put("launcherDownloadConfig.json", json.dumps({
+            "appId": self.manager.config["appId"], "version": "3.8.0",
+        }).encode())
+        result = self.invoke("resource", "uhd", "--allow-untested")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.manager.current_resource_tier(), "uhd")
+        self.assertEqual(self.read_json("launcherDownloadConfig.json")["appId"], self.manager.config["appId"])
+        self.assertEqual((self.root / DEST).read_bytes(), GOOD)
+        self.registered()
+
+    def test_global_allowed_full_download_uses_global_base_and_cn_tier(self):
+        self.use_global_server()
+        self.prepare_full_download("uhd")
+        result = self.invoke("download", "global", "uhd", "--allow-untested")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.manager.current_resource_tier(), "uhd")
+        self.assertEqual(self.read_json("launcherDownloadConfig.json")["appId"], self.manager.config["appId"])
+        self.assertEqual((self.root / DEST).read_bytes(), GOOD)
+        self.registered()
+
+    def test_global_allow_untested_does_not_bypass_space_checks(self):
+        self.use_global_server()
+        with patch.object(self.manager, "available_disk_space", return_value=0):
+            result = self.invoke("resource", "uhd", "--allow-untested")
+            self.assertNotEqual(result.exit_code, 0, result.output)
+            self.assertIn("空间不足", result.output)
+            self.assertFalse((self.root / DEST).exists())
+            result = self.invoke("resource", "uhd", "--allow-untested", "--force")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.registered()
+
+    def test_global_allow_untested_does_not_bypass_version_alignment(self):
+        self.use_global_server()
+        self.prepare_full_download("uhd")
+        self.bundle["resourcePacks"]["uhd"]["version"] = "3.9.0"
+        result = self.invoke("download", "global", "uhd", "--allow-untested")
+        self.assertNotEqual(result.exit_code, 0, result.output)
+        self.assertIn("版本不一致", result.output)
+        self.assertFalse((self.root / "Client").exists())
+
+    def test_global_allow_untested_does_not_bypass_manifest_or_md5_validation(self):
+        self.use_global_server()
+        self.manager.allow_untested = True
+        self.server.resources = [item("../escape.pak")]
+        with self.assertRaises(ConfigError):
+            self.manager.download_resource_tier("uhd")
+        self.server.resources = [item()]
+        with patch.object(self.manager, "_batch_download", return_value=0):
+            with self.assertRaisesRegex(NetworkError, "档位文件校验失败"):
+                self.manager.download_resource_tier("uhd")
+        self.assertFalse((self.root / "launcherDownloadConfig/uhd.json").exists())
+
+    def test_global_sync_experimental_tier_requires_explicit_opt_in_again(self):
+        self.use_global_server()
+        self.prepare_full_download("uhd")
+        self.manager._write_local_json("wwm_resource_state.json", {
+            "active_tier": "uhd", "versions": {"uhd": "3.8.0"},
+        })
+        result = self.invoke("sync")
+        self.assertNotEqual(result.exit_code, 0, result.output)
+        self.assertIn("--allow-untested", result.output)
+        result = self.invoke("sync", "--allow-untested")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.manager.current_resource_tier(), "uhd")
+
+    def test_global_experimental_tier_does_not_silently_update_hd(self):
+        self.use_global_server()
+        self.manager._write_local_json("wwm_resource_state.json", {
+            "active_tier": "uhd", "versions": {"uhd": "3.8.0"},
+        })
+        with patch("ww_manager.core.IncrementalManager") as engine:
+            with self.assertRaisesRegex(ConfigError, "增量更新尚未验证"):
+                self.manager.download_incremental()
+        engine.assert_not_called()
 
     def test_download_without_server_requires_interactive_terminal(self):
         with (
@@ -458,7 +585,7 @@ class ResourceTierTests(unittest.TestCase):
         self.manager.download_full()
         result = self.invoke("status")
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertEqual(len(result.output.strip().splitlines()), 4)
+        self.assertEqual(len(result.output.strip().splitlines()), 5)
         for text in (str(self.root), "bilibili", "3.8.0", "当前默认档位", "HD · 高清"):
             self.assertIn(text, result.output)
         self.assertNotIn("未校验", result.output)
@@ -485,6 +612,32 @@ class ResourceTierTests(unittest.TestCase):
         self.assertIn("SD · 标清", result.output)
         self.assertIn("HD · 高清", result.output)
         self.assertIn("UHD · 极致", result.output)
+
+    def test_status_displays_tool_version_and_cached_update_notice(self):
+        with (
+            patch("ww_manager.cli.__version__", "2.3.1"),
+            patch("ww_manager.cli.load_app_config", return_value={"latest_available_version": "2.4.0"}),
+        ):
+            result = self.invoke("status")
+        self.assertEqual(result.exit_code, 0, result.output)
+        for text in ("工具版本", "游戏版本", "2.3.1 → 2.4.0", "可更新", "ww update"):
+            self.assertIn(text, result.output)
+        self.assertEqual(self.server.requests, [])
+
+    def test_status_does_not_claim_update_without_newer_cached_version(self):
+        for latest in (None, "", "2.3.1", "2.3.0", "invalid", 123):
+            with (
+                self.subTest(latest=latest),
+                patch("ww_manager.cli.__version__", "2.3.1"),
+                patch("ww_manager.cli.load_app_config", return_value={"latest_available_version": latest}),
+            ):
+                result = self.invoke("status")
+                self.assertEqual(result.exit_code, 0, result.output)
+                self.assertIn("工具版本", result.output)
+                self.assertIn("2.3.1", result.output)
+                self.assertNotIn("可更新", result.output)
+                self.assertNotIn("已是最新", result.output)
+        self.assertEqual(self.server.requests, [])
 
     def test_status_without_install_or_selection(self):
         result = self.invoke("status")

@@ -13,7 +13,6 @@ source.tar.gz
 PKGBUILD
 
 # Test and development
-test-scripts/
 *.exe
 *.dll
 *.zip
