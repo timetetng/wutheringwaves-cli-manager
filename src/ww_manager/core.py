@@ -400,11 +400,7 @@ class WGameManager:
             self.md5_cache.clear(task["path"])
         for item in res_list:
             path = self._managed_path(item["dest"])
-            if (
-                not path.is_file()
-                or path.stat().st_size != item["size"]
-                or self.md5_cache.get(path) != item["md5"]
-            ):
+            if not path.is_file() or path.stat().st_size != item["size"] or self.md5_cache.get(path) != item["md5"]:
                 self.md5_cache.save()
                 raise NetworkError(f"基础资源校验失败: {item['dest']}；请重跑下载命令或 ww sync")
         self.md5_cache.save()
@@ -414,8 +410,7 @@ class WGameManager:
             except NetworkError as e:
                 raise NetworkError(f"组合安装未完成，请重跑原 download/sync 命令续传: {e}") from e
         if tier == "hd" and any(
-            tuple(p.lower() for p in Path(item["dest"]).parts[:3]) == ("client", "content", "hd")
-            for item in res_list
+            tuple(p.lower() for p in Path(item["dest"]).parts[:3]) == ("client", "content", "hd") for item in res_list
         ):
             # HD 已包含在渠道全量清单中，无需再拉取独立画质配置。
             self._register_installed_tier(
@@ -672,7 +667,12 @@ class WGameManager:
             raise DiskSpaceError(str(e)) from e
 
     def _resource_download_tasks(
-        self, tier: str, prepared: dict, force_check_md5: bool = False, *, cache: Optional[MD5Cache] = None,
+        self,
+        tier: str,
+        prepared: dict,
+        force_check_md5: bool = False,
+        *,
+        cache: Optional[MD5Cache] = None,
     ) -> List[dict]:
         if cache is None:
             cache = MD5Cache(self._managed_path(f"wwm_md5_cache_resource_{tier}.json"), self.game_folder)
@@ -684,10 +684,14 @@ class WGameManager:
             valid = path.is_file() and path.stat().st_size == item["size"] and cache.get(path) == item["md5"]
             if not valid:
                 source = f"{prepared['base'].strip('/')}/{item['source']}"
-                tasks.append({
-                    "url": quote(urljoin(prepared["cdn"], source), safe=":/"),
-                    "path": path, "size": item["size"], "md5": item["md5"],
-                })
+                tasks.append(
+                    {
+                        "url": quote(urljoin(prepared["cdn"], source), safe=":/"),
+                        "path": path,
+                        "size": item["size"],
+                        "md5": item["md5"],
+                    }
+                )
         return tasks
 
     def _tier_is_current(self, tier: str, version: str) -> bool:
@@ -699,8 +703,12 @@ class WGameManager:
         states = {s["tier"]: s for s in self.resource_tier_status()}
         if self.server_type == "global" and not self.allow_untested:
             return [
-                {**states[tier], "installed": False, "prepared": None,
-                 "error": "国际服复用国服清单未验证；须使用 ww resource --allow-untested"}
+                {
+                    **states[tier],
+                    "installed": False,
+                    "prepared": None,
+                    "error": "国际服复用国服清单未验证；须使用 ww resource --allow-untested",
+                }
                 for tier in ("sd", "hd", "uhd")
             ]
         bundle = self.get_bundle_config()
@@ -712,11 +720,16 @@ class WGameManager:
                 prepared = self._prepare_resource_tier(tier, bundle=bundle)
                 installed = self._tier_is_current(tier, prepared["version"])
                 tasks = [] if installed else self._resource_download_tasks(tier, prepared)
-                rows.append({
-                    **state, "installed": installed, "prepared": prepared,
-                    "total_size": sum(i["size"] for i in prepared["resources"]),
-                    "download_size": sum(t["size"] for t in tasks), "error": None,
-                })
+                rows.append(
+                    {
+                        **state,
+                        "installed": installed,
+                        "prepared": prepared,
+                        "total_size": sum(i["size"] for i in prepared["resources"]),
+                        "download_size": sum(t["size"] for t in tasks),
+                        "error": None,
+                    }
+                )
             except (WWError, OSError) as e:
                 rows.append({**state, "installed": False, "prepared": None, "error": str(e)})
         return rows
@@ -734,7 +747,11 @@ class WGameManager:
             self._install_resource_tier(tier, prepared, force_space=force_space)
 
     def _prepare_resource_tier(
-        self, tier: str, config_url: Optional[str] = None, *, bundle: Optional[dict] = None,
+        self,
+        tier: str,
+        config_url: Optional[str] = None,
+        *,
+        bundle: Optional[dict] = None,
     ) -> dict:
         """只读预检，组合安装须在公共文件下载前确认画质清单有效。"""
         self._require_untested_resources()
@@ -775,7 +792,12 @@ class WGameManager:
         return {"bundle": bundle, "version": version, "resources": resources, "cdn": cdn, "base": base}
 
     def _install_resource_tier(
-        self, tier: str, prepared: dict, force_check_md5: bool = False, *, force_space: bool = False,
+        self,
+        tier: str,
+        prepared: dict,
+        force_check_md5: bool = False,
+        *,
+        force_space: bool = False,
     ) -> None:
         bundle, version = prepared["bundle"], prepared["version"]
         resources = prepared["resources"]
@@ -870,9 +892,7 @@ class WGameManager:
             version = record.get("version", "") if isinstance(record, dict) else ""
             registered = bool(version and data.get("version") == version and data.get("packName") == tier)
             present = directory.is_dir() and any(directory.iterdir())
-            state = (
-                "已安装" if registered and present else ("未登记/不完整" if present or version else "未安装")
-            )
+            state = "已安装" if registered and present else ("未登记/不完整" if present or version else "未安装")
             if tier in selection.get("incomplete", []):
                 state = "更新未完成"
             states.append(
@@ -1323,7 +1343,9 @@ class WGameManager:
         if self.server_type != "global" or updater.has_pending_plan():
             return updater.download(config_url, force_space=force_space)
         if self.current_resource_tier() != "hd":
-            raise ConfigError("国际服实验性档位的增量更新尚未验证；请用 ww resource <tier> --allow-untested 校验更新档位")
+            raise ConfigError(
+                "国际服实验性档位的增量更新尚未验证；请用 ww resource <tier> --allow-untested 校验更新档位"
+            )
         logger.info("国际服使用默认 HD 基础增量")
         manager = IncrementalManager(
             self.game_folder,

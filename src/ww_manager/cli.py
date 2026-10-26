@@ -344,10 +344,14 @@ def _local_server(path: Path) -> Optional[str]:
 
 def _select_server(path: Path, *, title: str) -> Optional[ServerType]:
     names = {"cn": "官服", "bilibili": "哔哩哔哩服", "global": "国际服"}
-    selected = _run_menu(build_selection_menu(
-        [MenuOption(key, f"{key} · {name}") for key, name in names.items()],
-        _local_server(path), title=title, current_label="当前服务器",
-    ))
+    selected = _run_menu(
+        build_selection_menu(
+            [MenuOption(key, f"{key} · {name}") for key, name in names.items()],
+            _local_server(path),
+            title=title,
+            current_label="当前服务器",
+        )
+    )
     return ServerType(selected.key) if selected is not None else None
 
 
@@ -385,16 +389,29 @@ def download(
             server = _select_server(path, title="下载客户端 · 1/2 选择服务器")
             if server is None:
                 return
-            choice = _run_menu(build_selection_menu(
-                [MenuOption(
-                    key, f"{key.upper()} · {name}",
-                    description="未验证 · 国服清单" if server == ServerType.global_server and key != "hd" else "",
-                    description_style="fg:ansiyellow" if server == ServerType.global_server and key != "hd" else "",
-                    blocked_reason="国际服其他档位未验证；如接受复用国服清单的风险，请加 --allow-untested"
-                    if server == ServerType.global_server and key != "hd" and not allow_untested else None,
-                ) for key, name in TIER_NAMES.items()],
-                "hd", title=f"下载客户端 · 2/2 选择资源档位 · {server.value}", current_label="默认下载",
-            ))
+            choice = _run_menu(
+                build_selection_menu(
+                    [
+                        MenuOption(
+                            key,
+                            f"{key.upper()} · {name}",
+                            description="未验证 · 国服清单"
+                            if server == ServerType.global_server and key != "hd"
+                            else "",
+                            description_style="fg:ansiyellow"
+                            if server == ServerType.global_server and key != "hd"
+                            else "",
+                            blocked_reason="国际服其他档位未验证；如接受复用国服清单的风险，请加 --allow-untested"
+                            if server == ServerType.global_server and key != "hd" and not allow_untested
+                            else None,
+                        )
+                        for key, name in TIER_NAMES.items()
+                    ],
+                    "hd",
+                    title=f"下载客户端 · 2/2 选择资源档位 · {server.value}",
+                    current_label="默认下载",
+                )
+            )
             if choice is None:
                 return
             tier = choice.key
@@ -422,33 +439,40 @@ def run_resource_menu(manager: WGameManager, *, force_space: bool = False) -> No
                 blocked = row["error"]
             else:
                 version = row["prepared"]["version"]
-                description = (
-                    f"✓ 已安装 · v{version}" if row["installed"]
-                    else f"× {row['state']} · 目标 v{version}"
-                )
+                description = f"✓ 已安装 · v{version}" if row["installed"] else f"× {row['state']} · 目标 v{version}"
                 if row["state"] == "已安装" and not row["installed"]:
                     description = f"× 需更新 · v{row['version']} → v{version}"
                 details = (
-                    f"完整包 {row['total_size'] / 1024**3:.2f} GiB"
-                    f" · 本次下载 {row['download_size'] / 1024**3:.2f} GiB"
+                    f"完整包 {row['total_size'] / 1024**3:.2f} GiB · 本次下载 {row['download_size'] / 1024**3:.2f} GiB"
                 )
                 blocked = None if force_space else manager.space_shortage(row["download_size"], free)
             if manager.server_type == "global" and "未验证" not in description:
                 description += " · 未验证（国服清单）"
-            options.append(MenuOption(
-                key=tier, label=f"{tier.upper()} · {TIER_NAMES[tier]}", description=description,
-                details=details, blocked_reason=blocked,
-                description_style="fg:ansigreen bold" if row["installed"] else "fg:ansired bold",
-            ))
+            options.append(
+                MenuOption(
+                    key=tier,
+                    label=f"{tier.upper()} · {TIER_NAMES[tier]}",
+                    description=description,
+                    details=details,
+                    blocked_reason=blocked,
+                    description_style="fg:ansigreen bold" if row["installed"] else "fg:ansired bold",
+                )
+            )
         space = f"{free / 1024**3:.2f} GiB" if free is not None else "未知（无法检查）"
         subtitle = f"可用空间 {space} · 不计解压与预留空间"
         if force_space:
             subtitle += " · --force 已绕过空间拦截"
         current = manager._read_resource_state()["active_tier"]
-        selected = _run_menu(build_selection_menu(
-            options, current, title="画质档位", subtitle=subtitle, initial_key=focused_key,
-            shortcuts=[MenuShortcut("d", "删除高亮档位", "remove")],
-        ))
+        selected = _run_menu(
+            build_selection_menu(
+                options,
+                current,
+                title="画质档位",
+                subtitle=subtitle,
+                initial_key=focused_key,
+                shortcuts=[MenuShortcut("d", "删除高亮档位", "remove")],
+            )
+        )
         if selected is None:
             return
         if selected.action == "remove":
@@ -468,7 +492,9 @@ def _interactive_terminal() -> bool:
 @app.command()
 def resource(
     ctx: typer.Context,
-    tier: Annotated[Optional[str], typer.Argument(help="资源档位: sd 标清 / hd 高清 / uhd 极致；省略打开选择菜单")] = None,
+    tier: Annotated[
+        Optional[str], typer.Argument(help="资源档位: sd 标清 / hd 高清 / uhd 极致；省略打开选择菜单")
+    ] = None,
     config_url: Annotated[
         Optional[str],
         typer.Option("--config-url", help="覆盖自动获取的官方画质配置地址（通常无需指定）"),
@@ -524,7 +550,10 @@ def resource(
             mgr.remove_resource_tier(tier)
         else:
             mgr.download_resource_tier(
-                tier, config_url=config_url, force_check_md5=force_md5, force_space=force,
+                tier,
+                config_url=config_url,
+                force_check_md5=force_md5,
+                force_space=force,
             )
     except (WWError, OSError) as e:
         typer.secho(f"执行失败: {e}", fg="red")

@@ -62,7 +62,9 @@ class DemoMenuTests(unittest.TestCase):
 
     def test_resource_demo_cancelled_delete_preserves_default(self):
         code, output, menu = self.run_demo(
-            "resource", [MenuOption("hd", "高清", action="remove"), None], confirm=False,
+            "resource",
+            [MenuOption("hd", "高清", action="remove"), None],
+            confirm=False,
         )
         self.assertEqual(code, 0, output)
         hd = next(option for option in menu.call_args.args[0] if option.key == "hd")
@@ -71,7 +73,8 @@ class DemoMenuTests(unittest.TestCase):
 
     def test_download_demo_uses_both_real_menu_stages(self):
         code, output, menu = self.run_demo(
-            "download", [MenuOption("bilibili", "B服"), MenuOption("sd", "标清")],
+            "download",
+            [MenuOption("bilibili", "B服"), MenuOption("sd", "标清")],
         )
         self.assertEqual(code, 0, output)
         self.assertEqual(menu.call_count, 2)
@@ -79,7 +82,9 @@ class DemoMenuTests(unittest.TestCase):
 
     def test_download_demo_low_space_has_failure_exit_code(self):
         code, output, _ = self.run_demo(
-            "download", [MenuOption("bilibili", "B服"), MenuOption("uhd", "极致")], low_space=True,
+            "download",
+            [MenuOption("bilibili", "B服"), MenuOption("uhd", "极致")],
+            low_space=True,
         )
         self.assertEqual(code, 1, output)
         self.assertIn("空间不足", output)
@@ -87,8 +92,10 @@ class DemoMenuTests(unittest.TestCase):
 
     def test_download_demo_force_only_simulates_bypass(self):
         code, output, _ = self.run_demo(
-            "download", [MenuOption("bilibili", "B服"), MenuOption("uhd", "极致")],
-            low_space=True, force=True,
+            "download",
+            [MenuOption("bilibili", "B服"), MenuOption("uhd", "极致")],
+            low_space=True,
+            force=True,
         )
         self.assertEqual(code, 0, output)
         self.assertIn("--force 已绕过", output)

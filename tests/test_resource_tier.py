@@ -21,8 +21,8 @@ from typer.testing import CliRunner
 from ww_manager.cli import app
 from ww_manager.config import RESOURCE_CONFIG_URLS
 from ww_manager.core import ConfigError, DiskSpaceError, MD5Cache, NetworkError, WGameManager
-from ww_manager.menu import MenuOption
 from ww_manager.download import create_download_progress, download_single_file
+from ww_manager.menu import MenuOption
 from ww_manager.resource_updates import ResourceUpdater
 
 GOOD = b"official-resource-content"
@@ -432,9 +432,15 @@ class ResourceTierTests(unittest.TestCase):
 
     def test_global_allowed_resource_preserves_channel_and_selected_tier(self):
         self.use_global_server()
-        self.put("launcherDownloadConfig.json", json.dumps({
-            "appId": self.manager.config["appId"], "version": "3.8.0",
-        }).encode())
+        self.put(
+            "launcherDownloadConfig.json",
+            json.dumps(
+                {
+                    "appId": self.manager.config["appId"],
+                    "version": "3.8.0",
+                }
+            ).encode(),
+        )
         result = self.invoke("resource", "uhd", "--allow-untested")
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(self.manager.current_resource_tier(), "uhd")
@@ -487,9 +493,13 @@ class ResourceTierTests(unittest.TestCase):
     def test_global_sync_experimental_tier_requires_explicit_opt_in_again(self):
         self.use_global_server()
         self.prepare_full_download("uhd")
-        self.manager._write_local_json("wwm_resource_state.json", {
-            "active_tier": "uhd", "versions": {"uhd": "3.8.0"},
-        })
+        self.manager._write_local_json(
+            "wwm_resource_state.json",
+            {
+                "active_tier": "uhd",
+                "versions": {"uhd": "3.8.0"},
+            },
+        )
         result = self.invoke("sync")
         self.assertNotEqual(result.exit_code, 0, result.output)
         self.assertIn("--allow-untested", result.output)
@@ -499,9 +509,13 @@ class ResourceTierTests(unittest.TestCase):
 
     def test_global_experimental_tier_does_not_silently_update_hd(self):
         self.use_global_server()
-        self.manager._write_local_json("wwm_resource_state.json", {
-            "active_tier": "uhd", "versions": {"uhd": "3.8.0"},
-        })
+        self.manager._write_local_json(
+            "wwm_resource_state.json",
+            {
+                "active_tier": "uhd",
+                "versions": {"uhd": "3.8.0"},
+            },
+        )
         with patch("ww_manager.core.IncrementalManager") as engine:
             with self.assertRaisesRegex(ConfigError, "增量更新尚未验证"):
                 self.manager.download_incremental()
@@ -1109,7 +1123,10 @@ class ResourceTierTests(unittest.TestCase):
         self.put("launcherDownloadConfig.json", b'{"appId":"10003","version":"3.8.0"}')
         source = {"resource": [item(data=b"old")], "version": "3.8.0"}
         target = {
-            "resource": [item()], "version": "3.8.0", "cdn": self.url, "res_base": "files",
+            "resource": [item()],
+            "version": "3.8.0",
+            "cdn": self.url,
+            "res_base": "files",
             "info": {"default": {"version": "3.8.0"}},
         }
         return {"cn": source, "bilibili": target}

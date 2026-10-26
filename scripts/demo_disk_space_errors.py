@@ -57,19 +57,33 @@ def preview(scenario: Scenario, directory: Path) -> str:
         raise AssertionError("演示场景应当因空间不足退出")
 
     for method in (
-        "download_full", "download_resource_tier", "sync_files", "verify_new_version",
-        "checkout", "download_incremental", "apply_incremental",
+        "download_full",
+        "download_resource_tier",
+        "sync_files",
+        "verify_new_version",
+        "checkout",
+        "download_incremental",
+        "apply_incremental",
     ):
         getattr(manager, method).side_effect = reject
 
     with ExitStack() as stack:
         for name in (
-            "_auto_install_completion", "setup_logging", "check_pypi_version_silent", "save_app_config",
+            "_auto_install_completion",
+            "setup_logging",
+            "check_pypi_version_silent",
+            "save_app_config",
         ):
             stack.enter_context(patch(f"ww_manager.cli.{name}"))
-        stack.enter_context(patch("ww_manager.cli.load_app_config", return_value={
-            "default_path": str(directory), "latest_available_version": "999.0",
-        }))
+        stack.enter_context(
+            patch(
+                "ww_manager.cli.load_app_config",
+                return_value={
+                    "default_path": str(directory),
+                    "latest_available_version": "999.0",
+                },
+            )
+        )
         stack.enter_context(patch("ww_manager.cli.WGameManager", return_value=manager))
         result = CliRunner().invoke(app, list(scenario.args), input="y\n", color=True)
     if result.exit_code != 1 or "空间不足" not in result.output:

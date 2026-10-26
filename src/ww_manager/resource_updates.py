@@ -33,8 +33,13 @@ class PackIncrementalManager(IncrementalManager):
             owner._managed_path(f".incremental_download/packs/{name}/{metadata}")
         owner._managed_path(f".ww_manager_cache/packs/{name}/indexFile.json")
         super().__init__(
-            owner.game_folder, owner.server_type, {"default": {"config": entry["config"]}}, plan["cdn"], name,
-            force_space=force_space, space_check=owner._check_download_space,
+            owner.game_folder,
+            owner.server_type,
+            {"default": {"config": entry["config"]}},
+            plan["cdn"],
+            name,
+            force_space=force_space,
+            space_check=owner._check_download_space,
         )
         self._index_file = entry.get("index")
 
@@ -349,7 +354,9 @@ class ResourceUpdater:
                 if name != "common":
                     self.owner._unregister_installed_tier(name, self.owner._read_local_config())
                 logger.info(f"应用 {name}: {entry['from_version']} → {entry['to_version']}")
-                if not PackIncrementalManager(self.owner, name, entry, plan, force_space=force_space).apply_incremental():
+                if not PackIncrementalManager(
+                    self.owner, name, entry, plan, force_space=force_space
+                ).apply_incremental():
                     raise WWError(f"{name} 应用未完成；主版本未升级，请勿启动游戏，重跑 ww incremental --apply 续作")
             cfg = self.owner._read_local_config()
             cfg.update(

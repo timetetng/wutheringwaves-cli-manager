@@ -26,8 +26,14 @@ class CliHelpTests(unittest.TestCase):
         result = self.runner.invoke(app, ["--help"])
         self.assertEqual(result.exit_code, 0, result.output)
         for text in (
-            "下载客户端", "下载画质资源包", "切换服务器", "查看状态",
-            "下载或应用增量更新", "校验并修复文件", "获取抽卡记录链接", "更新工具",
+            "下载客户端",
+            "下载画质资源包",
+            "切换服务器",
+            "查看状态",
+            "下载或应用增量更新",
+            "校验并修复文件",
+            "获取抽卡记录链接",
+            "更新工具",
         ):
             self.assertIn(text, result.output)
         for text in ("[初始化]", "Client/Content", "3.7+", "incremental", "不带档位"):

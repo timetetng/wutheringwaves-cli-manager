@@ -22,12 +22,19 @@ CHOICES = (
 
 class ResourceMenuTests(unittest.TestCase):
     def run_keys(
-        self, keys, *, free_bytes=80 * GIB, current_tier: Optional[str] = "hd",
-        shortcuts=(), initial_key=None,
+        self,
+        keys,
+        *,
+        free_bytes=80 * GIB,
+        current_tier: Optional[str] = "hd",
+        shortcuts=(),
+        initial_key=None,
     ):
         options = [
             MenuOption(
-                key, name, "✓ 已安装" if key == "hd" else "× 未安装",
+                key,
+                name,
+                "✓ 已安装" if key == "hd" else "× 未安装",
                 "完整包 · 预计新增",
                 "空间不足" if required > free_bytes else None,
                 description_style="fg:ansigreen bold" if key == "hd" else "fg:ansired bold",
@@ -36,8 +43,13 @@ class ResourceMenuTests(unittest.TestCase):
         ]
         with create_pipe_input() as pipe:
             app = build_selection_menu(
-                options, current_tier, title="模拟数据", shortcuts=shortcuts, initial_key=initial_key,
-                input=pipe, output=DummyOutput(),
+                options,
+                current_tier,
+                title="模拟数据",
+                shortcuts=shortcuts,
+                initial_key=initial_key,
+                input=pipe,
+                output=DummyOutput(),
             )
             snapshots = []
 
@@ -62,8 +74,8 @@ class ResourceMenuTests(unittest.TestCase):
 
             app.after_render += capture
             result = app.run(pre_run=start_input)
-        selected = None if result is None else (
-            result.key if result.action == "select" else f"{result.action}:{result.key}"
+        selected = (
+            None if result is None else (result.key if result.action == "select" else f"{result.action}:{result.key}")
         )
         return selected, "\n".join(snapshots)
 
@@ -77,7 +89,8 @@ class ResourceMenuTests(unittest.TestCase):
         self.assertIn(
             "   标清  × 未安装\n   完整包 · 预计新增\n"
             " › 高清  ✓ 已安装  [当前默认]\n   完整包 · 预计新增\n"
-            "   极致  × 未安装", screen,
+            "   极致  × 未安装",
+            screen,
         )
 
     def test_selection_keys(self):
@@ -122,7 +135,8 @@ class ResourceMenuTests(unittest.TestCase):
 
     def test_delete_shortcut_returns_highlighted_item_even_if_download_blocked(self):
         result, screen = self.run_keys(
-            "\x1b[Bd", free_bytes=0,
+            "\x1b[Bd",
+            free_bytes=0,
             shortcuts=[MenuShortcut("d", "删除高亮档位", "remove")],
         )
         self.assertEqual(result, "remove:uhd")
@@ -143,9 +157,13 @@ class ResourceMenuTests(unittest.TestCase):
     def test_shortcut_bindings_keep_their_own_actions(self):
         for key, action in (("d", "remove"), ("e", "export")):
             with self.subTest(key=key):
-                result, _ = self.run_keys(key, shortcuts=[
-                    MenuShortcut("d", "删除", "remove"), MenuShortcut("e", "导出", "export"),
-                ])
+                result, _ = self.run_keys(
+                    key,
+                    shortcuts=[
+                        MenuShortcut("d", "删除", "remove"),
+                        MenuShortcut("e", "导出", "export"),
+                    ],
+                )
                 self.assertEqual(result, f"{action}:hd")
 
     def test_conflicting_shortcuts_are_rejected(self):

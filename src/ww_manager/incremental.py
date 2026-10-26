@@ -43,9 +43,9 @@ from rich.text import Text
 
 from ww_manager.download import (
     RAINBOW_COLORS,
+    DownloadSpaceError,
     NetworkError,
     RainbowBarColumn,
-    DownloadSpaceError,
     available_disk_space,
     check_space_requirement,
     create_download_progress,
@@ -272,8 +272,15 @@ class IncrementalManager:
     """统一的增量更新管理器，支持 cn、global、bilibili"""
 
     def __init__(
-        self, game_folder: Path, server_type: str, api_data: Dict, cdn_base: str, pack_name: Optional[str] = None,
-        *, force_space: bool = False, space_check: Optional[Callable[[List[dict], bool], None]] = None,
+        self,
+        game_folder: Path,
+        server_type: str,
+        api_data: Dict,
+        cdn_base: str,
+        pack_name: Optional[str] = None,
+        *,
+        force_space: bool = False,
+        space_check: Optional[Callable[[List[dict], bool], None]] = None,
     ):
         self.game_folder = game_folder
         self.server_type = server_type

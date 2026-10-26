@@ -48,7 +48,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     free_bytes = (5 if args.low_space else 80) * GIB
     try:
         choice = build_selection_menu(
-            demo_options(free_bytes), "hd",
+            demo_options(free_bytes),
+            "hd",
             title="画质档位 · 交互原型（全部为模拟数据）",
             subtitle=f"可用空间 {format_size(free_bytes)}",
         ).run()

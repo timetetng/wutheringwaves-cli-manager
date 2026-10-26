@@ -593,9 +593,14 @@ class ResourceUpdateTests(unittest.TestCase):
     def test_global_incremental_checks_space_and_supports_force(self):
         self.owner.server_type = "global"
         self.choose("hd")
-        self.owner._launcher_info = {"default": {"version": TARGET, "config": {
-            "patchConfig": [{"version": SOURCE, "indexFile": "patch/common.json", "baseUrl": "files"}],
-        }}}
+        self.owner._launcher_info = {
+            "default": {
+                "version": TARGET,
+                "config": {
+                    "patchConfig": [{"version": SOURCE, "indexFile": "patch/common.json", "baseUrl": "files"}],
+                },
+            }
+        }
         self.owner._cdn_node = self.url
         with patch.object(self.owner, "available_disk_space", return_value=0):
             with self.assertRaises(DiskSpaceError):
@@ -607,10 +612,19 @@ class ResourceUpdateTests(unittest.TestCase):
 
     def test_patch_transport_size_not_output_size_is_checked(self):
         diff = b"patch"
-        self.set_index("uhd", {"resource": [file_item("uhd.krpdiff", diff)], "groupInfos": [{
-            "dest": "uhd.krpdiff", "srcFiles": [file_item(destination("uhd"), OLD)],
-            "dstFiles": [file_item(destination("uhd"))],
-        }]})
+        self.set_index(
+            "uhd",
+            {
+                "resource": [file_item("uhd.krpdiff", diff)],
+                "groupInfos": [
+                    {
+                        "dest": "uhd.krpdiff",
+                        "srcFiles": [file_item(destination("uhd"), OLD)],
+                        "dstFiles": [file_item(destination("uhd"))],
+                    }
+                ],
+            },
+        )
         plan = self.updater._create_plan(None)
         engine = PackIncrementalManager(self.owner, "uhd", plan["packs"]["uhd"], plan)
         tasks = engine.pending_download_tasks()
@@ -621,10 +635,19 @@ class ResourceUpdateTests(unittest.TestCase):
     def test_apply_fallback_checks_space_and_force_can_resume(self):
         diff = b"patch-transport"
         self.server.payloads["/files/uhd.krpdiff"] = diff
-        self.set_index("uhd", {"resource": [file_item("uhd.krpdiff", diff)], "groupInfos": [{
-            "dest": "uhd.krpdiff", "srcFiles": [file_item(destination("uhd"), OLD)],
-            "dstFiles": [file_item(destination("uhd"))],
-        }]})
+        self.set_index(
+            "uhd",
+            {
+                "resource": [file_item("uhd.krpdiff", diff)],
+                "groupInfos": [
+                    {
+                        "dest": "uhd.krpdiff",
+                        "srcFiles": [file_item(destination("uhd"), OLD)],
+                        "dstFiles": [file_item(destination("uhd"))],
+                    }
+                ],
+            },
+        )
         self.assertTrue(self.owner.download_incremental())
         # 模拟 hpatchz 失败，触发完整资源回退，不执行真实外部程序。
         self.server.requested.clear()

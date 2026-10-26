@@ -49,10 +49,13 @@ class DemoManager:
     def resource_menu_data(self):
         return [
             {
-                "tier": tier, "state": "已安装" if tier in self.installed else "未安装",
+                "tier": tier,
+                "state": "已安装" if tier in self.installed else "未安装",
                 "version": VERSION if tier in self.installed else None,
-                "installed": tier in self.installed, "error": None,
-                "total_size": size, "download_size": 0 if tier in self.installed else size,
+                "installed": tier in self.installed,
+                "error": None,
+                "total_size": size,
+                "download_size": 0 if tier in self.installed else size,
                 "prepared": {"version": VERSION},
             }
             for tier, size in SIZES.items()
@@ -120,18 +123,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     with tempfile.TemporaryDirectory(prefix="ww-menu-demo-") as temporary, ExitStack() as stack:
         root = Path(temporary)
         for name in (
-            "_auto_install_completion", "setup_logging", "check_pypi_version_silent", "save_app_config",
+            "_auto_install_completion",
+            "setup_logging",
+            "check_pypi_version_silent",
+            "save_app_config",
         ):
             stack.enter_context(patch(f"ww_manager.cli.{name}"))
-        stack.enter_context(patch("ww_manager.cli.load_app_config", return_value={
-            "default_path": str(root), "latest_available_version": "999.0",
-        }))
-        stack.enter_context(patch(
-            "ww_manager.cli._local_server", return_value=None if args.command == "download" else "bilibili",
-        ))
-        stack.enter_context(patch("ww_manager.cli.WGameManager", side_effect=lambda path, server: DemoManager(
-            path, server, free_bytes,
-        )))
+        stack.enter_context(
+            patch(
+                "ww_manager.cli.load_app_config",
+                return_value={
+                    "default_path": str(root),
+                    "latest_available_version": "999.0",
+                },
+            )
+        )
+        stack.enter_context(
+            patch(
+                "ww_manager.cli._local_server",
+                return_value=None if args.command == "download" else "bilibili",
+            )
+        )
+        stack.enter_context(
+            patch(
+                "ww_manager.cli.WGameManager",
+                side_effect=lambda path, server: DemoManager(
+                    path,
+                    server,
+                    free_bytes,
+                ),
+            )
+        )
         command = [args.command] + (["--force"] if args.force else [])
         if args.allow_untested:
             command.append("--allow-untested")

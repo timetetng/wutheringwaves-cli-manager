@@ -26,9 +26,13 @@ class CommandMenuTests(unittest.TestCase):
         self.start_patch("ww_manager.cli._auto_install_completion")
         self.start_patch("ww_manager.cli.setup_logging")
         self.start_patch("ww_manager.cli.check_pypi_version_silent")
-        self.start_patch("ww_manager.cli.load_app_config", return_value={
-            "default_path": str(self.root), "latest_available_version": "999.0",
-        })
+        self.start_patch(
+            "ww_manager.cli.load_app_config",
+            return_value={
+                "default_path": str(self.root),
+                "latest_available_version": "999.0",
+            },
+        )
         self.save_config = self.start_patch("ww_manager.cli.save_app_config")
 
     def start_patch(self, target, **kwargs):
@@ -122,9 +126,14 @@ class CommandMenuTests(unittest.TestCase):
         self.factory.assert_not_called()
 
     def test_checkout_highlights_current_server_and_preserves_flags(self):
-        (self.root / "launcherDownloadConfig.json").write_text(json.dumps({
-            "appId": SERVER_CONFIGS["bilibili"]["appId"],
-        }), encoding="utf-8")
+        (self.root / "launcherDownloadConfig.json").write_text(
+            json.dumps(
+                {
+                    "appId": SERVER_CONFIGS["bilibili"]["appId"],
+                }
+            ),
+            encoding="utf-8",
+        )
         self.menu.return_value.run.return_value = MenuOption("cn", "官服")
         result = self.invoke("checkout", "--force", "--force-sync")
         self.assertEqual(result.exit_code, 0, result.output)
