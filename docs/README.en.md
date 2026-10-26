@@ -103,7 +103,7 @@ Pass the launch argument for an installed quality tier:
 
 | Tier | Launch argument |
 |---|---|
-| SD · Standard | `-krqlv=sd` |
+| SD · Smooth | `-krqlv=sd` |
 | HD · High | `-krqlv=hd` |
 | UHD · Ultra | `-krqlv=uhd` |
 

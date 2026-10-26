@@ -24,7 +24,7 @@ from ww_manager.download import format_bytes, space_shortage
 
 GIB = 1024**3
 SIZES = {"sd": 12 * GIB, "hd": 24 * GIB, "uhd": 48 * GIB}
-NAMES = {"sd": "标清", "hd": "高清", "uhd": "极致"}
+NAMES = {"sd": "流畅", "hd": "高清", "uhd": "极致"}
 VERSION = "3.7.1"
 
 

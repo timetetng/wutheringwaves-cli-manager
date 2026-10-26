@@ -74,7 +74,7 @@ class DemoMenuTests(unittest.TestCase):
     def test_download_demo_uses_both_real_menu_stages(self):
         code, output, menu = self.run_demo(
             "download",
-            [MenuOption("bilibili", "B服"), MenuOption("sd", "标清")],
+            [MenuOption("bilibili", "B服"), MenuOption("sd", "流畅")],
         )
         self.assertEqual(code, 0, output)
         self.assertEqual(menu.call_count, 2)

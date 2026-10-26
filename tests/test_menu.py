@@ -14,7 +14,7 @@ from ww_manager.menu import MenuOption, MenuShortcut, build_selection_menu
 
 GIB = 1024**3
 CHOICES = (
-    ("sd", "标清", 12 * GIB),
+    ("sd", "流畅", 12 * GIB),
     ("hd", "高清", 0),
     ("uhd", "极致", 48 * GIB),
 )
@@ -82,12 +82,12 @@ class ResourceMenuTests(unittest.TestCase):
     def test_enter_confirms_current_default(self):
         result, screen = self.run_keys("\r")
         self.assertEqual(result, "hd")
-        for text in ("[当前默认]", "标清", "高清", "极致", "完整包", "预计新增", "模拟数据"):
+        for text in ("[当前默认]", "流畅", "高清", "极致", "完整包", "预计新增", "模拟数据"):
             self.assertIn(text, screen)
         for text in ("空格", "●", "○"):
             self.assertNotIn(text, screen)
         self.assertIn(
-            "   标清  × 未安装\n   完整包 · 预计新增\n"
+            "   流畅  × 未安装\n   完整包 · 预计新增\n"
             " › 高清  ✓ 已安装  [当前默认]\n   完整包 · 预计新增\n"
             "   极致  × 未安装",
             screen,

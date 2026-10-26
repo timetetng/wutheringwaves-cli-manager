@@ -623,7 +623,7 @@ class ResourceTierTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("已安装", result.output)
         self.assertNotIn("未校验", result.output)
-        self.assertIn("SD · 标清", result.output)
+        self.assertIn("SD · 流畅", result.output)
         self.assertIn("HD · 高清", result.output)
         self.assertIn("UHD · 极致", result.output)
 

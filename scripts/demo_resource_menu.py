@@ -14,7 +14,7 @@ from ww_manager.menu import MenuOption, build_selection_menu
 GIB = 1024**3
 # 所有体积均为展示交互而虚构，不代表真实客户端下载大小。
 DEMO_CHOICES = (
-    ("sd", "标清", 12 * GIB, 12 * GIB),
+    ("sd", "流畅", 12 * GIB, 12 * GIB),
     ("hd", "高清", 24 * GIB, 0),
     ("uhd", "极致", 48 * GIB, 48 * GIB),
 )

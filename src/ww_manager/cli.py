@@ -25,7 +25,7 @@ from ww_manager.menu import MenuOption, MenuShortcut, build_selection_menu
 
 __version__ = metadata.version("ww-manager")
 
-TIER_NAMES = {"sd": "标清", "hd": "高清", "uhd": "极致"}
+TIER_NAMES = {"sd": "流畅", "hd": "高清", "uhd": "极致"}
 UNTESTED_HELP = "允许国际服复用国服画质清单（未验证，不保证兼容）"
 
 
@@ -493,7 +493,7 @@ def _interactive_terminal() -> bool:
 def resource(
     ctx: typer.Context,
     tier: Annotated[
-        Optional[str], typer.Argument(help="资源档位: sd 标清 / hd 高清 / uhd 极致；省略打开选择菜单")
+        Optional[str], typer.Argument(help="资源档位: sd 流畅 / hd 高清 / uhd 极致；省略打开选择菜单")
     ] = None,
     config_url: Annotated[
         Optional[str],

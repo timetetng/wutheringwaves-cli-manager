@@ -103,7 +103,7 @@ ww status
 
 | 档位 | 启动参数 |
 |---|---|
-| SD · 标清 | `-krqlv=sd` |
+| SD · 流畅 | `-krqlv=sd` |
 | HD · 高清 | `-krqlv=hd` |
 | UHD · 极致 | `-krqlv=uhd` |
 
