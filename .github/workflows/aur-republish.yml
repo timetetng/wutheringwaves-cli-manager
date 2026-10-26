@@ -1,0 +1,38 @@
+name: Republish to AUR (pkgrel bump)
+
+# 仅手动触发：版本号不变、只改打包内容（依赖、安装路径、启动参数等）时用。
+# pkgrel 递增后 AUR 上的版本从 X.Y.Z-1 变成 X.Y.Z-2，已安装旧包的用户
+# 才能通过 pacman/yay 升级拿到修正。
+on:
+  workflow_dispatch:
+    inputs:
+      pkgrel:
+        description: 'pkgrel（纯打包修正请递增，例如 2、3…）'
+        required: true
+        default: '2'
+      reason:
+        description: '本次重新打包的原因（写入 commit message）'
+        required: false
+        default: ''
+
+jobs:
+  aur-republish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate PKGBUILD
+        env:
+          PKGREL: ${{ inputs.pkgrel }}
+        run: bash .github/generate-pkgbuild.sh
+
+      - name: Publish AUR package
+        uses: KSXGitHub/github-actions-deploy-aur@master
+        with:
+          pkgname: ww-manager
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ github.repository_owner }}
+          commit_email: ${{ github.repository_owner }}@users.noreply.github.com
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Repackage ${{ github.ref_name }}: pkgrel ${{ inputs.pkgrel }}${{ inputs.reason && format(' - {0}', inputs.reason) || '' }}"
+          ssh_keyscan_types: rsa,ecdsa,ed25519
