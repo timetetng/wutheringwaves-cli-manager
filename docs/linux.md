@@ -14,7 +14,7 @@
 | HD · 高清 | `-krqlv=hd` |
 | UHD · 极致 | `-krqlv=uhd` |
 
-只指定一个档位。可以用 `ww status` 查看工具当前默认档位，但工具不会自动修改 Steam 或其他启动器中的启动参数。
+只指定一个档位。可以用 `ww status` 查看工具当前默认档位，但工具不会自动修改 Steam 或其他启动器中的启动参数。下面是一些启动游戏的参考：
 
 ## Steam + Proton
 
@@ -29,7 +29,24 @@
    -krqlv=hd
    ```
 
-也可以使用 Lutris，或参考仓库中的 `run_ww.sh` 自行配置启动方式，并保持档位参数一致。
+也可以使用 Lutris，或直接调用 DWProton 自带 Wine（见下节）。
+
+## 一键安装（DWProton + 独立 prefix）
+
+不想经过 Steam 或 Lutris 时，用仓库里的一键部署环境脚本（实验性，仅在 Archlinux + niri 图形环境下测试可用）：
+
+```bash
+// 不带参数时默认读 ww-cli 的安装目录
+scripts/setup-linux.sh --game-dir ~/Games/WutheringWaves
+```
+
+脚本依次完成：下载并校验 DWProton、准备 riched20 UTF-8 补丁组件（修复登录协议正文乱码）、建立独立 prefix（DXVK、ICU、字体、DLL 覆盖），最后把启动器装到 `~/.local/bin/run_ww`，并写入桌面启动器入口 `ww.desktop`（图标从游戏自带启动器里提取）。
+
+已存在的 DWProton（`$DWPROTON`、`~/.local/share/dwproton/`、Lutris/Steam 目录等）和已有 prefix 会被直接复用，不重复下载也不移动。
+
+安装后用 `run_ww` 启动（或点桌面图标）。脚本的画质档位自动读取游戏目录的 `wwm_resource_state.json`，`run_ww --check` 只检查路径和档位。日志在 `~/.local/share/ww-linux/logs/game.log`。
+
+已知问题：`bilibili` 服在登录的 webview 框会固定弹出**网络请求失败，请重试**，但是不影响验证码登录，忽略即可。
 
 ### 安装额外的 Proton 版本
 - [dwproton](https://dawn.wine/dawn-winery/dwproton/releases)

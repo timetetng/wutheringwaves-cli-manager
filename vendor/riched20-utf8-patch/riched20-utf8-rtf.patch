@@ -1,0 +1,90 @@
+--- a/dlls/riched20/editor.c
++++ b/dlls/riched20/editor.c
+@@ -1665,6 +1665,9 @@
+       parser.style = style;
+       WriterInit(&parser);
+       RTFInit(&parser);
++      /* EM_SETTEXTEX can explicitly specify UTF-8 for the RTF byte stream. */
++      if ((format & SF_USECODEPAGE) && HIWORD(format) == CP_UTF8)
++        parser.inputCodePage = CP_UTF8;
+       RTFSetReadHook(&parser, ME_RTFReadHook);
+       RTFSetDestinationCallback(&parser, rtfShpPict, ME_RTFReadShpPictGroup);
+       RTFSetDestinationCallback(&parser, rtfPict, ME_RTFReadPictGroup);
+@@ -1823,17 +1826,19 @@
+ }
+ 
+ static void
+-ME_StreamInRTFString(ME_TextEditor *editor, BOOL selection, char *string)
++ME_StreamInRTFString(ME_TextEditor *editor, BOOL selection, char *string, UINT codepage)
+ {
+   EDITSTREAM es;
+   ME_RTFStringStreamStruct data;
++  DWORD format = SF_RTF | (selection ? SFF_SELECTION : 0);
+ 
+   data.string = string;
+   data.length = strlen(string);
+   data.pos = 0;
+   es.dwCookie = (DWORD_PTR)&data;
+   es.pfnCallback = ME_ReadFromRTFString;
+-  ME_StreamIn(editor, SF_RTF | (selection ? SFF_SELECTION : 0), &es, TRUE);
++  if (codepage == CP_UTF8) format |= SF_USECODEPAGE | ((DWORD)CP_UTF8 << 16);
++  ME_StreamIn(editor, format, &es, TRUE);
+ }
+ 
+ 
+@@ -3440,7 +3445,7 @@
+     }
+ 
+     if (bRtf) {
+-      ME_StreamInRTFString(editor, bSelection, (char *)lParam);
++      ME_StreamInRTFString(editor, bSelection, (char *)lParam, pStruct->codepage);
+       if (bSelection) {
+         /* FIXME: The length returned doesn't include the rtf control
+          * characters, only the actual text. */
+@@ -3627,7 +3632,7 @@
+           !strncmp((char *)lParam, "{\\urtf", 6))
+       {
+         /* Undocumented: WM_SETTEXT supports RTF text */
+-        ME_StreamInRTFString(editor, 0, (char *)lParam);
++        ME_StreamInRTFString(editor, 0, (char *)lParam, CP_ACP);
+       }
+       else
+         ME_SetText( editor, (void*)lParam, TRUE );
+--- a/dlls/riched20/reader.c
++++ b/dlls/riched20/reader.c
+@@ -2594,7 +2594,8 @@
+         WCHAR *buffer = malloc(bufferMax);
+         int length;
+ 
+-        length = MultiByteToWideChar(info->codePage, 0, info->cpOutputBuffer,
++        length = MultiByteToWideChar(info->inputCodePage ? info->outputCodePage : info->codePage,
++                                     0, info->cpOutputBuffer,
+                                      info->dwCPOutputCount, buffer, bufferMax/sizeof(WCHAR));
+         info->dwCPOutputCount = 0;
+ 
+@@ -2623,6 +2624,14 @@
+ static void
+ RTFPutCodePageChar(RTF_Info *info, int c)
+ {
++        if (info->inputCodePage)
++        {
++                /* Hex escapes use the RTF charset; literal bytes use the caller's encoding. */
++                int codepage = !strncmp(info->rtfTextBuf, "\\'", 2) ? info->codePage : info->inputCodePage;
++                if (info->dwCPOutputCount && info->outputCodePage != codepage)
++                        RTFFlushCPOutputBuffer(info);
++                info->outputCodePage = codepage;
++        }
+         /* Use dynamic buffer here because it's the best way to handle
+          * MBCS codepages without having to worry about partial chars */
+         if (info->dwCPOutputCount >= info->dwMaxCPOutputCount)
+--- a/dlls/riched20/rtf.h
++++ b/dlls/riched20/rtf.h
+@@ -1141,6 +1141,8 @@
+     RTFColor	*colorList;	/* initialized to NULL */
+     RTFStyle	*styleList;
+     int ansiCodePage; /* ANSI codepage used in conversion to Unicode */
++    int inputCodePage; /* Explicit byte-stream codepage, or zero for document defaults */
++    int outputCodePage; /* Codepage of buffered bytes when inputCodePage is set */
+     int defFont;
+ 
+     /* Character attributes */

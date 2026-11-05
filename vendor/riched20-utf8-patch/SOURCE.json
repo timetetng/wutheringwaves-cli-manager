@@ -1,0 +1,12 @@
+{
+  "dwproton_version": "11.0-15",
+  "wine_commit": "b75a4125963073b01d2b3bfce6060d697d02066b",
+  "source_url": "https://dawn.wine/api/v1/repos/dawn-winery/wine-dwproton/archive/b75a4125963073b01d2b3bfce6060d697d02066b.tar.gz",
+  "source_archive_sha256": "657e9fbb61a3bd3bde414ca09eb60ec94e13edc1f07175861823dc055c076c90",
+  "component_sha256": "f7253d99dbb8688c8a64152b9c4cd251267104c30738797cd9aefbf5a1706b82",
+  "component_size": 2322432,
+  "component_arch": "x86_64-windows",
+  "scope": "仅修复 EM_SETTEXTEX 显式指定 UTF-8 代码页时的 RTF 输入解析；未泛化非 UTF-8 兼容行为。产物由 Wine 源码编译，不是微软 DLL。",
+  "verification": "独立测试程序：5 个目标用例的输出与微软 RichEdit 参考一致，8 个非目标用例输出不变；已在游戏中确认加载路径与协议正文显示。",
+  "rebuild": "scripts/setup-linux.sh --rebuild"
+}
