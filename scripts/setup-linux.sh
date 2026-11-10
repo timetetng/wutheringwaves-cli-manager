@@ -4,8 +4,10 @@
 # 一次执行完成：
 #   1. 下载并校验 DWProton
 #   2. 准备 riched20 UTF-8 补丁组件（修复登录协议正文乱码）
-#   3. 初始化独立 prefix，配置 DXVK、ICU、字体、DLL 覆盖
-#   4. 安装启动器 ~/.local/bin/run_ww 与桌面入口
+#   3. 初始化独立 prefix：DXVK、vkd3d-proton、dxvk-nvapi、NVIDIA NGX 运行时、
+#      ICU、字体、DLL 覆盖
+#   4. 自检 prefix 里的关键 DLL，缺什么补什么
+#   5. 安装启动器 ~/.local/bin/run_ww 与桌面入口
 #
 # 用法：scripts/setup-linux.sh [--game-dir <目录>] 默认则读 ww-cli 安装目录
 set -euo pipefail
@@ -65,6 +67,22 @@ while (($#)); do
 done
 
 need_tool() { command -v "$1" >/dev/null 2>&1 || die "缺少命令 $1，请先安装。"; }
+
+# 驱动自带的 NGX 运行时目录（Proton 的 proton 脚本也从这里取）
+nvidia_wine_dir() {
+    local candidate glx
+    for candidate in "${NV_WINE_DIR:-}" /usr/lib/nvidia/wine /usr/lib64/nvidia/wine \
+        /usr/lib/x86_64-linux-gnu/nvidia/wine /usr/lib/i386-linux-gnu/nvidia/wine; do
+        [[ -n "$candidate" && -f "$candidate/nvngx.dll" ]] || continue
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    glx="$(ldconfig -p 2>/dev/null | awk '/libGLX_nvidia[.]so[.]0 /{print $NF; exit}')"
+    [[ -n "$glx" ]] || return 1
+    candidate="$(dirname -- "$(readlink -f -- "$glx")")/nvidia/wine"
+    [[ -f "$candidate/nvngx.dll" ]] || return 1
+    printf '%s\n' "$candidate"
+}
 
 # 读取 ww 记录的游戏目录。
 ww_default_path() {
@@ -282,7 +300,9 @@ build_component() {
 # 链接内置 DLL 回 DWProton 的库目录
 slim_prefix() {
     local dw="$DW"
-    local -a keep=(dxgi.dll d3d11.dll riched20.dll)
+    # 已手工拷入的 DXVK/vkd3d-proton/NVAPI 不能在这里被 Wine 内置 DLL 的软链盖回。
+    local -a keep=(dxgi.dll d3d11.dll d3d12.dll d3d12core.dll riched20.dll
+        nvapi64.dll nvapi.dll nvofapi64.dll nvngx.dll _nvngx.dll)
     local pair arch dest src dll name linked=0
 
     for pair in 'x86_64-windows system32' 'i386-windows syswow64'; do
@@ -344,11 +364,40 @@ init_prefix() {
             cp --remove-destination "$dw/files/lib/wine/dxvk/$arch/$dll.dll" \
                 "$PFX/drive_c/windows/$dest/$dll.dll"
         done
+        # D3D12 用 DWProton 自带的 vkd3d-proton：Wine 自带的 d3d12 是旧 vkd3d 存根，
+        # UE4 游戏在它上面会报 “Failed to choose a D3D12 Adapter” 并退回 DX11。
+        # 走到 D3D12 才可能出现 DLSS 选项。
+        for dll in d3d12 d3d12core; do
+            [[ -f "$dw/files/lib/wine/vkd3d-proton/$arch/$dll.dll" ]] || continue
+            cp --remove-destination "$dw/files/lib/wine/vkd3d-proton/$arch/$dll.dll" \
+                "$PFX/drive_c/windows/$dest/$dll.dll"
+        done
+        # NVAPI / NVOFAPI（dxvk-nvapi）：DLSS、Reflex、帧生成的 NVIDIA 能力检测依赖它。
+        # proton 只在 PROTON_ENABLE_NVAPI=1 时把这组 DLL 拷进 prefix，这里直连 wine 所以自己拷。
+        for dll in "$dw/files/lib/wine/nvapi/$arch"/*.dll; do
+            [[ -f "$dll" ]] || continue
+            cp --remove-destination "$dll" "$PFX/drive_c/windows/$dest/$(basename "$dll")"
+        done
         for dll in icuin68 icuuc68 icudt68; do
             cp --remove-destination "$dw/files/lib/wine/icu/$arch/$dll.dll" \
                 "$PFX/drive_c/windows/$dest/$dll.dll"
         done
     done
+
+    # NGX 运行时（DLSS 4 架构）：游戏自带的 nvngx_dlss.dll 只接受 nvngx.dll 的转调，
+    # 直接调用一律返回 0xBAD00002 PlatformError。缺这两个 DLL 时设置里只有 FSR，
+    # 补上后 DLSS 与帧生成才会出现。Proton 也从驱动目录取同两个文件进 system32。
+    local nvdir
+    if nvdir="$(nvidia_wine_dir)"; then
+        for dll in nvngx _nvngx; do
+            cp --remove-destination "$nvdir/$dll.dll" \
+                "$PFX/drive_c/windows/system32/$dll.dll"
+        done
+        log "NGX 运行时已安装: $nvdir"
+    else
+        warn "未找到驱动自带的 nvngx.dll（/usr/lib/nvidia/wine），DLSS 选项不会出现；"
+        warn "请确认已安装 NVIDIA 闭源驱动。"
+    fi
 
     cp --remove-destination "$WW_HOME/component/riched20.dll" \
         "$PFX/drive_c/windows/system32/riched20.dll"
@@ -361,7 +410,69 @@ init_prefix() {
         /v riched20 /t REG_SZ /d n,b /f >>"$log_file" 2>&1
     "$dw/files/bin/wineserver" -w
 
+    verify_prefix
+
     log "prefix 就绪: $PFX"
+}
+
+# 逐项核对 prefix 里的关键 DLL，缺的按来源补上
+verify_prefix() {
+    local dw="$DW" nvdir="" spec dest dll src target total=0 miss=0 fixed=0
+    nvdir="$(nvidia_wine_dir || true)"
+
+    local -a specs=(
+        "system32|dxgi.dll|dxvk/x86_64-windows"
+        "system32|d3d11.dll|dxvk/x86_64-windows"
+        "system32|d3d12.dll|vkd3d-proton/x86_64-windows"
+        "system32|d3d12core.dll|vkd3d-proton/x86_64-windows"
+        "system32|nvapi64.dll|nvapi/x86_64-windows"
+        "system32|nvofapi64.dll|nvapi/x86_64-windows"
+        "system32|icuin68.dll|icu/x86_64-windows"
+        "system32|icuuc68.dll|icu/x86_64-windows"
+        "system32|icudt68.dll|icu/x86_64-windows"
+        "system32|riched20.dll|component"
+        "system32|nvngx.dll|driver-ngx"
+        "system32|_nvngx.dll|driver-ngx"
+        "syswow64|dxgi.dll|dxvk/i386-windows"
+        "syswow64|d3d11.dll|dxvk/i386-windows"
+        "syswow64|d3d12.dll|vkd3d-proton/i386-windows"
+        "syswow64|d3d12core.dll|vkd3d-proton/i386-windows"
+        "syswow64|nvapi.dll|nvapi/i386-windows"
+        "syswow64|icuin68.dll|icu/i386-windows"
+        "syswow64|icuuc68.dll|icu/i386-windows"
+        "syswow64|icudt68.dll|icu/i386-windows"
+    )
+
+    for spec in "${specs[@]}"; do
+        IFS='|' read -r dest dll src <<<"$spec"
+        total=$((total + 1))
+        target="$PFX/drive_c/windows/$dest/$dll"
+        [[ -f "$target" ]] && continue
+        miss=$((miss + 1))
+
+        printf '  \033[1;33m补装\033[0m %s/%s\n' "$dest" "$dll"
+        case "$src" in
+            component)
+                cp --remove-destination "$WW_HOME/component/riched20.dll" "$target" 2>/dev/null || true ;;
+            driver-ngx)
+                if [[ -n "$nvdir" ]]; then
+                    cp --remove-destination "$nvdir/$dll" "$target" 2>/dev/null || true
+                fi ;;
+            *)
+                cp --remove-destination "$dw/files/lib/wine/$src/$dll" "$target" 2>/dev/null || true ;;
+        esac
+        if [[ -f "$target" ]]; then
+            fixed=$((fixed + 1))
+        else
+            warn "补装失败: $dest/$dll（来源 $src）"
+        fi
+    done
+
+    if ((fixed > 0)); then
+        log "prefix 自检补装 $fixed 项（共 $total 项）"
+    else
+        log "prefix 自检通过（$total 项）"
+    fi
 }
 
 # 链接登录框所需 ms 字体
@@ -479,8 +590,11 @@ printf '游戏：%s\n档位：%s\n日志：%s\n' "\$GAME_EXE" "\$TIER" "\$STATE/
 export WINEARCH=wow64
 export LD_LIBRARY_PATH="\$DW/files/lib:\$DW/files/lib/x86_64-linux-gnu\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export WINEDLLPATH="\$DW/files/lib/vkd3d:\$DW/files/lib/wine\${WINEDLLPATH:+:\$WINEDLLPATH}"
+# DXVK 默认在未启用 NVAPI 时把 N 卡伪装成 AMD（dxgi.hideNvidiaGpu=Auto），
+# 游戏会据此只给 FSR、隐藏 DLSS，D3D12 适配器选择也会失败退回 DX11。
+export DXVK_ENABLE_NVAPI=1
 # dcomp 置空规避登录界面白屏（DXVK 未实现合成交换链）。
-export WINEDLLOVERRIDES="dxgi,d3d11=n,b;dcomp="
+export WINEDLLOVERRIDES="dxgi,d3d11=n,b;d3d12,d3d12core=n;nvapi,nvapi64=n;dcomp="
 export WINEDEBUG="\${WINEDEBUG:-fixme-all}"
 export GST_PLUGIN_SYSTEM_PATH_1_0="\$DW/files/lib/x86_64-linux-gnu/gstreamer-1.0"
 export WINE_GST_REGISTRY_DIR="\$STATE/gstreamer-1.0"
