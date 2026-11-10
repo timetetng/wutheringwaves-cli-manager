@@ -42,6 +42,8 @@ scripts/setup-linux.sh --game-dir ~/Games/WutheringWaves
 
 脚本依次完成：下载并校验 DWProton、准备 riched20 UTF-8 补丁组件（修复登录协议正文乱码）、建立独立 prefix（DXVK、ICU、字体、DLL 覆盖），最后把启动器装到 `~/.local/bin/run_ww`，并写入桌面启动器入口 `ww.desktop`（图标从游戏自带启动器里提取）。
 
+补丁组件需要从 Wine 源码编译，依赖构建工具和 PE 交叉工具链（mingw-w64，或 clang+lld）。缺失时脚本会询问是否安装；选择跳过则不打补丁，登录协议等文本可能乱码，但游戏可以正常启动。
+
 已存在的 DWProton（`$DWPROTON`、`~/.local/share/dwproton/`、Lutris/Steam 目录等）和已有 prefix 会被直接复用，不重复下载也不移动。
 
 安装后用 `run_ww` 启动（或点桌面图标）。脚本的画质档位自动读取游戏目录的 `wwm_resource_state.json`，`run_ww --check` 只检查路径和档位。日志在 `~/.local/share/ww-linux/logs/game.log`。

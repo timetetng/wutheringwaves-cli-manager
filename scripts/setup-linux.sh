@@ -53,6 +53,9 @@ usage() {
 画质档位读取游戏目录里的 wwm_resource_state.json。
 已有的 DWProton 和 prefix 会被直接复用，不重复下载也不移动。
 可用 WW_WINEPREFIX 指定要使用的 prefix。
+
+从源码编译 riched20 需要构建工具与 PE 交叉工具链（mingw-w64 或 clang+lld）；
+缺失时会询问是否安装，选择跳过则不打补丁（登录协议等文本可能乱码），游戏仍可正常启动。
 EOF
 }
 
@@ -65,6 +68,91 @@ while (($#)); do
 done
 
 need_tool() { command -v "$1" >/dev/null 2>&1 || die "缺少命令 $1，请先安装。"; }
+
+# 各发行版对应的包名
+base_pkgs() {
+    if command -v pacman >/dev/null 2>&1; then echo base-devel
+    elif command -v apt-get >/dev/null 2>&1; then echo build-essential bison flex autoconf automake libtool patch
+    elif command -v dnf >/dev/null 2>&1; then echo gcc gcc-c++ make bison flex autoconf automake libtool patch
+    elif command -v zypper >/dev/null 2>&1; then echo gcc make bison flex autoconf automake libtool patch
+    fi
+}
+
+mingw_pkgs() {
+    if command -v pacman >/dev/null 2>&1; then echo mingw-w64-gcc
+    elif command -v apt-get >/dev/null 2>&1; then echo gcc-mingw-w64-x86-64
+    elif command -v dnf >/dev/null 2>&1; then echo mingw64-gcc
+    elif command -v zypper >/dev/null 2>&1; then echo cross-x86_64-w64-mingw32-gcc
+    fi
+}
+
+pkg_install() {
+    local -a cmd
+    if command -v pacman >/dev/null 2>&1; then cmd=(pacman -S --needed --noconfirm "$@")
+    elif command -v apt-get >/dev/null 2>&1; then cmd=(apt-get install -y "$@")
+    elif command -v dnf >/dev/null 2>&1; then cmd=(dnf install -y "$@")
+    elif command -v zypper >/dev/null 2>&1; then cmd=(zypper --non-interactive install "$@")
+    else
+        warn "无法识别包管理器，请手动安装：$*"
+        return 1
+    fi
+    if ((EUID != 0)); then
+        command -v sudo >/dev/null 2>&1 || { warn "缺少 sudo，请以 root 手动安装：$*"; return 1; }
+        cmd=(sudo "${cmd[@]}")
+    fi
+    log "安装：${cmd[*]}"
+    "${cmd[@]}" || { warn "安装失败，请手动执行：${cmd[*]}"; return 1; }
+}
+
+# 缺失时询问是否安装；拒绝或非交互环境返回 1（由调用方跳过对应功能）
+ask_install() {
+    local what="$1" reply
+    shift
+    if [[ ! -t 0 ]]; then
+        warn "$what 缺失；当前不是交互终端，自动跳过。"
+        return 1
+    fi
+    printf '\033[1;33m??\033[0m %s 缺失，是否现在安装（%s）？[y/N] ' "$what" "$*"
+    read -r reply || reply=""
+    case "$reply" in
+        [Yy]*) ;;
+        *) warn "已跳过安装：$what"; return 1 ;;
+    esac
+    pkg_install "$@"
+}
+
+# 编译 riched20 需要 PE 交叉工具链：mingw-w64 或 clang+lld 二选一；
+# 只有纯 ELF 工具链时 Wine 会退化成 .dll.so 假模块。
+have_pe_toolchain() {
+    command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 && return 0
+    command -v clang >/dev/null 2>&1 && command -v ld.lld >/dev/null 2>&1 && return 0
+    return 1
+}
+
+ensure_build_tools() {
+    local -a base=(gcc make bison flex autoconf automake libtool patch)
+    local -a missing=() pkgs=()
+    local tool
+
+    for tool in "${base[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+    done
+    if ((${#missing[@]})); then
+        read -r -a pkgs <<<"$(base_pkgs)"
+        ask_install "构建工具（${missing[*]}）" "${pkgs[@]}" || return 1
+    fi
+
+    if ! have_pe_toolchain; then
+        read -r -a pkgs <<<"$(mingw_pkgs)"
+        ask_install "PE 交叉工具链（mingw-w64 或 clang+lld）" "${pkgs[@]}" || return 1
+    fi
+
+    for tool in "${base[@]}"; do
+        command -v "$tool" >/dev/null 2>&1 || { warn "仍缺少命令 $tool。"; return 1; }
+    done
+    have_pe_toolchain || { warn "仍没有可用的 PE 交叉工具链。"; return 1; }
+    return 0
+}
 
 # 读取 ww 记录的游戏目录。
 ww_default_path() {
@@ -201,7 +289,11 @@ install_component() {
         log "补丁组件已就绪"
         return
     fi
-    build_component "$target"
+    build_component "$target" || {
+        rm -f "$target"
+        warn "跳过 riched20 补丁：登录协议等文本可能乱码，不影响启动。"
+        return 0
+    }
 }
 
 build_component() {
@@ -210,7 +302,7 @@ build_component() {
     local src="$work/wine-src"
     local archive="$WW_HOME/downloads/wine-${WINE_COMMIT}.tar.gz"
 
-    for tool in gcc make bison flex autoconf automake libtool patch; do need_tool "$tool"; done
+    ensure_build_tools || return 1
 
     log "下载 Wine 源码（提交 ${WINE_COMMIT:0:12}）"
     if [[ ! -f "$archive" ]]; then
@@ -225,27 +317,32 @@ build_component() {
     log "准备源码树"
     rm -rf "$src" "$work/build"
     mkdir -p "$src"
-    tar -xzf "$archive" -C "$src" --strip-components=1
-    patch -d "$src" -p1 <"$VENDOR_DIR/riched20-utf8-rtf.patch"
+    tar -xzf "$archive" -C "$src" --strip-components=1 || { warn "解压 Wine 源码失败。"; return 1; }
+    patch -d "$src" -p1 <"$VENDOR_DIR/riched20-utf8-rtf.patch" \
+        || { warn "应用 riched20 补丁失败。"; return 1; }
 
     # autogen.sh 会生成 include/wine/vulkan.h 等头文件
     log "生成构建脚本"
     ( cd "$src" && ./autogen.sh >"$WW_HOME/logs/autogen.log" 2>&1 ) \
-        || die "autogen.sh 失败，见 $WW_HOME/logs/autogen.log"
+        || { warn "autogen.sh 失败，见 $WW_HOME/logs/autogen.log"; return 1; }
 
     log "配置构建"
     mkdir -p "$work/build"
+    # 必须用 --enable-archs 走 PE 架构：--enable-win64 是旧的 ELF 布局，
+    # 缺 MinGW 时只会生成 riched20.dll.so 与假模块，没有可用的 native PE 组件。
     ( cd "$work/build" && "$src/configure" \
-        --enable-win64 --disable-tests \
+        --enable-archs=x86_64 --disable-tests \
         --without-x --without-wayland --without-alsa --without-pulse --without-dbus \
         --without-gstreamer --without-cups --without-sane --without-udev --without-usb \
         --without-gnutls --without-opengl --without-vulkan \
-        >"$WW_HOME/logs/configure.log" 2>&1 ) || die "configure 失败，见 $WW_HOME/logs/configure.log"
+        >"$WW_HOME/logs/configure.log" 2>&1 ) \
+        || { warn "configure 失败，见 $WW_HOME/logs/configure.log"; return 1; }
 
     log "编译 riched20（并行度 $JOBS）"
     local built="$work/build/dlls/riched20/x86_64-windows/riched20.dll"
     ( cd "$work/build" && make -j"$JOBS" dlls/riched20/x86_64-windows/riched20.dll \
-        >"$WW_HOME/logs/build-riched20.log" 2>&1 ) || die "编译失败，见 $WW_HOME/logs/build-riched20.log"
+        >"$WW_HOME/logs/build-riched20.log" 2>&1 ) \
+        || { warn "编译失败，见 $WW_HOME/logs/build-riched20.log"; return 1; }
 
     # 默认链接产物带 builtin 标记，加载器会用它替换显式指定的 DLL；去掉标记才能作为 native 加载。
     log "重新链接为 native 组件"
@@ -260,7 +357,7 @@ build_component() {
             if ($0 !~ /\\$/) exit
         }
     ' "$WW_HOME/logs/build-riched20.log")"
-    [[ -n "$link_cmd" ]] || die "未能从构建日志提取链接命令。"
+    [[ -n "$link_cmd" ]] || { warn "未能从构建日志提取链接命令。"; return 1; }
 
     local -a args kept=()
     read -r -a args <<<"$link_cmd"
@@ -269,9 +366,12 @@ build_component() {
         [[ "$arg" == "-Wl,--wine-builtin" ]] || kept+=("$arg")
     done
     ( cd "$work/build" && "${kept[@]}" ) >"$WW_HOME/logs/link-riched20.log" 2>&1 \
-        || die "重新链接失败，见 $WW_HOME/logs/link-riched20.log"
+        || { warn "重新链接失败，见 $WW_HOME/logs/link-riched20.log"; return 1; }
 
-    [[ -f "$built" ]] || die "重新链接后找不到组件。"
+    [[ -f "$built" ]] || { warn "重新链接后找不到组件。"; return 1; }
+    # 只靠 ELF 工具链时产物不是 PE，装了也用不上
+    [[ "$(head -c2 "$built")" == MZ ]] \
+        || { warn "产物不是 PE 组件（检查 MinGW 交叉编译器），跳过补丁。"; return 1; }
     local actual
     actual="$(sha256sum "$built" | awk '{print $1}')"
     [[ "$actual" == "$COMPONENT_SHA256" ]] \
@@ -350,15 +450,30 @@ init_prefix() {
         done
     done
 
-    cp --remove-destination "$WW_HOME/component/riched20.dll" \
-        "$PFX/drive_c/windows/system32/riched20.dll"
+    local component="$WW_HOME/component/riched20.dll"
+    if [[ -f "$component" ]]; then
+        cp --remove-destination "$component" \
+            "$PFX/drive_c/windows/system32/riched20.dll"
+    else
+        # 未打补丁：恢复 DWProton 自带的 riched20，并清掉可能残留的覆盖项
+        local stock="$dw/files/lib/wine/x86_64-windows/riched20.dll"
+        [[ -f "$stock" ]] && cp --remove-destination "$stock" \
+            "$PFX/drive_c/windows/system32/riched20.dll"
+        warn "未启用 riched20 补丁：登录协议等文本可能乱码，不影响启动。"
+    fi
 
     slim_prefix
 
-    # 不注册这条覆盖，Wine 仍优先加载内置 riched20，补丁不生效。
-    "$wine" reg.exe add \
-        'HKCU\Software\Wine\AppDefaults\Client-Win64-Shipping.exe\DllOverrides' \
-        /v riched20 /t REG_SZ /d n,b /f >>"$log_file" 2>&1
+    if [[ -f "$component" ]]; then
+        # 不注册这条覆盖，Wine 仍优先加载内置 riched20，补丁不生效。
+        "$wine" reg.exe add \
+            'HKCU\Software\Wine\AppDefaults\Client-Win64-Shipping.exe\DllOverrides' \
+            /v riched20 /t REG_SZ /d n,b /f >>"$log_file" 2>&1
+    else
+        "$wine" reg.exe delete \
+            'HKCU\Software\Wine\AppDefaults\Client-Win64-Shipping.exe\DllOverrides' \
+            /v riched20 /f >>"$log_file" 2>&1 || true
+    fi
     "$dw/files/bin/wineserver" -w
 
     log "prefix 就绪: $PFX"
