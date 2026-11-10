@@ -2,24 +2,26 @@
 # 鸣潮 Linux 安装脚本：DWProton + 独立 prefix。
 #
 # 一次执行完成：
-#   1. 下载并校验 DWProton
-#   2. 准备 riched20 UTF-8 补丁组件（修复登录协议正文乱码）
-#   3. 初始化独立 prefix：DXVK、vkd3d-proton、dxvk-nvapi、NVIDIA NGX 运行时、
+#   1. 检查系统依赖（缺 gamemode、交叉编译器时询问后用 sudo 安装）
+#   2. 下载并校验 DWProton
+#   3. 准备 riched20 UTF-8 补丁组件（修复登录协议正文乱码）
+#   4. 初始化独立 prefix：DXVK、vkd3d-proton、dxvk-nvapi、NVIDIA NGX 运行时、
 #      ICU、字体、DLL 覆盖
-#   4. 自检 prefix 里的关键 DLL，缺什么补什么
-#   5. 安装启动器 ~/.local/bin/run_ww 与桌面入口
+#   5. 自检 prefix 里的关键 DLL，缺什么补什么
+#   6. 安装启动器 ~/.local/bin/run_ww（默认开 GameMode）与桌面入口
 #
-# 用法：scripts/setup-linux.sh [--game-dir <目录>] 默认则读 ww-cli 安装目录
+# 用法：scripts/setup-linux.sh [--game-dir <目录>]
+# 默认读 ww-cli 记录的游戏目录；--check 只自检不改动。
 set -euo pipefail
 
 readonly DWPROTON_VERSION="11.0-15"
 readonly DWPROTON_ASSET="dwproton-${DWPROTON_VERSION}-x86_64"
-readonly DWPROTON_URL="https://dawn.wine/dawn-winery/dwproton/releases/download/dwproton-${DWPROTON_VERSION}/${DWPROTON_ASSET}.tar.xz"
+readonly DWPROTON_URL="${WW_DWPROTON_URL:-https://dawn.wine/dawn-winery/dwproton/releases/download/dwproton-${DWPROTON_VERSION}/${DWPROTON_ASSET}.tar.xz}"
 readonly DWPROTON_SHA512="ec8985d14b6492df3459f93a3d90278814d9be2fe618e1ccd76f72f732c797e639d7f33fdf801be28585d0855e73bdda27858552ce709ba05cf3f60a17d2e817"
 
 # 补丁针对该版本提交构建，后续升级未验证，升级 DWProton 后需重新编译
 readonly WINE_COMMIT="b75a4125963073b01d2b3bfce6060d697d02066b"
-readonly WINE_SOURCE_URL="https://dawn.wine/api/v1/repos/dawn-winery/wine-dwproton/archive/${WINE_COMMIT}.tar.gz"
+readonly WINE_SOURCE_URL="${WW_WINE_SOURCE_URL:-https://dawn.wine/api/v1/repos/dawn-winery/wine-dwproton/archive/${WINE_COMMIT}.tar.gz}"
 readonly WINE_SOURCE_SHA256="657e9fbb61a3bd3bde414ca09eb60ec94e13edc1f07175861823dc055c076c90"
 readonly COMPONENT_SHA256="f7253d99dbb8688c8a64152b9c4cd251267104c30738797cd9aefbf5a1706b82"
 
@@ -35,6 +37,11 @@ ICON_DIR="$DATA_HOME/icons/hicolor"
 PFX=""
 
 GAME_DIR=""
+REBUILD=0
+CHECK_ONLY=0
+ASSUME_YES=0
+NO_INSTALL=0
+PKG_MGR=""
 DW=""
 TIER="hd"
 JOBS="$(nproc 2>/dev/null || echo 4)"
@@ -45,9 +52,13 @@ die() { printf '\033[1;31m错误:\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
     cat <<'EOF'
-用法：scripts/setup-linux.sh [--game-dir <目录>]
+用法：scripts/setup-linux.sh [--game-dir <目录>] [--check] [-y] [--no-install]
 
   --game-dir <目录>  游戏安装目录；省略时读取 ww 的配置，读不到则报错
+  --rebuild          忽略仓库内的预编译组件，强制从 Wine 源码重编译 riched20
+  --check            只自检 prefix（缺什么列出来），不安装也不改动
+  -y, --yes          缺少系统依赖时直接安装，不逐项询问
+  --no-install       不调用包管理器，缺依赖只给提示
   -h, --help         显示本帮助
 
 安装根目录为 ~/.local/share/ww-linux（可用 WW_LINUX_HOME 覆盖），
@@ -55,18 +66,206 @@ usage() {
 画质档位读取游戏目录里的 wwm_resource_state.json。
 已有的 DWProton 和 prefix 会被直接复用，不重复下载也不移动。
 可用 WW_WINEPREFIX 指定要使用的 prefix。
+
+缺 gamemode、MinGW 交叉编译器时脚本会询问后用 sudo 安装（-y 跳过询问）。
+生成的启动器默认用 gamemoderun 启动，可用 WW_GAMEMODE=0 关闭。
+编译 riched20 需要 PE 工具链：Arch 为 mingw-w64-gcc，Debian 为
+gcc-mingw-w64-x86-64，Fedora 为 mingw64-gcc。
 EOF
 }
 
 while (($#)); do
     case "$1" in
         --game-dir) GAME_DIR="${2:-}"; shift 2 ;;
+        --rebuild)  REBUILD=1; shift ;;
+        --check)    CHECK_ONLY=1; shift ;;
+        -y|--yes)   ASSUME_YES=1; shift ;;
+        --no-install) NO_INSTALL=1; shift ;;
         -h|--help)  usage; exit 0 ;;
         *) die "未知参数: $1（--help 查看用法）" ;;
     esac
 done
 
 need_tool() { command -v "$1" >/dev/null 2>&1 || die "缺少命令 $1，请先安装。"; }
+
+# 下载公共参数：限时握手、失速 60 秒就放弃、出错重试。
+# dawn.wine 会偶发 Connection reset / 卡在几 KB 不动，没有这组参数会僵住不退。
+CURL_OPTS=(--retry 5 --retry-delay 3 --retry-all-errors
+    --connect-timeout 20 --speed-limit 1024 --speed-time 60)
+
+# 服务端是否支持断点续传（dawn.wine 的 Gitea archive 接口不支持 Range，
+# 带 -C - 重试会直接报 “HTTP server does not seem to support byte ranges”）。
+supports_range() {
+    curl -sfI --connect-timeout 20 "$1" 2>/dev/null | grep -qi '^accept-ranges: *bytes'
+}
+
+# 下载到 <archive>.part 再改名；服务端支持时才续传
+fetch() {
+    local url="$1" archive="$2"
+    local -a opts=(-fL)
+    supports_range "$url" && opts+=(-C -)
+    curl "${opts[@]}" "${CURL_OPTS[@]}" --progress-bar -o "$archive.part" "$url" \
+        || die "下载失败: $url（若长期失败，可设置 https_proxy 后重试）"
+    mv "$archive.part" "$archive"
+}
+
+# 复用其它安装根里已下载的归档（换根/重装时不必重复下载）
+seed_archive() {
+    local target="$1" candidate
+    [[ -f "$target" ]] && return 0
+    for candidate in "$DATA_HOME/ww-linux/downloads/$(basename -- "$target")" \
+        "$HOME/.cache/ww-linux/downloads/$(basename -- "$target")"; do
+        [[ -f "$candidate" ]] || continue
+        log "复用已下载的归档: $candidate"
+        ln -f -- "$candidate" "$target" 2>/dev/null || cp -p -- "$candidate" "$target"
+        return 0
+    done
+    return 1
+}
+
+# ── 系统依赖 ──────────────────────────────────────────────────────────────
+# 包名走逻辑名，按发行版映射；发行版里不存在的包会被自动跳过。
+detect_pkg_mgr() {
+    if command -v pacman >/dev/null 2>&1; then PKG_MGR=pacman
+    elif command -v apt-get >/dev/null 2>&1; then PKG_MGR=apt
+    elif command -v dnf >/dev/null 2>&1; then PKG_MGR=dnf
+    else PKG_MGR=""
+    fi
+}
+
+pkg_name() {
+    case "$1:$PKG_MGR" in
+        gamemode:pacman)       printf '%s\n' gamemode ;;
+        gamemode:apt)          printf '%s\n' gamemode ;;
+        gamemode:dnf)          printf '%s\n' gamemode ;;
+        lib32-gamemode:pacman) printf '%s\n' lib32-gamemode ;;
+        mangohud:pacman)       printf '%s\n' mangohud ;;
+        mangohud:apt)          printf '%s\n' mangohud ;;
+        mangohud:dnf)          printf '%s\n' mangohud ;;
+        mingw:pacman)          printf '%s\n' mingw-w64-gcc ;;
+        mingw:apt)             printf '%s\n' gcc-mingw-w64-x86-64 ;;
+        mingw:dnf)             printf '%s\n' mingw64-gcc ;;
+    esac
+}
+
+pkg_available() {
+    case "$PKG_MGR" in
+        pacman) pacman -Si "$1" >/dev/null 2>&1 ;;
+        apt)    apt-cache show "$1" >/dev/null 2>&1 ;;
+        dnf)    dnf -q info "$1" >/dev/null 2>&1 ;;
+        *)      return 1 ;;
+    esac
+}
+
+install_packages() {
+    local -a want=() sudo_cmd=()
+    local name
+    for name in "$@"; do
+        pkg_available "$name" && want+=("$name")
+    done
+    ((${#want[@]})) || return 0
+
+    ((EUID == 0)) || sudo_cmd=(sudo)
+    log "安装系统包：${want[*]}（包管理器 $PKG_MGR）"
+    case "$PKG_MGR" in
+        pacman) "${sudo_cmd[@]}" pacman -S --needed --noconfirm "${want[@]}" ;;
+        apt)    "${sudo_cmd[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y "${want[@]}" ;;
+        dnf)    "${sudo_cmd[@]}" dnf install -y "${want[@]}" ;;
+        *)      return 1 ;;
+    esac
+}
+
+# 逻辑依赖名 → 是否已满足；新增逻辑名时必须同步在这里加上判断，
+# 否则会被当成永远缺失。
+dep_present() {
+    case "$1" in
+        gamemode) command -v gamemoderun >/dev/null 2>&1 ;;
+        mangohud) command -v mangohud >/dev/null 2>&1 ;;
+        mingw)    command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 ;;
+        *)        return 1 ;;
+    esac
+}
+
+# 缺失时询问再安装；默认答 y，--optional 时默认答 n；
+# --no-install 只提示，-y 不问直接装
+ensure_pkgs() {
+    local default="y"
+    if [[ "${1:-}" == "--optional" ]]; then default="n"; shift; fi
+    local what="$1"; shift
+    local -a missing=() names=()
+    local name real
+    for name in "$@"; do
+        dep_present "$name" || missing+=("$name")
+    done
+    ((${#missing[@]})) || return 0
+
+    if [[ "$NO_INSTALL" == 1 ]]; then
+        warn "$what 未安装（--no-install 已跳过），相关功能不可用。"
+        return 0
+    fi
+    if [[ -z "$PKG_MGR" ]]; then
+        warn "$what 未安装，且未识别包管理器，请手动安装后重试。"
+        return 0
+    fi
+
+    if [[ "$ASSUME_YES" == 0 ]]; then
+        local answer=""
+        if [[ "$default" == y ]]; then
+            printf '%s 未安装，现在安装吗？[Y/n] ' "$what"
+        else
+            printf '%s 未安装，是否顺便安装？[y/N] ' "$what"
+        fi
+        if ! read -r answer </dev/tty; then
+            warn "$what 未安装（无终端可询问，已跳过；加 -y 可自动安装）。"
+            return 0
+        fi
+        case "${answer:-$default}" in
+            [Nn]*) warn "跳过 $what 安装。"; return 0 ;;
+        esac
+    elif [[ "$default" == n ]]; then
+        # -y 不应把「默认不装」的可选项装上
+        return 0
+    fi
+
+    for name in "${missing[@]}"; do
+        real="$(pkg_name "$name")"
+        [[ -n "$real" ]] || continue
+        pkg_available "$real" && names+=("$real")
+    done
+    if ((${#names[@]} == 0)); then
+        warn "$what 在当前发行版没有对应包，请手动安装。"
+        return 0
+    fi
+
+    install_packages "${names[@]}" || warn "$what 安装失败，继续（相关功能可能不可用）。"
+}
+
+ensure_deps() {
+    detect_pkg_mgr
+    # GameMode：实测对帧率提升明显，缺了默认装；装不上也不阻断安装。
+    ensure_pkgs "GameMode（gamemode）" gamemode
+    # 帧率叠加只是可选功能，默认不问着装
+    ensure_pkgs --optional "MangoHud（帧率叠加）" mangohud
+    # 只有确实要编译补丁组件时才需要交叉编译器
+    if component_needs_build; then
+        ensure_pkgs "MinGW PE 交叉编译器" mingw
+    fi
+}
+
+# 是否需要从源码编译 riched20
+component_needs_build() {
+    local source_dll="$VENDOR_DIR/riched20.dll" target="$WW_HOME/component/riched20.dll"
+    [[ "$REBUILD" == 0 ]] || return 0
+    if [[ -f "$source_dll" ]] \
+        && [[ "$(sha256sum "$source_dll" | awk '{print $1}')" == "$COMPONENT_SHA256" ]]; then
+        return 1
+    fi
+    # 仓库里没有预编译产物、但本机之前编过，就不必再拉源码编译
+    if [[ -f "$target" && "$(head -c2 "$target" 2>/dev/null)" == "MZ" ]]; then
+        return 1
+    fi
+    return 0
+}
 
 # 驱动自带的 NGX 运行时目录（Proton 的 proton 脚本也从这里取）
 nvidia_wine_dir() {
@@ -129,7 +328,7 @@ preflight() {
     game_exe="$GAME_DIR/Client/Binaries/Win64/Client-Win64-Shipping.exe"
     [[ -f "$game_exe" ]] || die "找不到游戏主程序: $game_exe"
 
-    for tool in curl tar xz sha512sum sha256sum python3 awk grep ln cp mv mkdir; do
+    for tool in curl tar xz sha512sum sha256sum python3 awk grep ln cp mv mkdir timeout; do
         need_tool "$tool"
     done
     command -v magick >/dev/null 2>&1 \
@@ -190,9 +389,11 @@ ensure_dwproton() {
 
     local archive="$WW_HOME/downloads/${DWPROTON_ASSET}.tar.xz"
     if [[ ! -f "$archive" ]]; then
+        seed_archive "$archive" || true
+    fi
+    if [[ ! -f "$archive" ]]; then
         log "下载 DWProton $DWPROTON_VERSION（约 324 MiB）"
-        curl -fL -C - --retry 3 --progress-bar -o "$archive.part" "$DWPROTON_URL"
-        mv "$archive.part" "$archive"
+        fetch "$DWPROTON_URL" "$archive"
     fi
 
     log "校验 DWProton"
@@ -213,10 +414,15 @@ install_component() {
     local source_dll="$VENDOR_DIR/riched20.dll"
     local target="$WW_HOME/component/riched20.dll"
 
-    if [[ -f "$source_dll" ]] \
+    if [[ "$REBUILD" == 0 && -f "$source_dll" ]] \
         && [[ "$(sha256sum "$source_dll" | awk '{print $1}')" == "$COMPONENT_SHA256" ]]; then
         cp -p "$source_dll" "$target"
-        log "补丁组件已就绪"
+        log "补丁组件已就绪（仓库预编译）"
+        return
+    fi
+    # 重装时复用上次在本机编好的组件，避免再拉 Wine 源码（--rebuild 可强制重编）
+    if [[ "$REBUILD" == 0 && -f "$target" ]] && [[ "$(head -c2 "$target" 2>/dev/null)" == "MZ" ]]; then
+        log "复用已编译的补丁组件: $target"
         return
     fi
     build_component "$target"
@@ -229,11 +435,16 @@ build_component() {
     local archive="$WW_HOME/downloads/wine-${WINE_COMMIT}.tar.gz"
 
     for tool in gcc make bison flex autoconf automake libtool patch; do need_tool "$tool"; done
+    # PE 版组件需要 MinGW PE 交叉编译器；缺了只能产出 ELF/假模块，无法作为 native 组件
+    command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 \
+        || die "缺少 x86_64-w64-mingw32-gcc（PE 交叉编译器）。Arch: sudo pacman -S mingw-w64-gcc；Debian/Ubuntu: sudo apt install gcc-mingw-w64-x86-64。"
 
     log "下载 Wine 源码（提交 ${WINE_COMMIT:0:12}）"
     if [[ ! -f "$archive" ]]; then
-        curl -fL --retry 3 --progress-bar -o "$archive.part" "$WINE_SOURCE_URL"
-        mv "$archive.part" "$archive"
+        seed_archive "$archive" || true
+    fi
+    if [[ ! -f "$archive" ]]; then
+        fetch "$WINE_SOURCE_URL" "$archive"
     fi
     if [[ "$(sha256sum "$archive" | awk '{print $1}')" != "$WINE_SOURCE_SHA256" ]]; then
         rm -f "$archive" "$archive.part"
@@ -253,8 +464,10 @@ build_component() {
 
     log "配置构建"
     mkdir -p "$work/build"
+    # 必须用 --enable-archs 走 PE 架构：--enable-win64 是旧的 ELF 布局，只会生成
+    # riched20.dll.so 与假模块，没有可用的 native PE 组件。
     ( cd "$work/build" && "$src/configure" \
-        --enable-win64 --disable-tests \
+        --enable-archs=x86_64 --disable-tests \
         --without-x --without-wayland --without-alsa --without-pulse --without-dbus \
         --without-gstreamer --without-cups --without-sane --without-udev --without-usb \
         --without-gnutls --without-opengl --without-vulkan \
@@ -351,7 +564,7 @@ init_prefix() {
         LANG="${LANG:-zh_CN.UTF-8}" LC_ALL="${LC_ALL:-zh_CN.UTF-8}" \
             "$wine" wineboot.exe -i >"$log_file" 2>&1 \
             || die "wineboot 失败，见 $log_file"
-        "$dw/files/bin/wineserver" -w
+        timeout 30 "$dw/files/bin/wineserver" -w 2>/dev/null || true
         prefix_ready "$PFX" \
             || die "wineboot 结束后 prefix 仍不完整，见 $log_file（可删除 $PFX 后重试）"
     fi
@@ -408,14 +621,15 @@ init_prefix() {
     "$wine" reg.exe add \
         'HKCU\Software\Wine\AppDefaults\Client-Win64-Shipping.exe\DllOverrides' \
         /v riched20 /t REG_SZ /d n,b /f >>"$log_file" 2>&1
-    "$dw/files/bin/wineserver" -w
-
-    verify_prefix
+    # 等 wine 收尾；prefix 里若有残留服务进程，-w 会卡住，所以限时。
+    if ! timeout 15 "$dw/files/bin/wineserver" -w; then
+        warn "wine 未在 30 秒内收尾（可能有残留 wine 进程），继续。"
+    fi
 
     log "prefix 就绪: $PFX"
 }
 
-# 逐项核对 prefix 里的关键 DLL，缺的按来源补上
+# 逐项核对 prefix 里的关键 DLL，缺的按来源补上；--check 只报告不改动
 verify_prefix() {
     local dw="$DW" nvdir="" spec dest dll src target total=0 miss=0 fixed=0
     nvdir="$(nvidia_wine_dir || true)"
@@ -450,6 +664,11 @@ verify_prefix() {
         [[ -f "$target" ]] && continue
         miss=$((miss + 1))
 
+        if [[ "$CHECK_ONLY" == 1 ]]; then
+            printf '  \033[1;31m缺失\033[0m %s/%s\n' "$dest" "$dll"
+            continue
+        fi
+
         printf '  \033[1;33m补装\033[0m %s/%s\n' "$dest" "$dll"
         case "$src" in
             component)
@@ -468,6 +687,11 @@ verify_prefix() {
         fi
     done
 
+    if [[ "$CHECK_ONLY" == 1 ]]; then
+        ((miss == 0)) || die "prefix 自检未通过：$miss/$total 项缺失（见上）。"
+        log "prefix 自检通过（$total 项）"
+        return
+    fi
     if ((fixed > 0)); then
         log "prefix 自检补装 $fixed 项（共 $total 项）"
     else
@@ -537,8 +761,8 @@ FULLSCREEN="\${WW_FULLSCREEN:-0}"
 # MangoHud 帧率叠加（需自行安装 mangohud）
 MANGOHUD="\${WW_MANGOHUD:-0}"
 MANGOHUD_CONFIG="\${WW_MANGOHUD_CONFIG:-fps,frametime,gpu_temp,cpu_temp}"
-# GameMode 性能调度（需自行安装 gamemode）
-GAMEMODE="\${WW_GAMEMODE:-0}"
+# GameMode 性能调度（实测帧率提升明显，默认开启；未安装时自动忽略）
+GAMEMODE="\${WW_GAMEMODE:-1}"
 # Gamescope 嵌套合成器（需自行安装 gamescope）
 GAMESCOPE="\${WW_GAMESCOPE:-0}"
 GAMESCOPE_ARGS="\${WW_GAMESCOPE_ARGS:--W 1920 -H 1080 -f -F fsr}"
@@ -549,7 +773,7 @@ if [[ "\${1:-}" == --help ]]; then
         '      run_ww --check   只检查路径与档位，不启动' \\
         '环境变量：DWPROTON、WW_GAME_DIR、WW_WINEPREFIX、WW_TIER（sd/hd/uhd）' \\
         '画质档位默认读取游戏目录的 wwm_resource_state.json。' \\
-        '可选开关（默认关闭）：WW_RES_X/WW_RES_Y、WW_FULLSCREEN、WW_MANGOHUD、WW_GAMEMODE、WW_GAMESCOPE' \\
+        '可选开关：WW_GAMEMODE 默认开；WW_RES_X/WW_RES_Y、WW_FULLSCREEN、WW_MANGOHUD、WW_GAMESCOPE 默认关' \\
         '日志：\$STATE/logs/game.log'
     exit 0
 fi
@@ -679,10 +903,20 @@ EOF
 
 main() {
     preflight
+
+    if [[ "$CHECK_ONLY" == 1 ]]; then
+        prefix_ready "$PFX" || die "prefix 未初始化: $PFX（请先运行安装脚本）"
+        DW="$(cat "$WW_HOME/dwproton.path" 2>/dev/null || true)"
+        verify_prefix
+        exit 0
+    fi
+
+    ensure_deps
     ensure_dwproton
     install_component
     init_prefix
     install_fonts
+    verify_prefix
     install_icon
     write_launcher
     write_desktop
