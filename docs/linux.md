@@ -40,13 +40,22 @@
 scripts/setup-linux.sh --game-dir ~/Games/WutheringWaves
 ```
 
-脚本依次完成：下载并校验 DWProton、准备 riched20 UTF-8 补丁组件（修复登录协议正文乱码）、建立独立 prefix（DXVK、ICU、字体、DLL 覆盖），最后把启动器装到 `~/.local/bin/run_ww`，并写入桌面启动器入口 `ww.desktop`（图标从游戏自带启动器里提取）。
+脚本依次完成：下载并校验 DWProton、准备 riched20 UTF-8 补丁组件（修复登录协议正文乱码）、建立独立 prefix（DXVK、vkd3d-proton、dxvk-nvapi、NVIDIA 的 NGX 运行时、ICU、字体、DLL 覆盖），初始化后逐项自检并补装缺项，最后把启动器装到 `~/.local/bin/run_ww`，并写入桌面启动器入口 `ww.desktop`（图标从游戏自带启动器里提取）。
 
-补丁组件需要从 Wine 源码编译，依赖构建工具和 PE 交叉工具链（mingw-w64，或 clang+lld）。缺失时脚本会询问是否安装；选择跳过则不打补丁，登录协议等文本可能乱码，但游戏可以正常启动。
+常用开关：
+
+| 开关 | 作用 |
+|---|---|
+| `-y` | 不询问，缺失的系统包直接装 |
+| `--no-install` | 不装任何系统包，只提示 |
+| `--check` | 只检查路径与档位，不启动游戏 |
+| `--rebuild` | 忽略仓库内的预编译组件，从源码重编 riched20 |
+
+安装时检查 gamemode（启动时默认启用，实测对帧率有提升）与 PE 交叉工具链（仅重编组件时需要，mingw-w64 或 clang+lld 任一即可），缺失则询问是否安装；选择跳过则不打补丁，登录协议等文本可能乱码，但游戏仍可正常启动。MangoHud 属可选项，默认不装。脚本支持断点续传，并会复用其它安装根里已下载的归档；下载长期失败时可设 `https_proxy` 重试，或用 `WW_WINE_SOURCE_URL`、`WW_DWPROTON_URL` 换镜像源。
 
 已存在的 DWProton（`$DWPROTON`、`~/.local/share/dwproton/`、Lutris/Steam 目录等）和已有 prefix 会被直接复用，不重复下载也不移动。
 
-安装后用 `run_ww` 启动（或点桌面图标）。脚本的画质档位自动读取游戏目录的 `wwm_resource_state.json`，`run_ww --check` 只检查路径和档位。日志在 `~/.local/share/ww-linux/logs/game.log`。
+安装后用 `run_ww` 启动（或点桌面图标），默认经 gamemoderun 启动（`WW_GAMEMODE=0` 关闭）。脚本的画质档位自动读取游戏目录的 `wwm_resource_state.json`，`run_ww --check` 只检查路径和档位。日志在 `~/.local/share/ww-linux/logs/game.log`。
 
 已知问题：`bilibili` 服在登录的 webview 框会固定弹出**网络请求失败，请重试**，但是不影响验证码登录，忽略即可。
 
