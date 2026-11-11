@@ -19,7 +19,9 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.9"
+          # ubuntu-latest 已切到 26.04，其预构建版本里没有 3.9；
+          # 项目仍声明 >=3.9，这里只需一个能装上的版本跑检查。
+          python-version: "3.13"
 
       - name: Install dependencies
         run: pip install ruff -e .
