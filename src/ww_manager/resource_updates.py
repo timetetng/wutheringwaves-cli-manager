@@ -65,6 +65,10 @@ class PackIncrementalManager(IncrementalManager):
                         raise ConfigError(f"common 清单越界到档位目录: {dest}")
                     if rel.parts[0].startswith((".", "wwm_", "launcherDownloadConfig")):
                         raise ConfigError(f"common 清单试图覆盖管理记录: {dest}")
+                elif rel.parts[:3] == ("Client", "Saved", "Resources"):
+                    # 3.7.0+ 官方把版本化可选包放 Client/Saved/Resources/<版本>/；档位包仅可写本包目标版本目录。
+                    if len(rel.parts) < 4 or rel.parts[3] != self.entry["to_version"]:
+                        raise ConfigError(f"{self.pack_name} 清单越界: {dest}")
                 elif len(rel.parts) < 4 or rel.parts[:3] != ("Client", "Content", self.pack_name.upper()):
                     raise ConfigError(f"{self.pack_name} 清单越界: {dest}")
                 self.owner._managed_path(rel.as_posix())
@@ -210,10 +214,35 @@ class ResourceUpdater:
         bundle = self.owner.get_bundle_config(config_url)
         if not isinstance(bundle, dict) or not isinstance(bundle.get("resourcePacks"), dict):
             raise ConfigError("当前渠道未提供分包更新配置；不会改走其它档位或其它渠道")
-        # 预下载字段格式须等正式开放后适配；不能把未知结构误当成当前版本。
-        if bundle.get("predownload") is not None:
-            raise ConfigError("分包预下载配置已开放，但格式尚未适配验证；请更新工具后重试")
         tier = self.owner.current_resource_tier()
+        is_predownload = False
+        pre = bundle.get("predownload")
+        if pre is not None:
+            # 正式版仍有增量可下时先走正式版；仅正式无更新时才消费预下载配置。
+            formal = bundle["resourcePacks"]
+            formal_done = all(
+                isinstance(formal.get(name), dict)
+                and self.owner.resource_pack_version(name) == formal[name].get("version")
+                for name in ("common", tier)
+            )
+            if formal_done:
+                if not (
+                    isinstance(pre, dict)
+                    and isinstance(pre.get("resourcePacks"), dict)
+                    and isinstance(pre.get("bundles"), dict)
+                    and isinstance(pre["bundles"].get(tier.upper()), dict)
+                    and all(
+                        isinstance(pre["resourcePacks"].get(name), dict)
+                        and isinstance(pre["resourcePacks"][name].get("version"), str)
+                        and pre["resourcePacks"][name]["version"]
+                        and isinstance(pre["resourcePacks"][name].get("patchConfig"), list)
+                        for name in ("common", tier)
+                    )
+                ):
+                    raise ConfigError("分包预下载配置格式尚未适配验证；请更新工具后重试")
+                # 预下载结构与顶层 resourcePacks 同构：复用外层 cdnList，目标换成预下载通道。
+                bundle = {"cdnList": bundle.get("cdnList", []), **pre}
+                is_predownload = True
         bundles = bundle.get("bundles", {})
         if not isinstance(bundles, dict) or not isinstance(bundles.get(tier.upper(), {}), dict):
             raise ConfigError("分包安装记录配置错误")
@@ -228,6 +257,7 @@ class ResourceUpdater:
             "bundle": bundle,
             "packs": {},
             "ready": False,
+            "predownload": is_predownload,
         }
         # 只消费官方明确提供的 resourcePacks；未来预下载配置从此入口适配，绝不拼猜版本路径。
         for name in ("common", tier):
@@ -309,6 +339,8 @@ class ResourceUpdater:
                     raise NetworkError(f"{name} 下载失败，游戏未更新；重跑 ww incremental 可续传")
             plan["ready"] = True
             self.owner._write_local_json(PLAN, plan)
+            if plan.get("predownload"):
+                logger.info("预下载完成；版本正式开放（维护结束）前请勿 apply，也不要启动游戏")
             return True
         except (OSError, IncrementalError) as e:
             raise WWError(f"分包增量下载失败: {e}") from e
