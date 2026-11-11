@@ -597,7 +597,7 @@ class WGameManager:
         state["incomplete"] = sorted(pending)
         self._write_local_json("wwm_resource_state.json", state)
 
-    def _tier_manifest(self, tier: str, resources: Any) -> List[dict]:
+    def _tier_manifest(self, tier: str, resources: Any, version: Optional[str] = None) -> List[dict]:
         """先验证整份清单，再允许创建文件、清理旧包或登记安装。"""
         if not isinstance(resources, list) or not resources:
             raise ConfigError("档位清单为空或格式错误")
@@ -609,10 +609,17 @@ class WGameManager:
                 if not isinstance(dest, str) or dest.startswith(("/", "\\")):
                     raise ValueError("dest 必须为相对路径")
                 rel = _resource_rel_path(dest)
-                if len(rel.parts) < 4 or tuple(p.lower() for p in rel.parts[:3]) != ("client", "content", tier):
+                prefix = tuple(p.lower() for p in rel.parts[:3])
+                if len(rel.parts) > 4 and prefix == ("client", "saved", "resources"):
+                    # 3.8.0+ 官方把版本化可选包放 Client/Saved/Resources/<版本>/；只允许本档位目标版本目录。
+                    if not version or rel.parts[3] != version:
+                        raise ValueError("文件不在本版本 Saved/Resources 目录中")
+                    canonical = rel.as_posix()
+                elif len(rel.parts) < 4 or prefix != ("client", "content", tier):
                     raise ValueError("文件不在当前档位目录中")
-                # Windows 清单可包含反斜杠，磁盘目录统一为 Client/Content/<TIER>。
-                canonical = Path("Client", "Content", tier.upper(), *rel.parts[3:]).as_posix()
+                else:
+                    # Windows 清单可包含反斜杠，磁盘目录统一为 Client/Content/<TIER>。
+                    canonical = Path("Client", "Content", tier.upper(), *rel.parts[3:]).as_posix()
                 if canonical.lower() in seen:
                     raise ValueError("存在重复文件路径")
                 if any(":" in p or "\x00" in p for p in rel.parts):
@@ -785,7 +792,7 @@ class WGameManager:
         manifest = self._http_get_json(urljoin(cdn, index))
         if not isinstance(manifest, dict):
             raise NetworkError("无法下载资源档位清单")
-        resources = self._tier_manifest(tier, manifest.get("resource"))
+        resources = self._tier_manifest(tier, manifest.get("resource"), version)
         self._read_local_config()
         self._managed_path(f"launcherDownloadConfig/{tier}.json")
         self._managed_path(f"wwm_md5_cache_resource_{tier}.json")
