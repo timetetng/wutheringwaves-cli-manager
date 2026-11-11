@@ -248,6 +248,20 @@ class ResourceTierTests(unittest.TestCase):
         self.manager.download_resource_tier("uhd")
         self.assertEqual((self.root / DEST).read_bytes(), GOOD)
 
+    def test_versioned_saved_resources_allowed(self):
+        dest = "Client/Saved/Resources/3.8.0/Option_Pack_DianDaoTa_UHD/Base/pakchunk50-UHD-WindowsNoEditor.pak"
+        self.server.resources = [item(DEST), item(dest)]
+        self.manager.download_resource_tier("uhd")
+        self.assertEqual((self.root / dest).read_bytes(), GOOD)
+        self.registered()
+
+    def test_saved_resources_other_version_rejected(self):
+        stale = "Client/Saved/Resources/3.7.1/Option_Pack_X_UHD/Base/pakchunk1.pak"
+        self.server.resources = [item(stale)]
+        with self.assertRaisesRegex(ConfigError, "本版本 Saved/Resources"):
+            self.manager.download_resource_tier("uhd")
+        self.assertFalse((self.root / stale).exists())
+
     def test_symlink_rejected_before_download(self):
         outside = self.root / "outside"
         outside.mkdir()
