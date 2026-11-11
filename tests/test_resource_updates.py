@@ -138,11 +138,71 @@ class ResourceUpdateTests(unittest.TestCase):
         self.assertFalse((self.root / PLAN).exists())
 
     def test_unknown_predownload_format_is_not_guessed(self):
+        # 正式版已无增量时才会消费 predownload；未知结构仍拒绝，不猜格式。
         self.bundle["predownload"] = {"future_format": True}
+        for config in self.bundle["resourcePacks"].values():
+            config["version"] = SOURCE
         with self.assertRaisesRegex(ConfigError, "尚未适配验证"):
             self.updater.download()
         self.assertFalse((self.root / PLAN).exists())
         self.assertEqual((self.root / destination("common")).read_bytes(), OLD)
+
+    def prepare_predownload(self):
+        """正式版无增量，predownload 提供下一版本（结构与顶层同构）。"""
+        for config in self.bundle["resourcePacks"].values():
+            config["version"] = SOURCE
+        pre = {"bundles": {}, "resourcePacks": {}}
+        for name in ("common", "hd", "sd", "uhd"):
+            pre["bundles"][name.upper()] = {"resourcePacks": ["common", name]}
+            pre["resourcePacks"][name] = {
+                "version": TARGET,
+                "baseUrl": "files",
+                "indexFile": f"pfull/{name}.json",
+                "patchConfig": [{"version": SOURCE, "indexFile": f"ppatch/{name}.json", "baseUrl": "files"}],
+            }
+            self.serve_json(f"/ppatch/{name}.json", {"resource": [file_item(destination(name))], "deleteFiles": []})
+        self.bundle["predownload"] = pre
+
+    def test_predownload_plan_uses_official_channel_when_formal_is_current(self):
+        self.prepare_predownload()
+        self.assertTrue(self.updater.download())
+        plan = self.read_json(PLAN)
+        self.assertTrue(plan["predownload"])
+        self.assertTrue(plan["ready"])
+        for name in ("common", "uhd"):
+            self.assertEqual(plan["packs"][name]["from_version"], SOURCE)
+            self.assertEqual(plan["packs"][name]["to_version"], TARGET)
+        # 索引与数据必须来自预下载通道，而不是正式版通道。
+        self.assertTrue(any(f"/ppatch/{name}.json" in u for name in ("common", "uhd") for u in self.server.requested))
+        self.assertFalse(any(f"/patch/{name}.json" in u for name in ("common", "uhd") for u in self.server.requested))
+        # 游戏文件在 apply 前保持不变。
+        self.assertEqual((self.root / destination("common")).read_bytes(), OLD)
+
+    def test_predownload_ignored_while_formal_update_pending(self):
+        self.prepare_predownload()
+        # 正式版仍有 3.7.1 -> 3.8.0 增量时优先正式版，不消费 predownload。
+        for name in ("common", "hd", "sd", "uhd"):
+            self.bundle["resourcePacks"][name]["version"] = TARGET
+        self.assertTrue(self.updater.download())
+        plan = self.read_json(PLAN)
+        self.assertFalse(plan["predownload"])
+        self.assertFalse(any(u.startswith("/ppatch/") for u in self.server.requested))
+
+    def test_tier_pack_may_write_versioned_saved_resources(self):
+        # 3.7.0 起官方把版本化可选包放 Client/Saved/Resources/<版本>/；仅允许本包目标版本目录。
+        allowed = f"Client/Saved/Resources/{TARGET}/Option_Pack_DianDaoTa_UHD/Base/pakchunk50.pak"
+        self.set_index("uhd", {"resource": [file_item(allowed)], "deleteFiles": []})
+        self.server.payloads[f"/files/{allowed}"] = NEW
+        self.assertTrue(self.updater.download())
+        self.assertTrue(self.updater.apply())
+        self.assertEqual((self.root / allowed).read_bytes(), NEW)
+
+    def test_tier_saved_resources_other_version_rejected(self):
+        stale = f"Client/Saved/Resources/{SOURCE}/Option_Pack_X_UHD/Base/pakchunk1.pak"
+        self.set_index("uhd", {"resource": [file_item(stale)], "deleteFiles": []})
+        with self.assertRaisesRegex(ConfigError, "清单越界"):
+            self.updater.download()
+        self.assertFalse((self.root / PLAN).exists())
 
     def test_without_launcher_incremental_routes_to_auto_config(self):
         with patch("ww_manager.resource_updates.ResourceUpdater.download", return_value=True) as download:
