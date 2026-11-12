@@ -758,6 +758,36 @@ class ResourceUpdateTests(unittest.TestCase):
         self.assertEqual((self.root / destination("uhd")).read_bytes(), NEW)
         self.assertEqual(self.owner.resource_pack_version("uhd"), TARGET)
 
+    def test_apply_source_mismatch_falls_back_to_full_download(self):
+        diff = b"patch-transport"
+        self.server.payloads["/files/uhd.krpdiff"] = diff
+        self.set_index(
+            "uhd",
+            {
+                "resource": [file_item("uhd.krpdiff", diff)],
+                "groupInfos": [
+                    {
+                        "dest": "uhd.krpdiff",
+                        "srcFiles": [file_item(destination("uhd"), OLD)],
+                        "dstFiles": [file_item(destination("uhd"))],
+                    }
+                ],
+            },
+        )
+        self.assertTrue(self.owner.download_incremental())
+        # 本地文件是另一渠道的原装版本：md5 既不是源也不是目标，应整组回退全量下载。
+        self.put(destination("uhd"), b"x" * len(OLD))
+        with (
+            patch("ww_manager.incremental.check_hpatchz_requirements", return_value=(True, "")),
+            patch("ww_manager.incremental.get_hpatchz_path", return_value=self.root / "fixture-hpatchz"),
+            patch.object(
+                PackIncrementalManager, "_run_hpatchz", side_effect=AssertionError("源不匹配不应调用 hpatchz")
+            ),
+        ):
+            self.assertTrue(self.owner.apply_incremental())
+        self.assertEqual((self.root / destination("uhd")).read_bytes(), NEW)
+        self.assertEqual(self.owner.resource_pack_version("uhd"), TARGET)
+
     def test_incremental_cli_force_download_and_apply_dispatch(self):
         for name in ("_auto_install_completion", "setup_logging", "check_pypi_version_silent", "save_app_config"):
             mocked = patch(f"ww_manager.cli.{name}")
