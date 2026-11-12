@@ -518,43 +518,16 @@ class ResourceUpdateTests(unittest.TestCase):
         self.assertEqual((self.root / destination("uhd")).read_bytes(), NEW)
         self.assertEqual((self.root / destination("hd")).read_bytes(), OLD)
 
-    def prepare_bilibili(self):
+    def test_bilibili_common_uses_shared_pack_list(self):
+        """官/B 服共用同一画质资源包：B 服不需要额外的目标全量清单即可预下载 common。"""
         self.owner.server_type = "bilibili"
         state = self.owner._read_resource_state()
         state["common_server"] = "bilibili"
         self.owner._write_local_json("wwm_resource_state.json", state)
-        self.owner._launcher_info = {"predownload": {"version": TARGET, "config": {"indexFile": "b-target.json"}}}
-        self.owner._cdn_node = self.url
-        self.serve_json(
-            "/b-target.json", {"resource": [file_item(destination("common")), file_item(destination("hd"))]}
-        )
-
-    def test_bilibili_common_requires_matching_channel_target(self):
-        self.prepare_bilibili()
         self.assertTrue(self.updater.download())
         self.assertTrue(self.updater.apply())
         self.assertEqual((self.root / destination("common")).read_bytes(), NEW)
         self.assertEqual((self.root / destination("hd")).read_bytes(), OLD)
-
-    def test_bilibili_common_rejects_official_channel_exclusive_file(self):
-        self.prepare_bilibili()
-        self.set_index("common", {"resource": [file_item("Client/official-only.dll")]})
-        with self.assertRaisesRegex(ConfigError, "与 B 服目标清单不符"):
-            self.updater.download()
-        self.assertEqual((self.root / destination("common")).read_bytes(), OLD)
-        self.assertFalse((self.root / PLAN).exists())
-
-    def test_bilibili_common_rejects_deleting_required_channel_file(self):
-        self.prepare_bilibili()
-        self.set_index("common", {"deleteFiles": [destination("common")]})
-        with self.assertRaisesRegex(ConfigError, "仍需要"):
-            self.updater.download()
-
-    def test_bilibili_no_target_manifest_does_not_fallback(self):
-        self.prepare_bilibili()
-        self.owner._launcher_info = {"default": {"version": SOURCE}}
-        with self.assertRaisesRegex(ConfigError, "目标清单尚未开放"):
-            self.updater.download()
 
     def test_group_output_cannot_be_deleted_by_same_patch(self):
         dest = destination("uhd")

@@ -129,19 +129,6 @@ class PackIncrementalManager(IncrementalManager):
         for dest in index.get("deleteFiles", []):
             if path(dest) in outputs or path(dest) in group_outputs:
                 raise ConfigError(f"补丁同时写入并删除同一路径: {dest}")
-        if self.pack_name == "common" and self.owner.server_type == "bilibili":
-            channel_index = self.entry.get("channel_index")
-            if not isinstance(channel_index, dict) or not isinstance(channel_index.get("resource"), list):
-                raise ConfigError("尚无 B 服目标清单证明 common 兼容，拒绝借用官服基础文件")
-            target = {_resource_rel_path(item["dest"]).as_posix().lower(): item for item in channel_index["resource"]}
-            writes = [r for r in index.get("resource", []) if not _is_diff_resource(r["dest"])]
-            writes += list(group_outputs.values())
-            for item in writes:
-                expected = target.get(path(item["dest"]))
-                if not expected or any(item[k] != expected.get(k) for k in ("size", "md5")):
-                    raise ConfigError(f"common 文件与 B 服目标清单不符: {item['dest']}")
-            if any(path(dest) in target for dest in index.get("deleteFiles", [])):
-                raise ConfigError("common 试图删除 B 服目标版本仍需要的文件")
 
     def get_group_infos(self):
         self.validate_index(self.index_file)
@@ -285,25 +272,6 @@ class ResourceUpdater:
                     f"{name} 暂无 {current} → {target} 的匹配补丁（未开放或源版本不支持）；"
                     "请等待预下载渠道，或明确选择全量修复；不会自动下载 HD"
                 )
-            if name == "common" and self.owner.server_type == "bilibili":
-                # 只共用画质包；common 的每一项变更还须符合 B 服目标全量清单。
-                section = next(
-                    (
-                        s
-                        for s in (self.owner.launcher_info.get(k) for k in ("predownload", "default"))
-                        if isinstance(s, dict) and s.get("version") == target
-                    ),
-                    None,
-                )
-                uri = section.get("config", {}).get("indexFile") if section else None
-                if not isinstance(uri, str):
-                    raise ConfigError(f"B 服 {target} 目标清单尚未开放，不能确认 common 兼容性")
-                from urllib.parse import urljoin
-
-                channel_index = self.owner._http_get_json(urljoin(self.owner.cdn_node, uri))
-                if not isinstance(channel_index, dict):
-                    raise NetworkError("无法获取 B 服目标清单，未修改游戏")
-                entry["channel_index"] = channel_index
             engine = PackIncrementalManager(self.owner, name, entry, plan)
             url = engine.get_index_url()
             index = self.owner._http_get_json(url) if url else None
