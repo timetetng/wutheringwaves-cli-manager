@@ -29,6 +29,7 @@ apply 选项:
   --workers N       并发分组数（默认 min(CPU, 分组数)）
   --cache-mb N      每组解压临时缓存 MiB（默认 8，无需调大）
   --fsync           写完每个文件后执行 fsync（默认关）
+  --no-verify       不计算输出文件的 md5（更快，但无法自证输出正确）
   --json FILE       把结果 JSON 写入文件（默认 stdout）
   --quiet           不输出进度
 ";
@@ -77,6 +78,7 @@ struct ApplyCli {
     workers: usize,
     cache_mb: usize,
     fsync: bool,
+    verify: bool,
     json: Option<PathBuf>,
     quiet: bool,
     patches: Vec<PathBuf>,
@@ -89,6 +91,7 @@ fn parse_apply_args(args: &[String]) -> Result<ApplyCli, String> {
         workers: 0,
         cache_mb: 8,
         fsync: false,
+        verify: true,
         json: None,
         quiet: false,
         patches: Vec::new(),
@@ -115,6 +118,7 @@ fn parse_apply_args(args: &[String]) -> Result<ApplyCli, String> {
             }
             "--json" => cli.json = Some(PathBuf::from(value("--json")?)),
             "--fsync" => cli.fsync = true,
+            "--no-verify" => cli.verify = false,
             "--quiet" => cli.quiet = true,
             s if s.starts_with('-') => return Err(format!("未知选项 {s}\n{USAGE}")),
             s => cli.patches.push(PathBuf::from(s)),
@@ -211,6 +215,7 @@ fn cmd_apply(args: &[String]) -> Result<i32, String> {
         out_root: cli.out_root.clone(),
         cache_bytes: cli.cache_mb << 20,
         fsync: cli.fsync,
+        verify: cli.verify,
         counter: counter.clone(),
     };
 
@@ -284,7 +289,7 @@ fn cmd_apply(args: &[String]) -> Result<i32, String> {
     }
 
     let ok = results.iter().all(|(_, r)| r.is_ok());
-    let json = build_json(&results, workers, cli.cache_mb, started.elapsed().as_secs_f64());
+    let json = build_json(&results, workers, cli.cache_mb, cli.verify, started.elapsed().as_secs_f64());
     match &cli.json {
         Some(path) => {
             std::fs::write(path, json).map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
@@ -323,6 +328,7 @@ fn build_json(
     results: &[(usize, Result<apply::GroupOutcome, String>)],
     workers: usize,
     cache_mb: usize,
+    verify: bool,
     total_secs: f64,
 ) -> String {
     let ok = results.iter().all(|(_, r)| r.is_ok());
@@ -331,6 +337,7 @@ fn build_json(
     s.push_str(&format!("  \"ok\": {ok},\n"));
     s.push_str(&format!("  \"workers\": {workers},\n"));
     s.push_str(&format!("  \"cache_mb\": {cache_mb},\n"));
+    s.push_str(&format!("  \"verify\": {verify},\n"));
     s.push_str(&format!("  \"total_secs\": {total_secs:.3},\n"));
     s.push_str("  \"groups\": [\n");
     for (i, (_, r)) in results.iter().enumerate() {
@@ -348,11 +355,15 @@ fn build_json(
                 s.push_str(&format!("      \"secs\": {:.3},\n", o.secs));
                 s.push_str("      \"files\": [\n");
                 for (j, f) in o.files.iter().enumerate() {
+                    let md5 = match &f.md5 {
+                        Some(m) => json_str(m),
+                        None => "null".to_string(),
+                    };
                     s.push_str(&format!(
                         "        {{\"path\": {}, \"size\": {}, \"md5\": {}}}{}\n",
                         json_str(&f.rel),
                         f.size,
-                        json_str(&f.md5),
+                        md5,
                         if j + 1 == o.files.len() { "" } else { "," }
                     ));
                 }

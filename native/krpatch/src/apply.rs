@@ -36,6 +36,9 @@ pub struct ApplyOptions {
     /// Memory cache handed to `patch_decompress_with_cache()`.
     pub cache_bytes: usize,
     pub fsync: bool,
+    /// Compute per-file MD5 while writing (the manager uses it to decide
+    /// whether the result can be kept). `--no-verify` turns this off.
+    pub verify: bool,
     /// Global progress counter (bytes written across all groups).
     pub counter: Arc<AtomicU64>,
 }
@@ -159,7 +162,7 @@ pub fn apply_head(
             .map_err(|e| e.to_string())?;
     }
     // Virtual new stream: the group's outputs, split by newRefSizes.
-    let mut writer = SegWrite::new(opts.counter.clone());
+    let mut writer = SegWrite::new(opts.counter.clone(), opts.verify);
     for r in &head.new_refs {
         writer
             .push_file(r.path.clone(), opts.out_root.join(&r.path), r.size)

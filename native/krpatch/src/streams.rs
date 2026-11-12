@@ -4,7 +4,8 @@
 //!   (group refs are concatenated in `oldRefSizes` order);
 //! * `DiffRead` — the hdiff section of the `.krpdiff` container;
 //! * `SegWrite` — many new files addressed as one contiguous virtual file,
-//!   with per-file MD5 computed while data is being written.
+//!   with per-file MD5 computed by a separate hashing thread that consumes
+//!   the written chunks in parallel with the patch/write path.
 //!
 //! Everything uses positional I/O (`pread`/`pwrite`), so a single group can be
 //! applied by several threads' worth of I/O without any shared cursor.
@@ -13,7 +14,9 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use md5::{Digest, Md5};
 
@@ -183,9 +186,10 @@ pub struct OutFile {
     pub abs: PathBuf,
     file: File,
     len: u64,
-    hasher: Md5,
-    hashed: u64,
-    need_rehash: bool,
+    /// Next offset expected by the hashing thread (linear writes only).
+    expect: u64,
+    /// False once a write arrived out of order; the file is re-hashed from disk.
+    linear: bool,
 }
 
 impl OutFile {
@@ -207,27 +211,18 @@ impl OutFile {
             abs,
             file,
             len,
-            hasher: Md5::new(),
-            hashed: 0,
-            need_rehash: false,
+            expect: 0,
+            linear: true,
         })
     }
 
     fn write_at(&mut self, off_in: u64, data: &[u8]) -> io::Result<()> {
         self.file.write_all_at(data, off_in)?;
-        if !self.need_rehash {
-            if off_in == self.hashed {
-                self.hasher.update(data);
-                self.hashed += data.len() as u64;
-            } else if off_in < self.hashed {
-                // Rewritten region (should not happen for linear patches).
-                self.hasher = Md5::new();
-                self.hashed = 0;
-                self.need_rehash = true;
-            } else {
-                // Gap: fall back to hashing the finished file.
-                self.need_rehash = true;
-            }
+        if off_in != self.expect {
+            // Rewritten or skipped region: cannot hash incrementally.
+            self.linear = false;
+        } else {
+            self.expect += data.len() as u64;
         }
         Ok(())
     }
@@ -236,7 +231,53 @@ impl OutFile {
 pub struct FileOutcome {
     pub rel: String,
     pub size: u64,
-    pub md5: String,
+    /// `None` when verification was disabled (`--no-verify`).
+    pub md5: Option<String>,
+}
+
+/// Chunks in flight between the write path and the hashing thread (1 chunk is
+/// as large as the hpatch cache, so this bounds the extra memory at ~32 chunks).
+const HASH_QUEUE: usize = 32;
+
+/// Dedicated MD5 thread: one hasher per produced file, fed in write order.
+struct HashWorker {
+    tx: SyncSender<(usize, Vec<u8>)>,
+    handle: JoinHandle<Vec<Md5>>,
+}
+
+impl HashWorker {
+    fn spawn() -> Self {
+        let (tx, rx) = sync_channel::<(usize, Vec<u8>)>(HASH_QUEUE);
+        let handle = std::thread::Builder::new()
+            .name("krpatch-md5".into())
+            .spawn(move || receiver_loop(rx))
+            .expect("无法创建哈希线程");
+        HashWorker { tx, handle }
+    }
+
+    /// Hand a chunk to the hashing thread; blocks when it is behind.
+    fn feed(&self, seg: usize, data: &[u8]) -> io::Result<()> {
+        self.tx
+            .send((seg, data.to_vec()))
+            .map_err(|_| io::Error::other("哈希线程意外退出"))
+    }
+
+    fn finish(self) -> Vec<Md5> {
+        let HashWorker { tx, handle } = self;
+        drop(tx);
+        handle.join().unwrap_or_default()
+    }
+}
+
+fn receiver_loop(rx: Receiver<(usize, Vec<u8>)>) -> Vec<Md5> {
+    let mut hashers: Vec<Md5> = Vec::new();
+    for (seg, data) in rx {
+        if hashers.len() <= seg {
+            hashers.resize_with(seg + 1, Md5::new);
+        }
+        hashers[seg].update(&data);
+    }
+    hashers
 }
 
 /// Concatenation of several write-only files.
@@ -245,15 +286,17 @@ pub struct SegWrite {
     starts: Vec<u64>,
     total: u64,
     counter: Arc<AtomicU64>,
+    hash: Option<HashWorker>,
 }
 
 impl SegWrite {
-    pub fn new(counter: Arc<AtomicU64>) -> Self {
+    pub fn new(counter: Arc<AtomicU64>, verify: bool) -> Self {
         SegWrite {
             segs: Vec::new(),
             starts: Vec::new(),
             total: 0,
             counter,
+            hash: if verify { Some(HashWorker::spawn()) } else { None },
         }
     }
 
@@ -283,6 +326,11 @@ impl SegWrite {
                 ));
             }
             seg.write_at(off_in, &data[..n])?;
+            if let Some(hw) = &self.hash {
+                if seg.linear {
+                    hw.feed(i, &data[..n])?;
+                }
+            }
             data = &data[n..];
             pos += n as u64;
             self.counter.fetch_add(n as u64, Ordering::Relaxed);
@@ -292,20 +340,24 @@ impl SegWrite {
 
     /// Flush, hash the files that were written out of order, and report results.
     pub fn finish(mut self, fsync: bool) -> io::Result<Vec<FileOutcome>> {
+        // Close the queue first so the hashing thread drains and exits.
+        let mut digests = self.hash.take().map(|hw| hw.finish()).map(|v| v.into_iter());
         let mut out = Vec::with_capacity(self.segs.len());
         for seg in self.segs.drain(..) {
             if fsync {
                 seg.file.sync_all()?;
             }
-            let mut seg = seg;
-            let md5 = if seg.need_rehash || seg.hashed != seg.len {
-                hash_file(&seg.abs)?
-            } else {
-                let digest = std::mem::take(&mut seg.hasher).finalize();
-                hex32(&digest)
+            let malformed = !seg.linear || seg.expect != seg.len;
+            let md5 = match digests.as_mut() {
+                None => None,
+                Some(_) if malformed => Some(hash_file(&seg.abs)?),
+                Some(it) => match it.next() {
+                    Some(hasher) => Some(hex32(&hasher.finalize())),
+                    None => Some(hash_file(&seg.abs)?),
+                },
             };
             out.push(FileOutcome {
-                rel: seg.rel.clone(),
+                rel: seg.rel,
                 size: seg.len,
                 md5,
             });

@@ -9,7 +9,7 @@
 `krpatch` 把这件事收进一个二进制：
 
 - **差分核心不改写**：直接编译上游 HDiffPatch v4.8.0 的 `patch.c`（原封不动地 vendor 在 `c/hdiffpatch/`），zstd 解压走上游 `decompress_plugin_demo.h` 里的官方插件，所以差分语义与官方 exe 同源，不存在“重新实现一遍算法”的偏差风险。
-- **Rust 只做外围**：容器头解析、虚拟 old/new 流、写文件 + md5、线程池、进度与 JSON 结果。
+- **Rust 只做外围**：容器头解析、虚拟 old/new 流、写文件 + 独立 md5 线程、分组线程池、进度与 JSON 结果。
 - **分组级并发**：一次调用传入多个 `.krpdiff`，二进制内部起线程池，每个分组一条独立流水线（每组每线程持有自己的 zstd 插件实例）。
 - **openat + 相对路径**：路径转换（容器里的 `\` 与大小写）和目录创建在 Rust 侧完成，不依赖 wine 的路径模拟。
 
@@ -44,6 +44,7 @@ krpatch version
 | `--workers N` | 并发分组数，默认 `min(CPU 核数, 分组数)` |
 | `--cache-mb N` | 每组交给 `patch_decompress_with_cache()` 的临时缓存 MiB，默认 8（实测 1–32MB 都在噪声内，≥64MB 反而更慢，不必调） |
 | `--fsync` | 每个输出文件写完 fsync（默认关；断电即毁的场景再开） |
+| `--no-verify` | 不计算输出 md5（大组从 ~3.1 s 降到 ~1.2 s，JSON 里 `md5` 为 `null`；调用方就拿不到自证依据） |
 | `--json FILE` | 结果 JSON 写入文件，默认打到 stdout |
 | `--quiet` | 不打印进度和分组合计 |
 
@@ -56,6 +57,7 @@ krpatch version
   "ok": true,
   "workers": 8,
   "cache_mb": 8,
+  "verify": true,
   "total_secs": 4.312,
   "groups": [
     {
@@ -99,21 +101,38 @@ krpatch version
 
 ## 性能
 
-`group_38`（2.5 GB 输出，单分组单线程）：
+`group_38`（2.5 GB 输出，单分组）：
 
-| | wall | user | sys |
-| --- | --- | --- | --- |
-| `krpatch`（含 md5 校验，缓存 8MB） | 4.77 s | 3.98 s | 0.77 s |
-| 官方 `hpatchz.exe` 走 wine（同一份 `.krpdiff`） | 4.86 s | 1.87 s | 0.84 s |
-| 上游原生 `hpatchz` v4.8.0（不校验 md5） | 3.9 s | — | — |
+| | wall | user | sys | 备注 |
+| --- | --- | --- | --- | --- |
+| `krpatch`（默认，含 md5） | **3.1 s** | 3.30 s | 0.90 s | 差分与 md5 在两条线程上重叠 |
+| `krpatch --no-verify` | **1.2 s** | 0.28 s | 0.80 s | 不校验 |
+| 官方 `hpatchz.exe` 走 wine | 4.86 s | 1.87 s | 0.84 s | exe 自报内部 4.43 s |
+| 上游原生 `hpatchz` v4.8.0 | 3.9 s | — | — | 不校验 md5 |
+| 旧流程整体（wine 应用 + Python 事后 md5） | 7.9 s | — | — | 4.86 + 3.06 |
 
-`group_16`（106 MB 输出）：`krpatch` 0.21 s，wine + `hpatchz.exe` 1.07 s（exe 自报内部只花 0.11 s，剩下全是 wine 启动）。
+把这 4.6 s 拆开看，瓶颈根本不在差分：
 
-也就是说：**最大的那个分组上 wine 只是打平**——2.5 GB 数据面前，wine 那点开销被淡化了，exe 内部的 zstd 也是 native 跑的。真正的差别在每组固定开销（一次 wine 启动 ≈ 0.95 s，六十个分组就是一分钟白烧）、只能串行、以及调用方额外的代价（跑之前把旧文件 `copy2` 到临时目录、跑完再读一遍盘算 md5）。`krpatch` 原地 pread 旧文件、写的时候顺手算 md5、分组并行。
+| | 耗时 |
+| --- | --- |
+| 差分本身（关掉 md5） | 1.18 s（2.1 GB/s） |
+| MD5 校验 | +3.4 s（RustCrypto `md-5` 约 740 MB/s） |
 
-单核吞吐约 530–580 MB/s（已含 md5）。wall 在高负载下会明显超出 user（实测有 13 s 的轮次），那是 dirty page writeback 排队，不是差分算得慢。
+所以现在的做法是：写线程只负责 pwrite，把写过的块交给一条独立的哈希线程（`krpatch-md5`，有界队列 32 块背压）；MD5 用 `md-5` 的 `asm`(AVX2) 实现（847 MB/s，需 x86/x86_64）。两者重叠后 wall = max(差分, md5) 而不是相加，留给差分的 1.2 s 被完全藏掉。MD5 单流不可跨核并行（不是 Merkle 树），单文件 1 GB/s 左右就是天花板，所以 `--no-verify` 是唯一能再往下压的开关。
 
-和原来那条路径的真实差别在**分组之间**：一次更新几十个分组，`krpatch` 让它们同时跑，总 wall 时间接近最大那组的耗时；wine + `hpatchz.exe` 只能一个接一个。
+`group_16`（106 MB 输出）：`krpatch` 0.14 s，wine + `hpatchz.exe` 1.07 s（exe 自报内部只花 0.11 s，剩下全是 wine 启动）。
+
+**分组之间**的差别用 8 份 `group_16` 复制样本模拟（每组 106 MB，共 850 MB 输出）：
+
+| | wall | 相对旧流程 |
+| --- | --- | --- |
+| 旧流程 8 组串行（copy2 + wine hpatchz + md5sum） | 2.82 s | 1.0x |
+| `krpatch` 8 组串行 | 1.49 s | 1.9x |
+| `krpatch` 8 组并发 | **0.23 s** | **12x** |
+
+wine 启动方差极大：warm 时约 0.1 s，wineserver 被回收后实测单次 4.57 s（exe 内部只花 0.22 s）。另外旧流程在跑之前要把该组旧文件 `copy2` 到临时目录（本机 btrfs 走 reflink 几乎免费，ext4 上就是实打实的复制），跑完还要再读一遍盘算 md5。
+
+wall 在高负载下仍可能明显超出 user（实测有 13 s 的轮次），那是 dirty page writeback 排队，不是计算慢。
 
 ## 限制
 
@@ -134,7 +153,7 @@ native/krpatch/
 └── src/
     ├── main.rs               # CLI、线程池、进度、JSON
     ├── head.rs               # 容器头解析、refs 表、hdiff 段定位
-    ├── streams.rs            # hpatch_TStreamInput/Output 的 Rust 实现、分段读写、md5
+    ├── streams.rs            # hpatch_TStreamInput/Output 的 Rust 实现、分段读写、md5 线程
     ├── apply.rs              # 单分组应用流程与前置校验
     └── ffi.rs                # 与 C 侧的类型映射和 extern 声明
 ```
