@@ -1382,15 +1382,7 @@ class IncrementalManager:
             # 源文件不存在，回退下载所有 dst 文件
             set_status(f"源文件缺失，回退下载 {len(dst_files)} 个文件")
             logger.debug(f"源文件不存在: {first_src_path}, 回退下载 {len(dst_files)} 个文件")
-            failed_count = 0
-            for index, dst_info in enumerate(dst_files, 1):
-                set_status(f"回退下载 {index}/{len(dst_files)}")
-                staged_path = self._get_staged_patch_path(download_dir, dst_info["dest"])
-                if not self._download_full_file_to_stage(dst_info, staged_path, log_error):
-                    failed_count += 1
-                    log_error(f"下载失败: {dst_info['dest']}")
-                else:
-                    log_info(f"已缓存完整文件: {dst_info['dest']}")
+            failed_count = self._fallback_download_group(dst_files, download_dir, log_info, log_error, set_status)
             return krpdiff_name, "failed" if failed_count > 0 else "success"
 
         # 检查 MD5：必须是 src 版本或已经是 dst 版本
@@ -1399,12 +1391,15 @@ class IncrementalManager:
             # 仍需运行 hpatchz 来生成其他输出文件
             pass
         elif first_local_md5 != first_src_md5:
-            set_status("源文件校验失败")
+            # 源文件与索引记录的旧版本不同（例如另一渠道的原装文件），整组回退为完整下载，不中断整次更新。
+            set_status(f"源文件校验失败，回退下载 {len(dst_files)} 个文件")
             log_warning(
                 f"源文件 MD5 不匹配: {first_src_path} "
-                f"(期望 {first_src_md5[:16]}... 或 dst MD5, 实际 {first_local_md5[:16]}...)"
+                f"(期望 {first_src_md5[:16]}... 或 dst MD5, 实际 {first_local_md5[:16]}...)，"
+                f"回退全量下载 {len(dst_files)} 个文件"
             )
-            return krpdiff_name, "failed"
+            failed_count = self._fallback_download_group(dst_files, download_dir, log_info, log_error, set_status)
+            return krpdiff_name, "failed" if failed_count > 0 else "success"
 
         # 从备份恢复
         if backup_path.exists() and not first_src_full.exists():
@@ -1493,6 +1488,26 @@ class IncrementalManager:
 
         finally:
             pass
+
+    def _fallback_download_group(
+        self,
+        dst_files: List[Dict],
+        download_dir: Path,
+        log_info,
+        log_error,
+        set_status: Callable[[str], None],
+    ) -> int:
+        """整组回退为完整文件下载，返回失败个数。"""
+        failed_count = 0
+        for index, dst_info in enumerate(dst_files, 1):
+            set_status(f"回退下载 {index}/{len(dst_files)}")
+            staged_path = self._get_staged_patch_path(download_dir, dst_info["dest"])
+            if not self._download_full_file_to_stage(dst_info, staged_path, log_error):
+                failed_count += 1
+                log_error(f"下载失败: {dst_info['dest']}")
+            else:
+                log_info(f"已缓存完整文件: {dst_info['dest']}")
+        return failed_count
 
     def _download_full_file_to_stage(
         self,
