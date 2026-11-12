@@ -5,15 +5,29 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::expect::ExpectTable;
 use crate::ffi;
 use crate::head::GroupHead;
 use crate::streams::{FileOutcome, InStream, OutStream, SegRead, SegWrite};
+
+/// One produced file plus its comparison against `--expect` (if provided).
+pub struct FileCheck {
+    pub rel: String,
+    pub size: u64,
+    pub md5: Option<String>,
+    pub expected_size: Option<u64>,
+    pub expected_md5: Option<String>,
+    /// `None` = 没有期望值可对；`Some(false)` = 与期望不一致。
+    pub matched: Option<bool>,
+}
 
 /// Result of applying one group.
 pub struct GroupOutcome {
     pub patch: PathBuf,
     pub group: String,
-    pub files: Vec<FileOutcome>,
+    pub files: Vec<FileCheck>,
+    /// 与期望值不一致的文件（空 = 全对，或者根本没有提供期望值）。
+    pub mismatch: Vec<String>,
     pub old_data_size: u64,
     pub new_data_size: u64,
     pub secs: f64,
@@ -39,6 +53,8 @@ pub struct ApplyOptions {
     /// Compute per-file MD5 while writing (the manager uses it to decide
     /// whether the result can be kept). `--no-verify` turns this off.
     pub verify: bool,
+    /// 可选的厂商真值表（从 index.json 导出），用于端到端校验输出。
+    pub expect: Option<ExpectTable>,
     /// Global progress counter (bytes written across all groups).
     pub counter: Arc<AtomicU64>,
 }
@@ -158,22 +174,35 @@ pub fn apply_head(
     // Virtual old stream: every referenced file in ref order.
     let mut old = SegRead::new();
     for r in &head.old_refs {
-        old.push_file(&opts.old_root.join(&r.path), r.size)
-            .map_err(|e| e.to_string())?;
+        let abs = opts.old_root.join(&r.path);
+        old.push_file(&abs, r.size).map_err(|e| {
+            format!(
+                "打开旧版文件 {} 失败（{} 字节，路径 {}）: {e}",
+                r.path,
+                r.size,
+                abs.display()
+            )
+        })?;
     }
     // Virtual new stream: the group's outputs, split by newRefSizes.
     let mut writer = SegWrite::new(opts.counter.clone(), opts.verify);
     for r in &head.new_refs {
-        writer
-            .push_file(r.path.clone(), opts.out_root.join(&r.path), r.size)
-            .map_err(|e| e.to_string())?;
+        let abs = opts.out_root.join(&r.path);
+        writer.push_file(r.path.clone(), abs.clone(), r.size).map_err(|e| {
+            format!(
+                "创建输出文件 {} 失败（{} 字节，路径 {}）: {e}",
+                r.path,
+                r.size,
+                abs.display()
+            )
+        })?;
     }
 
     let cache_bytes = opts.cache_bytes.max(4 << 20);
     let mut cache = vec![0u8; cache_bytes];
     let in_diff = InStream::new(diff);
     let in_old = InStream::new(old);
-    let out = OutStream::new(writer);
+    let mut out = OutStream::new(writer);
     let mut plugin = ffi::new_zstd_plugin();
 
     let ok = unsafe {
@@ -187,23 +216,67 @@ pub fn apply_head(
         )
     };
     let dec_error = plugin.dec_error();
-    let files = out.finish(opts.fsync).map_err(|e| e.to_string())?;
     if ok != ffi::HPATCH_TRUE {
-        return Err(if dec_error != 0 {
-            format!("patch 失败（zstd 解压错误码 {dec_error}，片段 {} 个）", dh.cover_count)
-        } else {
-            format!("patch 失败（hdiff 校验或数据错误，片段 {} 个）", dh.cover_count)
+        // write_into 的错误（磁盘满、权限、路径问题）优先报，它才是根因。
+        return Err(match out.take_err() {
+            Some(cause) => format!(
+                "应用差分失败：{cause}（片段 {} 个，目标共 {new_sum} 字节）",
+                dh.cover_count
+            ),
+            None if dec_error != 0 => {
+                format!("应用差分失败：zstd 解压错误码 {dec_error}（片段 {} 个）", dh.cover_count)
+            }
+            None => format!(
+                "应用差分失败：hdiff 校验未通过或差分数据不完整（片段 {} 个）",
+                dh.cover_count
+            ),
         });
     }
+    let files = out.finish(opts.fsync).map_err(|e| e.to_string())?;
+    let (files, mismatch) = check_against_expect(files, opts.expect.as_ref());
 
     Ok(GroupOutcome {
         patch: patch.to_path_buf(),
         group: group_name(patch),
         files,
+        mismatch,
         old_data_size: old_sum,
         new_data_size: new_sum,
         secs: started.elapsed().as_secs_f64(),
     })
+}
+
+/// 把 `--expect` 的期望值套到实际输出上；没有期望值的文件保持 `matched: None`。
+fn check_against_expect(
+    files: Vec<FileOutcome>,
+    expect: Option<&ExpectTable>,
+) -> (Vec<FileCheck>, Vec<String>) {
+    let mut checks = Vec::with_capacity(files.len());
+    let mut mismatch = Vec::new();
+    for f in files {
+        let exp = expect.and_then(|t| t.get(&f.rel));
+        let matched = exp.map(|e| {
+            let size_ok = e.size.map(|s| s == f.size).unwrap_or(true);
+            let md5_ok = f
+                .md5
+                .as_deref()
+                .map(|m| m.eq_ignore_ascii_case(&e.md5))
+                .unwrap_or(false);
+            size_ok && md5_ok
+        });
+        if matched == Some(false) {
+            mismatch.push(f.rel.clone());
+        }
+        checks.push(FileCheck {
+            rel: f.rel,
+            size: f.size,
+            md5: f.md5,
+            expected_size: exp.and_then(|e| e.size),
+            expected_md5: exp.map(|e| e.md5.clone()),
+            matched,
+        });
+    }
+    (checks, mismatch)
 }
 
 fn validate_head(head: &GroupHead) -> Result<(), String> {

@@ -45,10 +45,34 @@ krpatch version
 | `--cache-mb N` | 每组交给 `patch_decompress_with_cache()` 的临时缓存 MiB，默认 8（实测 1–32MB 都在噪声内，≥64MB 反而更慢，不必调） |
 | `--fsync` | 每个输出文件写完 fsync（默认关；断电即毁的场景再开） |
 | `--no-verify` | 不计算输出 md5（大组从 ~3.1 s 降到 ~1.2 s，JSON 里 `md5` 为 `null`；调用方就拿不到自证依据） |
+| `--expect FILE` | 期望值表，逐文件比对厂商真值（见下），不一致即判该分组失败 |
 | `--json FILE` | 结果 JSON 写入文件，默认打到 stdout |
 | `--quiet` | 不打印进度和分组合计 |
 
-进度走 stderr（`45.3%  1.2 GiB / 2.6 GiB  530 MiB/s`），结果 JSON 走 stdout，方便 Python 侧直接 `json.loads(stdout)`。退出码：全部成功 0，有分组失败 1，参数/环境错误 2。
+进度走 stderr（`45.3%  1.2 GiB / 2.6 GiB  530 MiB/s`），结果 JSON 走 stdout，方便 Python 侧直接 `json.loads(stdout)`。
+
+退出码：
+
+| 码 | 含义 |
+| --- | --- |
+| 0 | 全部成功；给了 `--expect` 时全部对得上 |
+| 1 | 有分组应用失败（旧文件缺失、磁盘写坏、差分损坏……看 `groups[].error`） |
+| 2 | 参数或环境错误（补丁读不开、路径重复、`--expect` 文件有问题） |
+| 3 | 应用本身成功，但输出与 `--expect` 不符（不该发生；发生了说明上游补丁或本工具出了问题） |
+
+`--expect` 表是纯文本，每行 `相对路径<TAB>字节数<TAB>md5`，通常从官方 index.json 的落地清单直接生成：
+
+```bash
+python3 - <<'PY' > /tmp/expect.tsv
+import json
+d = json.load(open('index.json'))          # 官服启动器下发的清单
+for g in d['groups'].values():
+    for f in g['dstFiles']:
+        print(f"{f['dest']}\t{f['size']}\t{f['md5']}")
+PY
+```
+
+没出现在输出里的条目会被忽略（一个表可以覆盖多组补丁）；路径里的 `\` 会被当成 `/`。这是应用完成后**唯一能证明“和官方客户端逐字节一致”** 的依据，所以校验成本（约 1 GiB/s 的单流 md5）值得付；要快就 `--no-verify`，但别再同时给 `--expect`（没 md5 就没得比，会直接报错）。
 
 结果 JSON：
 
@@ -58,25 +82,33 @@ krpatch version
   "workers": 8,
   "cache_mb": 8,
   "verify": true,
+  "expect_checked": true,
   "total_secs": 4.312,
   "groups": [
     {
       "group": "group_16",
       "patch": "/path/group_16.krpdiff",
       "ok": true,
+      "status": "ok",
       "old_size": 97716450,
       "new_size": 105844690,
       "secs": 0.246,
+      "mismatch": [],
       "files": [
         {"path": "Client/Content/Paks/pakchunk42-WindowsNoEditor.pak",
-         "size": 105844690, "md5": "37cb7a62c6b2548c43083d079454aaa5"}
+         "size": 105844690, "md5": "37cb7a62c6b2548c43083d079454aaa5",
+         "expected_size": 105844690,
+         "expected_md5": "37cb7a62c6b2548c43083d079454aaa5",
+         "matched": true}
       ]
     }
   ]
 }
 ```
 
-失败时该分组变成 `{"ok": false, "error": "..."}`，其余分组照常完成——调用方可以按分组回退（比如用户目录里旧文件缺失、或者补丁没下完）。
+`ok` 全局字段在“有分组失败”或“有 mismatch”时都是 `false`；`status` 取 `ok` / `mismatch` / `failed`。没有给 `--expect` 时 `expect_checked` 为 `false`、每个文件的 `expected_*` 与 `matched` 为 `null`。
+
+失败时该分组变成 `{"ok": false, "status": "failed", "error": "..."}`，其余分组照常完成——调用方可以按分组回退（比如用户目录里旧文件缺失、或者补丁没下完）。错误文本优先报**根因**：写盘失败会带具体路径与系统错误，而不是笼统的“校验失败”。
 
 ## 容器格式（`apply` 实际依赖的部分）
 
@@ -97,7 +129,9 @@ krpatch version
 | `group_38` | 2,351,195,631 + 144,036 → 2,513,149,583 + 153,920 | 520 MB | `3f2dc3c20392c6b4991fb0b972f24e96` / `dcbdcb1389813e972a426a0c54f4d02e` ✓ |
 | `group_25` | 108 refs（715 MiB）→ 109 个文件（730 MiB） | 52 MB | 旧文件 CDN 已 404，用同尺寸稀疏文件跑通：109 个输出全写出、尺寸全对；因输入是空洞文件，md5 不可比 |
 
-另外验证过的失败路径：旧文件缺失、补丁被截断、hdiff 段长度与头部不符、输出路径重复（并发写冲突）——都会在写坏任何东西之前报错。
+另外验证过的失败路径：旧文件缺失、补丁被截断、hdiff 段长度与头部不符、输出路径重复（并发写冲突）、输出盘写满（`ENOSPC` / `EFBIG`）——都会在写坏任何东西之前报错，且错误文本指向真实根因（例如 `应用差分失败：Disk quota exceeded (os error 122)（片段 3133 个，目标共 105844690 字节）`）。
+
+`--expect` 本身的四个行为也验过：厂商 md5 全对 → 退出码 0；篡改一条期望 md5 → 退出码 3、`status: mismatch`、`mismatch` 里点名该文件；反斜杠路径的清单 → 仍能匹配；`--expect` 与 `--no-verify` 同用 → 退出码 2 并拒绝执行。
 
 ## 性能
 

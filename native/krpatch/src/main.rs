@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod apply;
+mod expect;
 mod ffi;
 mod head;
 mod streams;
@@ -30,8 +31,12 @@ apply 选项:
   --cache-mb N      每组解压临时缓存 MiB（默认 8，无需调大）
   --fsync           写完每个文件后执行 fsync（默认关）
   --no-verify       不计算输出文件的 md5（更快，但无法自证输出正确）
+  --expect FILE     期望值表（每行 `路径<TAB>大小<TAB>md5`，从 index.json 导出）
+                    提供后逐文件与厂商真值比对，不一致则判该分组失败
   --json FILE       把结果 JSON 写入文件（默认 stdout）
   --quiet           不输出进度
+
+退出码: 0 成功 / 1 有分组应用失败 / 2 参数或补丁错误 / 3 输出与期望值不一致
 ";
 
 fn main() {
@@ -79,6 +84,7 @@ struct ApplyCli {
     cache_mb: usize,
     fsync: bool,
     verify: bool,
+    expect: Option<PathBuf>,
     json: Option<PathBuf>,
     quiet: bool,
     patches: Vec<PathBuf>,
@@ -92,6 +98,7 @@ fn parse_apply_args(args: &[String]) -> Result<ApplyCli, String> {
         cache_mb: 8,
         fsync: false,
         verify: true,
+        expect: None,
         json: None,
         quiet: false,
         patches: Vec::new(),
@@ -119,6 +126,7 @@ fn parse_apply_args(args: &[String]) -> Result<ApplyCli, String> {
             "--json" => cli.json = Some(PathBuf::from(value("--json")?)),
             "--fsync" => cli.fsync = true,
             "--no-verify" => cli.verify = false,
+            "--expect" => cli.expect = Some(PathBuf::from(value("--expect")?)),
             "--quiet" => cli.quiet = true,
             s if s.starts_with('-') => return Err(format!("未知选项 {s}\n{USAGE}")),
             s => cli.patches.push(PathBuf::from(s)),
@@ -135,6 +143,9 @@ fn parse_apply_args(args: &[String]) -> Result<ApplyCli, String> {
     }
     if cli.cache_mb < 4 {
         cli.cache_mb = 4;
+    }
+    if cli.expect.is_some() && !cli.verify {
+        return Err("--expect 需要 md5 才能比对，不能与 --no-verify 同用".into());
     }
     Ok(cli)
 }
@@ -157,6 +168,11 @@ fn human(bytes: u64) -> String {
 fn cmd_apply(args: &[String]) -> Result<i32, String> {
     let cli = parse_apply_args(args)?;
     let started = Instant::now();
+    // 期望值表在启动时就确定（后面会被各分组共享）
+    let expect_table = match &cli.expect {
+        Some(p) => Some(expect::ExpectTable::load(p)?),
+        None => None,
+    };
 
     // Parse every container up front: gives the total workload for progress and
     // lets us reject overlapping output paths before touching any file.
@@ -201,11 +217,15 @@ fn cmd_apply(args: &[String]) -> Result<i32, String> {
 
     if !cli.quiet {
         eprintln!(
-            "krpatch: {} 个分组，共 {} 待生成，并发 {}{}",
+            "krpatch: {} 个分组，共 {} 待生成，并发 {}{}{}",
             groups.len(),
             human(total_new),
             workers,
-            if workers > 1 { "" } else { "（单分组只能串行）" }
+            if workers > 1 { "" } else { "（单分组只能串行）" },
+            match &expect_table {
+                Some(t) => format!("，期望值 {} 条", t.len()),
+                None => String::new(),
+            }
         );
     }
 
@@ -216,6 +236,7 @@ fn cmd_apply(args: &[String]) -> Result<i32, String> {
         cache_bytes: cli.cache_mb << 20,
         fsync: cli.fsync,
         verify: cli.verify,
+        expect: expect_table,
         counter: counter.clone(),
     };
 
@@ -275,35 +296,79 @@ fn cmd_apply(args: &[String]) -> Result<i32, String> {
 
     for (_, r) in &results {
         match r {
-            Ok(o) if !cli.quiet => eprintln!(
-                "  [{}] {} -> {} 个文件, {:.2}s, {}/s",
-                o.group,
-                human(o.new_data_size),
-                o.files.len(),
-                o.secs,
-                human(o.throughput() as u64)
-            ),
+            Ok(o) if !cli.quiet => {
+                eprintln!(
+                    "  [{}] {} -> {} 个文件, {:.2}s, {}/s",
+                    o.group,
+                    human(o.new_data_size),
+                    o.files.len(),
+                    o.secs,
+                    human(o.throughput() as u64)
+                );
+                if !o.mismatch.is_empty() {
+                    eprintln!(
+                        "        [校验失败] {} 个文件与期望值不一致: {}",
+                        o.mismatch.len(),
+                        o.mismatch
+                            .iter()
+                            .take(3)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
+            }
             Ok(_) => {}
             Err(e) => eprintln!("  [失败] {e}"),
         }
     }
 
-    let ok = results.iter().all(|(_, r)| r.is_ok());
-    let json = build_json(&results, workers, cli.cache_mb, cli.verify, started.elapsed().as_secs_f64());
+    let apply_failed = results.iter().any(|(_, r)| r.is_err());
+    let mismatch = results
+        .iter()
+        .any(|(_, r)| matches!(r, Ok(o) if !o.mismatch.is_empty()));
+    let json = build_json(
+        &results,
+        workers,
+        cli.cache_mb,
+        cli.verify,
+        started.elapsed().as_secs_f64(),
+    );
     match &cli.json {
         Some(path) => {
             std::fs::write(path, json).map_err(|e| format!("写 {} 失败: {e}", path.display()))?;
         }
-        None => println!("{json}"),
+        None => {
+            // 用 write_all 而不是 println!：stdout 写失败（如管道关闭）时该报错，不该 panic。
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(json.as_bytes())
+                .and_then(|()| stdout.flush())
+                .map_err(|e| format!("写 stdout 失败: {e}"))?;
+        }
     }
     if !cli.quiet {
         eprintln!(
             "krpatch: {} ({:.2}s)",
-            if ok { "完成" } else { "有分组失败" },
+            if apply_failed {
+                "有分组失败"
+            } else if mismatch {
+                "输出与期望值不一致"
+            } else {
+                "完成"
+            },
             started.elapsed().as_secs_f64()
         );
     }
-    Ok(if ok { 0 } else { 1 })
+    // 应用失败与“内容不对”分开报，调用方（管理器）可以只回退受影响的分组。
+    Ok(if apply_failed {
+        1
+    } else if mismatch {
+        3
+    } else {
+        0
+    })
 }
 
 fn json_str(s: &str) -> String {
@@ -324,6 +389,28 @@ fn json_str(s: &str) -> String {
     out
 }
 
+fn json_opt_str(v: Option<&str>) -> String {
+    match v {
+        Some(s) => json_str(s),
+        None => "null".to_string(),
+    }
+}
+
+fn json_opt_num(v: Option<u64>) -> String {
+    match v {
+        Some(n) => n.to_string(),
+        None => "null".to_string(),
+    }
+}
+
+fn json_opt_bool(v: Option<bool>) -> &'static str {
+    match v {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "null",
+    }
+}
+
 fn build_json(
     results: &[(usize, Result<apply::GroupOutcome, String>)],
     workers: usize,
@@ -331,39 +418,57 @@ fn build_json(
     verify: bool,
     total_secs: f64,
 ) -> String {
-    let ok = results.iter().all(|(_, r)| r.is_ok());
+    let ok = results
+        .iter()
+        .all(|(_, r)| matches!(r, Ok(o) if o.mismatch.is_empty()));
+    let expect_used = results.iter().any(|(_, r)| {
+        matches!(r, Ok(o) if o.files.iter().any(|f| f.expected_md5.is_some()))
+    });
     let mut s = String::new();
     s.push_str("{\n");
     s.push_str(&format!("  \"ok\": {ok},\n"));
     s.push_str(&format!("  \"workers\": {workers},\n"));
     s.push_str(&format!("  \"cache_mb\": {cache_mb},\n"));
     s.push_str(&format!("  \"verify\": {verify},\n"));
+    s.push_str(&format!("  \"expect_checked\": {expect_used},\n"));
     s.push_str(&format!("  \"total_secs\": {total_secs:.3},\n"));
     s.push_str("  \"groups\": [\n");
     for (i, (_, r)) in results.iter().enumerate() {
         match r {
             Ok(o) => {
+                let clean = o.mismatch.is_empty();
                 s.push_str("    {\n");
                 s.push_str(&format!("      \"group\": {},\n", json_str(&o.group)));
                 s.push_str(&format!(
                     "      \"patch\": {},\n",
                     json_str(&o.patch.display().to_string())
                 ));
-                s.push_str("      \"ok\": true,\n");
+                s.push_str(&format!("      \"ok\": {clean},\n"));
+                s.push_str(&format!(
+                    "      \"status\": \"{}\",\n",
+                    if clean { "ok" } else { "mismatch" }
+                ));
                 s.push_str(&format!("      \"old_size\": {},\n", o.old_data_size));
                 s.push_str(&format!("      \"new_size\": {},\n", o.new_data_size));
                 s.push_str(&format!("      \"secs\": {:.3},\n", o.secs));
+                s.push_str("      \"mismatch\": [");
+                for (k, rel) in o.mismatch.iter().enumerate() {
+                    if k > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&json_str(rel));
+                }
+                s.push_str("],\n");
                 s.push_str("      \"files\": [\n");
                 for (j, f) in o.files.iter().enumerate() {
-                    let md5 = match &f.md5 {
-                        Some(m) => json_str(m),
-                        None => "null".to_string(),
-                    };
                     s.push_str(&format!(
-                        "        {{\"path\": {}, \"size\": {}, \"md5\": {}}}{}\n",
+                        "        {{\"path\": {}, \"size\": {}, \"md5\": {}, \"expected_size\": {}, \"expected_md5\": {}, \"matched\": {}}}{}\n",
                         json_str(&f.rel),
                         f.size,
-                        md5,
+                        json_opt_str(f.md5.as_deref()),
+                        json_opt_num(f.expected_size),
+                        json_opt_str(f.expected_md5.as_deref()),
+                        json_opt_bool(f.matched),
                         if j + 1 == o.files.len() { "" } else { "," }
                     ));
                 }
@@ -373,6 +478,7 @@ fn build_json(
             Err(e) => {
                 s.push_str("    {\n");
                 s.push_str("      \"ok\": false,\n");
+                s.push_str("      \"status\": \"failed\",\n");
                 s.push_str(&format!("      \"error\": {}\n", json_str(e)));
                 s.push_str("    }");
             }

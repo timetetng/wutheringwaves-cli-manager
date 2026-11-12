@@ -287,6 +287,8 @@ pub struct SegWrite {
     total: u64,
     counter: Arc<AtomicU64>,
     hash: Option<HashWorker>,
+    /// 首个写入错误：C 回调只能返回失败，错误文本得存在这里带出去。
+    err: Option<String>,
 }
 
 impl SegWrite {
@@ -297,6 +299,7 @@ impl SegWrite {
             total: 0,
             counter,
             hash: if verify { Some(HashWorker::spawn()) } else { None },
+            err: None,
         }
     }
 
@@ -338,6 +341,11 @@ impl SegWrite {
         Ok(())
     }
 
+    /// 取出首个写入错误（如果有），给上层拼错误信息用。
+    pub fn take_err(&mut self) -> Option<String> {
+        self.err.take()
+    }
+
     /// Flush, hash the files that were written out of order, and report results.
     pub fn finish(mut self, fsync: bool) -> io::Result<Vec<FileOutcome>> {
         // Close the queue first so the hashing thread drains and exits.
@@ -377,7 +385,12 @@ unsafe extern "C" fn seg_write(
     let slice = std::slice::from_raw_parts(data, len);
     match ctx.write_into(write_to_pos, slice) {
         Ok(()) => HPATCH_TRUE,
-        Err(_) => 0,
+        Err(e) => {
+            if ctx.err.is_none() {
+                ctx.err = Some(e.to_string());
+            }
+            0
+        }
     }
 }
 
@@ -406,6 +419,11 @@ impl OutStream {
 
     pub fn finish(self, fsync: bool) -> io::Result<Vec<FileOutcome>> {
         self.owner.finish(fsync)
+    }
+
+    /// 写入过程中记录的首个错误（如果有）。
+    pub fn take_err(&mut self) -> Option<String> {
+        self.owner.take_err()
     }
 }
 
