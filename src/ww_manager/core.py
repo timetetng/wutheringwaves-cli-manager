@@ -236,13 +236,13 @@ class WGameManager:
         data["default"] = {
             "version": common.get("version"),
             "cdnList": cdn_list,
-            "baseUrl": common.get("baseUrl"),
-            "resourcesBasePath": common.get("baseUrl"),
+            "baseUrl": (common.get("baseUrl") or "").rstrip("/"),
+            "resourcesBasePath": (common.get("baseUrl") or "").rstrip("/"),
             "resources": common.get("indexFile"),
             "config": {
                 "version": common.get("version"),
                 "indexFile": common.get("indexFile"),
-                "baseUrl": common.get("baseUrl"),
+                "baseUrl": (common.get("baseUrl") or "").rstrip("/"),
                 "patchConfig": common.get("patchConfig", []),
             },
         }
@@ -1137,17 +1137,26 @@ class WGameManager:
         if server not in SERVER_CONFIGS:
             raise ConfigError(f"无效的服务器类型: {server}")
         cfg = SERVER_CONFIGS[server]
-        info = self._http_get_json(cfg["api_url"])
+        info = None
+        urls = cfg.get("api_urls") or (cfg["api_url"],)
+        for url in urls:
+            data = self._http_get_json(url)
+            if isinstance(data, dict) and (data.get("default") or data.get("resourcePacks")):
+                info = self._normalize_channel_index(data)
+                break
         if not info:
             raise NetworkError(f"无法获取 {server} 服启动器配置信息")
-        version = info["default"].get("version", "")
-        nodes = info["default"].get("cdnList", [])
+        default = info.get("default") or {}
+        version = default.get("version", "")
+        nodes = default.get("cdnList", [])
         valid = [n for n in nodes if n.get("K1") == 1 and n.get("K2") == 1]
         if not valid:
             raise NetworkError(f"{server} 服没有可用的 CDN 节点")
         cdn = max(valid, key=lambda x: x["P"])["url"]
-        res_base = info["default"].get("resourcesBasePath") or info["default"].get("baseUrl")
-        uri = info["default"]["config"]["indexFile"]
+        res_base = (default.get("resourcesBasePath") or default.get("baseUrl") or "").rstrip("/")
+        uri = (default.get("config") or {}).get("indexFile")
+        if not uri:
+            raise NetworkError(f"{server} 服配置缺少文件清单地址")
         idx = self._http_get_json(urljoin(cdn, uri))
         if not idx:
             raise NetworkError(f"无法下载 {server} 服文件清单")

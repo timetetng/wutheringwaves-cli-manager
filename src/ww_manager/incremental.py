@@ -615,18 +615,9 @@ class IncrementalManager:
         resources = index_data.get("resource", [])
         resource_by_dest = {r["dest"]: r for r in resources if r.get("dest")}
         complete_files = [r for r in resources if not _is_diff_resource(r["dest"])]
-        res_base = None
-        for r in resources:
-            if r.get("fromFolder"):
-                res_base = r["fromFolder"].rstrip("/")
-                break
+        res_base = self._full_resource_base()
         if not res_base:
-            # 回退到 patch 或 default config 的 baseUrl
-            patch_info = self._find_matching_patch()
-            if patch_info and patch_info.get("baseUrl"):
-                res_base = patch_info["baseUrl"].rstrip("/")
-            elif self.default_config.get("baseUrl"):
-                res_base = self.default_config["baseUrl"].rstrip("/")
+            logger.debug("无法确定全量资源目录，将逐个使用资源的 fromFolder")
 
         logger.debug("正在检查本地增量更新资源缓存...")
 
@@ -1845,7 +1836,7 @@ class IncrementalManager:
         repair_needed = inconsistent_files + missing_files
         logger.warning(f"需要修复的游戏文件: {repair_needed}")
 
-        res_base = self._find_resource_base()
+        res_base = self._full_resource_base()
         if not res_base:
             logger.warning("无法获取全局新版本资源路径，将尝试使用单个资源的 fromFolder")
 
