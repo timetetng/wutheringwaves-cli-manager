@@ -1,0 +1,24 @@
+[package]
+name = "krpatch"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Native applier for Kuro Games directory diffs (.krpdiff, HDIFF19)"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "krpatch"
+path = "src/main.rs"
+
+[dependencies]
+zstd = { version = "0.13", default-features = false }
+md-5 = "0.10"
+
+[build-dependencies]
+cc = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
