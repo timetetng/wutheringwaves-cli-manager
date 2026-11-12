@@ -518,16 +518,75 @@ class ResourceUpdateTests(unittest.TestCase):
         self.assertEqual((self.root / destination("uhd")).read_bytes(), NEW)
         self.assertEqual((self.root / destination("hd")).read_bytes(), OLD)
 
-    def test_bilibili_common_uses_shared_pack_list(self):
-        """官/B 服共用同一画质资源包：B 服不需要额外的目标全量清单即可预下载 common。"""
+    def prepare_bilibili(self):
         self.owner.server_type = "bilibili"
         state = self.owner._read_resource_state()
         state["common_server"] = "bilibili"
         self.owner._write_local_json("wwm_resource_state.json", state)
+        self.owner._launcher_info = {"predownload": {"version": TARGET, "config": {"indexFile": "b-target.json"}}}
+        self.owner._cdn_node = self.url
+        self.serve_json(
+            "/b-target.json", {"resource": [file_item(destination("common")), file_item(destination("hd"))]}
+        )
+
+    def test_bilibili_common_requires_matching_channel_target(self):
+        self.prepare_bilibili()
         self.assertTrue(self.updater.download())
         self.assertTrue(self.updater.apply())
         self.assertEqual((self.root / destination("common")).read_bytes(), NEW)
         self.assertEqual((self.root / destination("hd")).read_bytes(), OLD)
+
+    def test_bilibili_common_rejects_official_channel_exclusive_file(self):
+        self.prepare_bilibili()
+        self.set_index("common", {"resource": [file_item("Client/official-only.dll")]})
+        with self.assertRaisesRegex(ConfigError, "与 B 服目标清单不符"):
+            self.updater.download()
+        self.assertEqual((self.root / destination("common")).read_bytes(), OLD)
+        self.assertFalse((self.root / PLAN).exists())
+
+    def test_bilibili_common_rejects_deleting_required_channel_file(self):
+        self.prepare_bilibili()
+        self.set_index("common", {"deleteFiles": [destination("common")]})
+        with self.assertRaisesRegex(ConfigError, "仍需要"):
+            self.updater.download()
+
+    def test_bilibili_no_target_manifest_does_not_fallback(self):
+        self.prepare_bilibili()
+        self.owner._launcher_info = {"default": {"version": SOURCE}}
+        with self.assertRaisesRegex(ConfigError, "目标清单尚未开放"):
+            self.updater.download()
+
+    def prepare_bilibili_deferred_predownload(self):
+        self.prepare_predownload()
+        self.owner.server_type = "bilibili"
+        state = self.owner._read_resource_state()
+        state["common_server"] = "bilibili"
+        self.owner._write_local_json("wwm_resource_state.json", state)
+        self.owner._launcher_info = {"default": {"version": SOURCE}}
+
+    def test_bilibili_predownload_skips_common_until_channel_manifest(self):
+        """B 服还没发布目标清单：只预下载画质包，common 保持原版本且不请求 common 补丁。"""
+        self.prepare_bilibili_deferred_predownload()
+        self.assertTrue(self.updater.download())
+        plan = self.read_json(PLAN)
+        self.assertTrue(plan["predownload"])
+        self.assertEqual(plan["packs"]["common"]["from_version"], SOURCE)
+        self.assertEqual(plan["packs"]["common"]["to_version"], SOURCE)
+        self.assertEqual(plan["packs"]["uhd"]["to_version"], TARGET)
+        self.assertFalse(any("/ppatch/common.json" in u for u in self.server.requested))
+        self.assertTrue(any("/ppatch/uhd.json" in u for u in self.server.requested))
+
+    def test_bilibili_deferred_common_backfilled_when_channel_manifest_opens(self):
+        """B 服开放目标清单后，重跑原计划能把被跳过的 common 补上，不需要手动删计划。"""
+        self.prepare_bilibili_deferred_predownload()
+        self.assertTrue(self.updater.download())
+        self.serve_json("/b-target.json", {"resource": [file_item(destination("common"))]})
+        self.owner._cdn_node = self.url
+        self.owner._launcher_info = {"predownload": {"version": TARGET, "config": {"indexFile": "b-target.json"}}}
+        self.assertTrue(self.updater.download())
+        plan = self.read_json(PLAN)
+        self.assertEqual(plan["packs"]["common"]["to_version"], TARGET)
+        self.assertTrue(any("/ppatch/common.json" in u for u in self.server.requested))
 
     def test_group_output_cannot_be_deleted_by_same_patch(self):
         dest = destination("uhd")
