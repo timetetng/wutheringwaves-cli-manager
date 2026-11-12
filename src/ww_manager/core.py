@@ -24,12 +24,12 @@ from rich.progress import (
 from ww_manager.config import (
     APPID_TO_SERVER,
     DIFF_CACHE_SERVERS,
-    RESOURCE_CONFIG_URLS,
     SERVER_CONFIGS,
     SERVER_DIFF_CACHE_DIR_NAME,
     SERVER_DIFF_CACHE_MANIFEST,
     SERVER_DIFF_CACHE_VERSION,
     parse_major_minor,
+    resource_config_urls,
 )
 from ww_manager.download import (
     DownloadSpaceError,
@@ -211,10 +211,42 @@ class WGameManager:
     def launcher_info(self):
         if not self._launcher_info:
             logger.info(f"正在获取 {self.server_type} 服配置...")
-            self._launcher_info = self._http_get_json(self.config["api_url"])
+            for url in self.config.get("api_urls") or (self.config["api_url"],):
+                data = self._http_get_json(url)
+                if isinstance(data, dict) and (data.get("default") or data.get("resourcePacks")):
+                    self._launcher_info = self._normalize_channel_index(data)
+                    break
             if not self._launcher_info:
                 raise NetworkError("无法获取启动器配置信息")
         return self._launcher_info
+
+    @staticmethod
+    def _normalize_channel_index(data: Dict[str, Any]) -> Dict[str, Any]:
+        """3.8 起启动器 index 改版：顶层 resourcePacks/cdnList，不再有 default。
+
+        合成 default 段，让基础版本、基础文件清单和 CDN 选择的旧路径继续可用。
+        """
+        if not isinstance(data, dict) or "default" in data:
+            return data
+        packs = data.get("resourcePacks")
+        common = packs.get("common") if isinstance(packs, dict) else None
+        if not isinstance(common, dict):
+            return data
+        cdn_list = data.get("cdnList") if isinstance(data.get("cdnList"), list) else []
+        data["default"] = {
+            "version": common.get("version"),
+            "cdnList": cdn_list,
+            "baseUrl": common.get("baseUrl"),
+            "resourcesBasePath": common.get("baseUrl"),
+            "resources": common.get("indexFile"),
+            "config": {
+                "version": common.get("version"),
+                "indexFile": common.get("indexFile"),
+                "baseUrl": common.get("baseUrl"),
+                "patchConfig": common.get("patchConfig", []),
+            },
+        }
+        return data
 
     @property
     def cdn_node(self):
@@ -480,7 +512,17 @@ class WGameManager:
         if config_url is not None and (not isinstance(config_url, str) or not config_url):
             raise ConfigError("资源档位配置地址为空")
         logger.info("正在获取资源档位配置...")
-        for url in (config_url,) if config_url else RESOURCE_CONFIG_URLS:
+        # 3.8 起 index 自带 resourcePacks；已取到的渠道配置直接复用，避免重复请求。
+        if config_url is None and isinstance(self._launcher_info, dict):
+            cached = self._launcher_info
+            if (
+                isinstance(cached.get("resourcePacks"), dict)
+                and cached["resourcePacks"]
+                and isinstance(cached.get("cdnList"), list)
+                and cached["cdnList"]
+            ):
+                return cached
+        for url in (config_url,) if config_url else resource_config_urls(self.server_type):
             data = self._http_get_json(url)
             if (
                 isinstance(data, dict)

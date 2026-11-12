@@ -19,7 +19,7 @@ from unittest.mock import patch
 from typer.testing import CliRunner
 
 from ww_manager.cli import app
-from ww_manager.config import RESOURCE_CONFIG_URLS
+from ww_manager.config import RESOURCE_CONFIG_URLS, resource_config_urls
 from ww_manager.core import ConfigError, DiskSpaceError, MD5Cache, NetworkError, WGameManager
 from ww_manager.download import create_download_progress, download_single_file
 from ww_manager.menu import MenuOption
@@ -361,9 +361,44 @@ class ResourceTierTests(unittest.TestCase):
             app_id = manager.config["appId"]
             with patch.object(manager, "_http_get_json", return_value=self.bundle) as fetch:
                 self.assertEqual(manager.get_bundle_config(), self.bundle)
-            fetch.assert_called_once_with(RESOURCE_CONFIG_URLS[0])
+            fetch.assert_called_once_with(resource_config_urls(server)[0])
             self.assertEqual(manager.config["appId"], app_id)
             self.assertEqual(manager.server_type, server)
+
+    def test_new_schema_index_synthesizes_default(self):
+        manager = WGameManager(self.root, "bilibili")
+        index = {
+            "cdnList": [
+                {"P": 7, "url": "http://cdn-a/", "K1": 1, "K2": 1},
+                {"P": 1, "url": "http://cdn-b/", "K1": 1, "K2": 1},
+            ],
+            "resourcePacks": {
+                "common": {
+                    "version": "3.8.0",
+                    "indexFile": "g/common/indexFile.json",
+                    "baseUrl": "g/zip/",
+                    "patchConfig": [{"version": "3.7.1", "indexFile": "g/common/3.7.1/indexFile.json"}],
+                },
+                "uhd": {"version": "3.8.0", "indexFile": "g/uhd/indexFile.json", "baseUrl": "g/zip/"},
+            },
+            "bundles": {"UHD": {"resourcePacks": ["common", "uhd"]}},
+        }
+        with patch.object(manager, "_http_get_json", return_value=copy.deepcopy(index)) as fetch:
+            info = manager.launcher_info
+            self.assertEqual(info["default"]["version"], "3.8.0")
+            self.assertEqual(info["default"]["config"]["indexFile"], "g/common/indexFile.json")
+            self.assertEqual(manager.cdn_node, "http://cdn-a/")
+            # 渠道配置已缓存，画质配置直接复用，不再重复请求。
+            self.assertEqual(manager.get_bundle_config(), info)
+        fetch.assert_called_once_with(resource_config_urls("bilibili")[0])
+        self.assertEqual(info["default"]["cdnList"][0]["url"], "http://cdn-a/")
+
+    def test_launcher_info_falls_back_to_second_host(self):
+        manager = WGameManager(self.root, "cn")
+        index = {"resourcePacks": {"common": {"version": "3.8.0", "indexFile": "a"}}, "cdnList": []}
+        with patch.object(manager, "_http_get_json", side_effect=[None, copy.deepcopy(index)]) as fetch:
+            self.assertEqual(manager.launcher_info["default"]["version"], "3.8.0")
+        self.assertEqual([call.args[0] for call in fetch.call_args_list], list(resource_config_urls("cn")[:2]))
 
     def test_auto_config_tries_other_official_nodes(self):
         manager = WGameManager(self.root, "cn")

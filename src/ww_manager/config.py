@@ -57,7 +57,12 @@ def parse_major_minor(version: str) -> Optional[tuple]:
 
 SERVER_CONFIGS = {
     "cn": {
-        "api_url": "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/G152/10003_Y8xXrXk65DqFHEDgApn3cpK5lfczpFx5/index.json",
+        # 3.8 起启动器 index 换成 <appId>_<appKey>/G152/<channel>/index.json，旧 10003_Y8x… 已 404
+        "api_url": "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json",
+        "api_urls": (
+            "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json",
+            "https://prod-volcdn-gamestarter.kurogame.xyz/launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json",
+        ),
         "appId": "10003",
     },
     "global": {
@@ -65,21 +70,37 @@ SERVER_CONFIGS = {
         "appId": "50004",
     },
     "bilibili": {
-        "api_url": "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/G152/10004_j5GWFuUFlb8N31Wi2uS3ZAVHcb7ZGN7y/index.json",
+        # B 服自己的 appKey（2026-11-12 实测抓到）；换 token 时改这里
+        "api_url": "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10004_IY6xmlAusbImBjWrpPj1OwNuirXEO44x/G152/bilibili/index.json",
+        "api_urls": (
+            "https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10004_IY6xmlAusbImBjWrpPj1OwNuirXEO44x/G152/bilibili/index.json",
+            "https://prod-volcdn-gamestarter.kurogame.xyz/launcher/game/10004_IY6xmlAusbImBjWrpPj1OwNuirXEO44x/G152/bilibili/index.json",
+        ),
         "appId": "10004",
     },
 }
 
-# 官服/B服共用画质包入口；版本、清单及下载 CDN 从官方配置动态读取。
-RESOURCE_CONFIG_PATH = "launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json"
-RESOURCE_CONFIG_URLS = tuple(
-    host + RESOURCE_CONFIG_PATH
-    for host in (
-        "https://prod-cn-alicdn-gamestarter.kurogame.com/",
-        "https://prod-volcdn-gamestarter.kurogame.xyz/",
-        "https://prod-tencentcdn-gamestarter.kurogame.com/",
-    )
+RESOURCE_CONFIG_HOSTS = (
+    "https://prod-cn-alicdn-gamestarter.kurogame.com/",
+    "https://prod-volcdn-gamestarter.kurogame.xyz/",
+    "https://prod-tencentcdn-gamestarter.kurogame.com/",
 )
+
+# 各渠道自己的画质/分包配置路径（官/B 服 contentId 目录不同，不能共用）
+RESOURCE_CONFIG_PATHS = {
+    "cn": "launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json",
+    "bilibili": "launcher/game/10004_IY6xmlAusbImBjWrpPj1OwNuirXEO44x/G152/bilibili/index.json",
+}
+
+
+def resource_config_urls(server_type: str) -> tuple:
+    """渠道配置的多 CDN 地址；未登记的国际服沿用官服入口。"""
+    path = RESOURCE_CONFIG_PATHS.get(server_type) or RESOURCE_CONFIG_PATHS["cn"]
+    return tuple(host + path for host in RESOURCE_CONFIG_HOSTS)
+
+
+# 兼容旧引用（官服）
+RESOURCE_CONFIG_URLS = resource_config_urls("cn")
 
 APPID_TO_SERVER = {v["appId"]: k for k, v in SERVER_CONFIGS.items()}
 
