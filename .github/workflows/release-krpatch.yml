@@ -1,0 +1,124 @@
+name: Release krpatch
+
+# krpatch 是原生 Linux 补丁应用器（native/krpatch），替代 wine + hpatchz.exe。
+# 推 krpatch-* tag 时构建并挂到 Release；平时推 main/dev 只做构建校验。
+on:
+  push:
+    tags:
+      - 'krpatch-*'
+    branches: [ "main", "dev" ]
+    paths:
+      - 'native/krpatch/**'
+      - '.github/workflows/release-krpatch.yml'
+  pull_request:
+    branches: [ "main", "dev" ]
+    paths:
+      - 'native/krpatch/**'
+      - '.github/workflows/release-krpatch.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., krpatch-v0.1.0)'
+        required: true
+        default: 'krpatch-v0.1.0'
+
+jobs:
+  build:
+    name: Build native binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        # --locked 保证依赖版本与仓库里的 Cargo.lock 一致
+        run: cargo build --release --locked --manifest-path native/krpatch/Cargo.toml
+
+      - name: Smoke test
+        run: |
+          ./native/krpatch/target/release/krpatch version
+          ./native/krpatch/target/release/krpatch --help
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          strip native/krpatch/target/release/krpatch
+          cp native/krpatch/target/release/krpatch dist/krpatch-linux-x86_64
+          tar -C dist -czf dist/krpatch-linux-x86_64.tar.gz krpatch-linux-x86_64
+          cp native/krpatch/README.md dist/README-krpatch.md
+          cd dist && sha256sum krpatch-linux-x86_64 > krpatch-linux-x86_64.sha256
+          ls -la
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: krpatch-linux-x86_64
+          path: |
+            dist/krpatch-linux-x86_64
+            dist/krpatch-linux-x86_64.tar.gz
+            dist/krpatch-linux-x86_64.sha256
+
+  release:
+    name: Attach to Release
+    needs: build
+    # 只有 tag 推送或手动派发才发 Release，普通分支推送仅构建
+    if: startsWith(github.ref, 'refs/tags/krpatch-') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --locked --manifest-path native/krpatch/Cargo.toml
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          strip native/krpatch/target/release/krpatch
+          cp native/krpatch/target/release/krpatch dist/krpatch-linux-x86_64
+          tar -C dist -czf dist/krpatch-linux-x86_64.tar.gz krpatch-linux-x86_64
+          cp native/krpatch/README.md dist/README-krpatch.md
+          cd dist && sha256sum krpatch-linux-x86_64 > krpatch-linux-x86_64.sha256
+
+      - name: Determine tag
+        id: get_tag
+        run: |
+          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+          echo "Tag: ${{ steps.get_tag.outputs.tag }}"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/krpatch-linux-x86_64
+            dist/krpatch-linux-x86_64.tar.gz
+            dist/krpatch-linux-x86_64.sha256
+          tag_name: ${{ steps.get_tag.outputs.tag }}
+          name: krpatch ${{ steps.get_tag.outputs.tag }}
+          body: |
+            krpatch —— 原生 Linux 补丁应用器（x86_64）
+
+            无需 wine，直接应用 Wuthering Waves 增量补丁（.krpdiff 容器 / HDiffPatch
+            压缩差分），支持多组并发与 md5 校验。
+
+            核心与官方 hpatchz.exe 同源（HDiffPatch 4.8.0 + zstd），但命令行接口不同：
+
+                krpatch apply --old-root OLD --out-root OUT patch1.krpdiff [patch2 ...]
+                krpatch info patch.krpdiff
+
+            详见仓库 native/krpatch/README.md。
+
+            SHA256（krpatch-linux-x86_64）见 krpatch-linux-x86_64.sha256。
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
