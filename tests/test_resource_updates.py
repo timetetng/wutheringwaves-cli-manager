@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -787,6 +788,60 @@ class ResourceUpdateTests(unittest.TestCase):
             self.assertTrue(self.owner.apply_incremental())
         self.assertEqual((self.root / destination("uhd")).read_bytes(), NEW)
         self.assertEqual(self.owner.resource_pack_version("uhd"), TARGET)
+
+    def test_apply_reuses_staged_output_after_interruption(self):
+        diff = b"patch-transport"
+        self.server.payloads["/files/uhd.krpdiff"] = diff
+        self.set_index(
+            "uhd",
+            {
+                "resource": [file_item("uhd.krpdiff", diff)],
+                "groupInfos": [
+                    {
+                        "dest": "uhd.krpdiff",
+                        "srcFiles": [file_item(destination("uhd"), OLD)],
+                        "dstFiles": [file_item(destination("uhd"))],
+                    }
+                ],
+            },
+        )
+        self.assertTrue(self.owner.download_incremental())
+        # 上次 apply 中断时输出已在 staging，重跑应直接复用而不重跑 hpatchz。
+        staged = self.root / ".incremental_download" / "packs" / "uhd" / "krpdiff_temp" / destination("uhd")
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_bytes(NEW)
+        with (
+            patch("ww_manager.incremental.check_hpatchz_requirements", return_value=(True, "")),
+            patch("ww_manager.incremental.get_hpatchz_path", return_value=self.root / "fixture-hpatchz"),
+            patch.object(PackIncrementalManager, "_run_hpatchz", side_effect=AssertionError("应复用暂存输出")),
+        ):
+            self.assertTrue(self.owner.apply_incremental())
+        self.assertEqual((self.root / destination("uhd")).read_bytes(), NEW)
+
+    def test_hpatchz_timeout_scales_with_patch_size(self):
+        self.set_index(
+            "uhd",
+            {
+                "resource": [file_item("uhd.krpdiff", b"patch")],
+                "groupInfos": [
+                    {
+                        "dest": "uhd.krpdiff",
+                        "srcFiles": [file_item(destination("uhd"), OLD)],
+                        "dstFiles": [file_item(destination("uhd"))],
+                    }
+                ],
+            },
+        )
+        plan = self.updater._create_plan(None)
+        engine = PackIncrementalManager(self.owner, "uhd", plan["packs"]["uhd"], plan)
+        small = self.root / "small.krpdiff"
+        small.write_bytes(b"x" * (8 << 20))
+        self.assertEqual(engine._hpatchz_timeout(small), 600)
+        big = self.root / "big.krpdiff"
+        big.write_bytes(b"x" * (1200 << 20))
+        self.assertGreater(engine._hpatchz_timeout(big), 3600)
+        with patch.dict(os.environ, {"WW_HPATCHZ_TIMEOUT": "9000"}):
+            self.assertEqual(engine._hpatchz_timeout(big), 9000)
 
     def test_incremental_cli_force_download_and_apply_dispatch(self):
         for name in ("_auto_install_completion", "setup_logging", "check_pypi_version_silent", "save_app_config"):

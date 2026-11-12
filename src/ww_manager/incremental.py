@@ -1363,6 +1363,16 @@ class IncrementalManager:
                 log_info(f"所有文件已为目标版本，跳过 {len(dst_files)} 个文件")
                 return krpdiff_name, "skipped"
 
+        # 上次 apply 中断时输出可能已经在 staging 里；校验通过就直接复用，避免重跑大补丁
+        staged_outputs = [(d, self._get_staged_patch_path(download_dir, d["dest"])) for d in dst_files]
+        if all(p.exists() and p.stat().st_size == int(d["size"]) for d, p in staged_outputs):
+            set_status("校验已暂存的输出")
+            if all(self._is_file_verified(p, int(d["size"]), d["md5"]) for d, p in staged_outputs):
+                for d, _ in staged_outputs:
+                    self._mark_staged_patch_verified(d["dest"])
+                log_info(f"复用上次已校验的增量输出: {len(dst_files)} 个文件")
+                return krpdiff_name, "success"
+
         # 检查第一个源文件的状态（决定运行 hpatchz 还是回退下载）
         set_status("检查源文件")
         first_src = src_files[0]
@@ -1652,7 +1662,15 @@ class IncrementalManager:
 
         set_status("运行 hpatchz")
         logger.debug(f"Running hpatchz: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        timeout = self._hpatchz_timeout(krpdiff_path)
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            emit_error(
+                f"hpatchz 超时 ({int(timeout)}s，补丁 {krpdiff_path.stat().st_size / (1 << 20):.0f}MB)，"
+                f"可用环境变量 WW_HPATCHZ_TIMEOUT 调大"
+            )
+            return False
 
         set_status("检查 hpatchz 结果")
         if result.returncode != 0:
@@ -1660,6 +1678,27 @@ class IncrementalManager:
             return False
 
         return True
+
+    HPATCHZ_MIN_TIMEOUT = 600.0
+    HPATCHZ_TIMEOUT_PER_MB = 4.0
+    HPATCHZ_MAX_TIMEOUT = 6 * 3600.0
+
+    def _hpatchz_timeout(self, krpdiff_path: Path) -> float:
+        """按补丁体积给 hpatchz 超时；wine 下大补丁可能跑几十分钟。"""
+        override = os.environ.get("WW_HPATCHZ_TIMEOUT")
+        if override:
+            try:
+                return max(60.0, float(override))
+            except ValueError:
+                logger.warning(f"WW_HPATCHZ_TIMEOUT 不是数字: {override}，已忽略")
+        try:
+            size_mb = krpdiff_path.stat().st_size / (1 << 20)
+        except OSError:
+            size_mb = 0.0
+        return min(
+            self.HPATCHZ_MAX_TIMEOUT,
+            max(self.HPATCHZ_MIN_TIMEOUT, size_mb * self.HPATCHZ_TIMEOUT_PER_MB),
+        )
 
     def _get_cached_target_version(self, download_dir: Path) -> Optional[str]:
         """从增量下载元信息或 API 配置获取目标版本"""

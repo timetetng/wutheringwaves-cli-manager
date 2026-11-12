@@ -1,7 +1,7 @@
 <div align="center">
   <h1>WutheringWaves CLI Manager</h1>
   <h3>鸣潮命令行管理器</h3>
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.5-brightgreen.svg" alt="version 2.3.5">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.6-brightgreen.svg" alt="version 2.3.6">
 </div>
 
 <p align="center">
@@ -148,6 +148,7 @@ ww resource --help
 
 - [Linux 启动与常见问题](docs/linux.md)
 - [在 Linux 上运行官方启动器](docs/wuwa-launcher.md)
+- [游戏资源 index 地址（appKey）的更新流程](docs/launcher-index.md)
 
 ## 反馈
 
