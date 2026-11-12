@@ -185,6 +185,16 @@ class ResourceUpdater:
     def has_pending_plan(self) -> bool:
         return self.owner._managed_path(PLAN).is_file()
 
+    @staticmethod
+    def _common_deferred(plan: Dict) -> bool:
+        """B 服预下载时 common 因目标清单未开放被跳过（from == to）。"""
+        entry = plan["packs"].get("common")
+        return (
+            plan.get("server") == "bilibili"
+            and isinstance(entry, dict)
+            and entry.get("from_version") == entry.get("to_version")
+        )
+
     def _read_plan(self, relative=PLAN) -> Dict:
         path = self.owner._managed_path(relative)
         try:
@@ -297,7 +307,15 @@ class ResourceUpdater:
                 )
                 uri = section.get("config", {}).get("indexFile") if section else None
                 if not isinstance(uri, str):
-                    raise ConfigError(f"B 服 {target} 目标清单尚未开放，不能确认 common 兼容性")
+                    if not is_predownload:
+                        raise ConfigError(f"B 服 {target} 目标清单尚未开放，不能确认 common 兼容性")
+                    # B 服还没发布目标版本清单：先只预下载画质包，common 等 B 服开放预下载后再补。
+                    logger.warning(
+                        f"B 服 {target} 预下载清单尚未开放，本次只预下载画质包；"
+                        f"common 保持 {current}，等 B 服开放后重跑 ww incremental 即可补上"
+                    )
+                    entry["to_version"] = current
+                    continue
                 from urllib.parse import urljoin
 
                 channel_index = self.owner._http_get_json(urljoin(self.owner.cdn_node, uri))
@@ -319,7 +337,20 @@ class ResourceUpdater:
     def download(self, config_url: Optional[str] = None, *, force_space: bool = False) -> bool:
         try:
             # 已有计划按原目标续传，避免预下载维护前后线上配置改变导致缓存串用。
-            plan = self._read_plan() if self.has_pending_plan() else self._create_plan(config_url)
+            if not self.has_pending_plan():
+                plan = self._create_plan(config_url)
+            else:
+                plan = self._read_plan()
+                # B 服预下载时 common 可能因目标清单未开放被跳过；B 服开放后重建计划把它补上。
+                if self._common_deferred(plan):
+                    try:
+                        candidate = self._create_plan(config_url)
+                    except WWError:
+                        candidate = None
+                    if candidate is not None and (
+                        candidate["packs"]["common"]["from_version"] != candidate["packs"]["common"]["to_version"]
+                    ):
+                        plan = candidate
             self._validate_sources(plan)
             engines = []
             pending = []
