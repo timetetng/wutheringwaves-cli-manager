@@ -1,7 +1,7 @@
 <div align="center">
   <h1>WutheringWaves CLI Manager</h1>
   <h3>Command-line manager for Wuthering Waves</h3>
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.6-brightgreen.svg" alt="version 2.3.6">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.7-brightgreen.svg" alt="version 2.3.7">
 </div>
 
 <p align="center">
