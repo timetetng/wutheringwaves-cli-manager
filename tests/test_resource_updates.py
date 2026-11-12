@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -817,6 +818,61 @@ class ResourceUpdateTests(unittest.TestCase):
         ):
             self.assertTrue(self.owner.apply_incremental())
         self.assertEqual((self.root / destination("uhd")).read_bytes(), NEW)
+
+    def test_full_resource_base_uses_full_baseurl_not_patch(self):
+        entry = {
+            "from_version": SOURCE,
+            "config": {
+                "version": TARGET,
+                "baseUrl": "p/3.8.0/zip/",
+                "patchConfig": [{"version": SOURCE, "baseUrl": "p/3.8.0/sd/3.7.1/resources"}],
+            },
+            "index": {"resource": [{"dest": "g.krpdiff", "fromFolder": "p/3.8.0/sd/3.7.1/resources"}]},
+        }
+        engine = PackIncrementalManager(self.owner, "sd", entry, {"cdn": self.url, "packs": {}})
+        self.assertEqual(engine._full_resource_base(), "p/3.8.0/zip")
+        url = engine._build_resource_url(
+            {"dest": "Client/Content/SD/a.pak"}, fallback_base=engine._full_resource_base()
+        )
+        self.assertTrue(url.endswith("/p/3.8.0/zip/Client/Content/SD/a.pak"), url)
+
+    def test_hpatchz_retries_when_wine_server_not_ready(self):
+        self.set_index(
+            "uhd",
+            {
+                "resource": [file_item("uhd.krpdiff", b"patch")],
+                "groupInfos": [
+                    {
+                        "dest": "uhd.krpdiff",
+                        "srcFiles": [file_item(destination("uhd"), OLD)],
+                        "dstFiles": [file_item(destination("uhd"))],
+                    }
+                ],
+            },
+        )
+        plan = self.updater._create_plan(None)
+        engine = PackIncrementalManager(self.owner, "uhd", plan["packs"]["uhd"], plan)
+        engine.hpatchz_path = self.root / "hpatchz.exe"
+        engine.hpatchz_path.write_bytes(b"")
+        not_ready = subprocess.CompletedProcess(
+            [], 1, "", "wine: a wine server seems to be running, but I cannot connect to it."
+        )
+        ok = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            patch("ww_manager.incremental.subprocess.run", side_effect=[not_ready, not_ready, ok]) as run,
+            patch("ww_manager.incremental.time.sleep"),
+            patch.object(engine, "_run_hpatchz", autospec=True, wraps=engine._run_hpatchz) as wrapped,
+        ):
+            del wrapped  # 只为确保调用真实实现
+            self.assertTrue(
+                engine._run_hpatchz(
+                    self.root / "x.krpdiff",
+                    self.root / "out",
+                    [],
+                    temp_olddir=self.root / "old",
+                )
+            )
+        self.assertEqual(run.call_count, 3)
 
     def test_hpatchz_timeout_scales_with_patch_size(self):
         self.set_index(

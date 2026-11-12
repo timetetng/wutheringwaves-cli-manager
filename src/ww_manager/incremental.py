@@ -463,6 +463,28 @@ class IncrementalManager:
             return None
         return f"{self.cdn_base}/{res_base}/{quote(item['dest'], safe='/:')}"
 
+    def _full_resource_base(self) -> Optional[str]:
+        """完整资源文件所在的全量目录。
+
+        3.8 的 index 里补丁 baseUrl 是 `<pack>/<ver>/resources`（只有 krpdiff），
+        完整文件在 `<ver>/zip/`；旧 schema 两者的 baseUrl 同构，所以以前没暴露。
+        """
+        base = self.default_config.get("baseUrl")
+        if base:
+            return base.rstrip("/")
+        for path in (self.download_dir / "indexFile.json", self.cache_dir / "indexFile.json"):
+            if not path.exists():
+                continue
+            try:
+                resources = json.loads(path.read_text()).get("resource", [])
+            except Exception:
+                continue
+            if resources:
+                from_folder = resources[0].get("fromFolder", "")
+                if from_folder:
+                    return from_folder.rstrip("/")
+        return self._find_resource_base()
+
     def _get_staged_complete_path(self, download_dir: Path, dest: str) -> Path:
         """获取完整资源在增量下载目录中的缓存路径"""
         return download_dir / "resources" / _resource_rel_path(dest)
@@ -1537,7 +1559,7 @@ class IncrementalManager:
         if staged_path.exists():
             staged_path.unlink()
 
-        url = self._build_resource_url(dst_info)
+        url = self._build_resource_url(dst_info, fallback_base=self._full_resource_base())
         if not url:
             message = "无法获取资源路径"
             if error_callback:
@@ -1663,14 +1685,25 @@ class IncrementalManager:
         set_status("运行 hpatchz")
         logger.debug(f"Running hpatchz: {' '.join(cmd)}")
         timeout = self._hpatchz_timeout(krpdiff_path)
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            emit_error(
-                f"hpatchz 超时 ({int(timeout)}s，补丁 {krpdiff_path.stat().st_size / (1 << 20):.0f}MB)，"
-                f"可用环境变量 WW_HPATCHZ_TIMEOUT 调大"
-            )
-            return False
+        result = None
+        for attempt in range(1, 4):
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                emit_error(
+                    f"hpatchz 超时 ({int(timeout)}s，补丁 {krpdiff_path.stat().st_size / (1 << 20):.0f}MB)，"
+                    f"可用环境变量 WW_HPATCHZ_TIMEOUT 调大"
+                )
+                return False
+            if result.returncode == 0:
+                break
+            stderr = result.stderr or ""
+            # 多个 hpatchz 同时冷启动时会抢 wineserver，重试即可
+            if attempt < 3 and ("wine server" in stderr or "cannot connect to it" in stderr):
+                emit_error(f"wine server 未就绪，{attempt * 3}s 后重试（{attempt}/3）")
+                time.sleep(attempt * 3)
+                continue
+            break
 
         set_status("检查 hpatchz 结果")
         if result.returncode != 0:
