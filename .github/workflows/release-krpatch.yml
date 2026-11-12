@@ -22,6 +22,10 @@ on:
         required: true
         default: 'krpatch-v0.1.0'
 
+# softprops/action-gh-release 需要写权限才能创建 Release（默认只读，会 403）
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build native binary
