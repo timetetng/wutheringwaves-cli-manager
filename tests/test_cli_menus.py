@@ -86,34 +86,19 @@ class CommandMenuTests(unittest.TestCase):
         self.menu.assert_not_called()
         self.manager.download_full.assert_called_once_with(tier="SD", force_space=True)
 
-    def test_global_menu_blocks_unsupported_tiers(self):
+    def test_global_menu_offers_all_tiers_without_warning(self):
         self.menu.return_value.run.side_effect = [MenuOption("global", "国际服"), None]
         result = self.invoke("download")
         self.assertEqual(result.exit_code, 0, result.output)
         for option in self.menu.call_args_list[1].args[0]:
-            if option.key == "hd":
-                self.assertIsNone(option.blocked_reason)
-            else:
-                self.assertIn("国际服", option.blocked_reason or "")
+            self.assertIsNone(option.blocked_reason)
+            self.assertNotIn("未验证", option.description)
         self.factory.assert_not_called()
 
-    def test_global_menu_labels_untested_and_requires_separate_opt_in(self):
-        for flags, allowed in ((["--force"], False), (["--allow-untested"], True)):
-            with self.subTest(flags=flags):
-                self.menu.return_value.run.side_effect = [MenuOption("global", "国际服"), None]
-                result = self.invoke("download", *flags)
-                self.assertEqual(result.exit_code, 0, result.output)
-                for option in self.menu.call_args_list[-1].args[0]:
-                    if option.key != "hd":
-                        self.assertIn("未验证", option.description)
-                        self.assertEqual(option.blocked_reason is None, allowed)
-                self.factory.assert_not_called()
-
-    def test_global_download_opt_in_configures_manager_without_redefining_force(self):
+    def test_global_download_uhd_needs_no_extra_flag(self):
         self.manager.server_type = "global"
-        result = self.invoke("download", "global", "UHD", "--allow-untested")
+        result = self.invoke("download", "global", "UHD")
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertTrue(self.manager.allow_untested)
         self.manager.download_full.assert_called_once_with(tier="UHD", force_space=False)
 
     def test_first_download_can_choose_menu_for_nonexistent_directory(self):
@@ -154,6 +139,27 @@ class CommandMenuTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.menu.assert_not_called()
         self.manager.checkout.assert_called_once_with("bilibili", force_sync=False, force_space=True)
+
+    def test_checkout_global_needs_no_extra_flag(self):
+        self.manager.server_type = "global"
+        result = self.invoke("checkout", "global")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.manager.checkout.assert_called_once_with("global", force_sync=False, force_space=False)
+
+    def test_allow_untested_is_deprecated_noop(self):
+        self.manager.server_type = "global"
+        with self.assertLogs("WW_Manager", level="WARNING") as logs:
+            result = self.invoke("checkout", "global", "--allow-untested")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("已废弃", "\n".join(logs.output))
+        self.manager.checkout.assert_called_once_with("global", force_sync=False, force_space=False)
+
+    def test_checkout_global_menu_reaches_manager(self):
+        self.manager.server_type = "global"
+        self.menu.return_value.run.return_value = MenuOption("global", "国际服")
+        result = self.invoke("checkout")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.manager.checkout.assert_called_once_with("global", force_sync=False, force_space=False)
 
     def test_noninteractive_missing_arguments_refuse_without_downloading(self):
         self.terminal.return_value = False

@@ -43,7 +43,7 @@ class CliHelpTests(unittest.TestCase):
         examples = {
             "download": ("不带参数", "服务器", "画质", "--allow-untested", "--force"),
             "resource": ("按 d", "删除", "确认", "--force-md5", "--remove"),
-            "checkout": ("不带参数", "差异缓存", "--force-sync"),
+            "checkout": ("不带参数", "差异缓存", "--force-sync", "--allow-untested"),
             "predownload": ("--apply", "维护", "--force"),
         }
         for command, expected in examples.items():

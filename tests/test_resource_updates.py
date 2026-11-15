@@ -211,20 +211,16 @@ class ResourceUpdateTests(unittest.TestCase):
             self.assertTrue(self.owner.download_incremental())
         download.assert_called_once_with(None, force_space=False)
 
-    def test_global_incremental_keeps_original_hd_engine(self):
+    def test_global_incremental_uses_pack_updater(self):
         self.owner.server_type = "global"
         self.choose("hd")
-        self.owner._launcher_info = {"default": {"version": TARGET}}
-        self.owner._cdn_node = self.url
         with (
-            patch("ww_manager.resource_updates.ResourceUpdater.download") as packs,
+            patch("ww_manager.resource_updates.ResourceUpdater.download", return_value=True) as packs,
             patch("ww_manager.core.IncrementalManager") as legacy,
-            patch("ww_manager.core.check_hpatchz_requirements", return_value=(True, "ok")),
         ):
-            legacy.return_value.download_incremental.return_value = True
             self.assertTrue(self.owner.download_incremental())
-        packs.assert_not_called()
-        legacy.return_value.download_incremental.assert_called_once()
+        packs.assert_called_once()
+        legacy.assert_not_called()
 
     def test_three_tiers_download_and_apply_without_hd_dependency(self):
         for tier in ("uhd", "sd", "hd"):
@@ -687,22 +683,15 @@ class ResourceUpdateTests(unittest.TestCase):
     def test_global_incremental_checks_space_and_supports_force(self):
         self.owner.server_type = "global"
         self.choose("hd")
-        self.owner._launcher_info = {
-            "default": {
-                "version": TARGET,
-                "config": {
-                    "patchConfig": [{"version": SOURCE, "indexFile": "patch/common.json", "baseUrl": "files"}],
-                },
-            }
-        }
-        self.owner._cdn_node = self.url
         with patch.object(self.owner, "available_disk_space", return_value=0):
             with self.assertRaises(DiskSpaceError):
                 self.owner.download_incremental()
-            self.assertFalse((self.root / ".incremental_download/indexFile.json").exists())
+            self.assertFalse((self.root / PLAN).exists())
             self.assertFalse(any(url.startswith("/files/") for url in self.server.requested))
             self.assertTrue(self.owner.download_incremental(force_space=True))
-        self.assertEqual((self.root / ".incremental_download/resources" / destination("common")).read_bytes(), NEW)
+        self.assertEqual(
+            (self.root / ".incremental_download/packs/hd/resources" / destination("hd")).read_bytes(), NEW
+        )
 
     def test_patch_transport_size_not_output_size_is_checked(self):
         diff = b"patch"
