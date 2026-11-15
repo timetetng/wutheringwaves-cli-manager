@@ -28,6 +28,8 @@ pub struct GroupOutcome {
     pub files: Vec<FileCheck>,
     /// 与期望值不一致的文件（空 = 全对，或者根本没有提供期望值）。
     pub mismatch: Vec<String>,
+    /// 有输出但期望值表里没条目的文件；调用方据此决定要不要自己再校验。
+    pub expect_missing: Vec<String>,
     pub old_data_size: u64,
     pub new_data_size: u64,
     pub secs: f64,
@@ -233,13 +235,14 @@ pub fn apply_head(
         });
     }
     let files = out.finish(opts.fsync).map_err(|e| e.to_string())?;
-    let (files, mismatch) = check_against_expect(files, opts.expect.as_ref());
+    let (files, mismatch, expect_missing) = check_against_expect(files, opts.expect.as_ref());
 
     Ok(GroupOutcome {
         patch: patch.to_path_buf(),
         group: group_name(patch),
         files,
         mismatch,
+        expect_missing,
         old_data_size: old_sum,
         new_data_size: new_sum,
         secs: started.elapsed().as_secs_f64(),
@@ -250,9 +253,10 @@ pub fn apply_head(
 fn check_against_expect(
     files: Vec<FileOutcome>,
     expect: Option<&ExpectTable>,
-) -> (Vec<FileCheck>, Vec<String>) {
+) -> (Vec<FileCheck>, Vec<String>, Vec<String>) {
     let mut checks = Vec::with_capacity(files.len());
     let mut mismatch = Vec::new();
+    let mut expect_missing = Vec::new();
     for f in files {
         let exp = expect.and_then(|t| t.get(&f.rel));
         let matched = exp.map(|e| {
@@ -267,6 +271,9 @@ fn check_against_expect(
         if matched == Some(false) {
             mismatch.push(f.rel.clone());
         }
+        if matched.is_none() {
+            expect_missing.push(f.rel.clone());
+        }
         checks.push(FileCheck {
             rel: f.rel,
             size: f.size,
@@ -276,7 +283,7 @@ fn check_against_expect(
             matched,
         });
     }
-    (checks, mismatch)
+    (checks, mismatch, expect_missing)
 }
 
 fn validate_head(head: &GroupHead) -> Result<(), String> {

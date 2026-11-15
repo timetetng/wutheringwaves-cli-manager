@@ -248,8 +248,14 @@ fn cmd_apply(args: &[String]) -> Result<i32, String> {
         let stop = stop.clone();
         Some(std::thread::spawn(move || {
             let mut last_done = 0u64;
-            while !stop.load(Ordering::Relaxed) {
-                std::thread::sleep(Duration::from_millis(500));
+            'tick: loop {
+                // 分片睡眠：主线程收工时最多再等一个 25ms，而不是固定 500ms。
+                for _ in 0..20 {
+                    if stop.load(Ordering::Relaxed) {
+                        break 'tick;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
                 let done = counter.load(Ordering::Relaxed);
                 let pct = if total_new > 0 {
                     done as f64 * 100.0 / total_new as f64
@@ -329,6 +335,7 @@ fn cmd_apply(args: &[String]) -> Result<i32, String> {
         .any(|(_, r)| matches!(r, Ok(o) if !o.mismatch.is_empty()));
     let json = build_json(
         &results,
+        &cli.patches,
         workers,
         cli.cache_mb,
         cli.verify,
@@ -340,12 +347,7 @@ fn cmd_apply(args: &[String]) -> Result<i32, String> {
         }
         None => {
             // 用 write_all 而不是 println!：stdout 写失败（如管道关闭）时该报错，不该 panic。
-            use std::io::Write as _;
-            let mut stdout = std::io::stdout().lock();
-            stdout
-                .write_all(json.as_bytes())
-                .and_then(|()| stdout.flush())
-                .map_err(|e| format!("写 stdout 失败: {e}"))?;
+            write_stdout(&json)?;
         }
     }
     if !cli.quiet {
@@ -369,6 +371,16 @@ fn cmd_apply(args: &[String]) -> Result<i32, String> {
     } else {
         0
     })
+}
+
+/// 整段写 stdout；管道被提前关闭（如 `| head`）时安静地当成成功。
+fn write_stdout(text: &str) -> Result<(), String> {
+    let mut stdout = std::io::stdout().lock();
+    match stdout.write_all(text.as_bytes()).and_then(|()| stdout.flush()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(format!("写 stdout 失败: {e}")),
+    }
 }
 
 fn json_str(s: &str) -> String {
@@ -413,6 +425,7 @@ fn json_opt_bool(v: Option<bool>) -> &'static str {
 
 fn build_json(
     results: &[(usize, Result<apply::GroupOutcome, String>)],
+    patches: &[PathBuf],
     workers: usize,
     cache_mb: usize,
     verify: bool,
@@ -433,7 +446,7 @@ fn build_json(
     s.push_str(&format!("  \"expect_checked\": {expect_used},\n"));
     s.push_str(&format!("  \"total_secs\": {total_secs:.3},\n"));
     s.push_str("  \"groups\": [\n");
-    for (i, (_, r)) in results.iter().enumerate() {
+    for (pos, (index, r)) in results.iter().enumerate() {
         match r {
             Ok(o) => {
                 let clean = o.mismatch.is_empty();
@@ -459,6 +472,14 @@ fn build_json(
                     s.push_str(&json_str(rel));
                 }
                 s.push_str("],\n");
+                s.push_str("      \"expect_missing\": [");
+                for (k, rel) in o.expect_missing.iter().enumerate() {
+                    if k > 0 {
+                        s.push_str(", ");
+                    }
+                    s.push_str(&json_str(rel));
+                }
+                s.push_str("],\n");
                 s.push_str("      \"files\": [\n");
                 for (j, f) in o.files.iter().enumerate() {
                     s.push_str(&format!(
@@ -477,13 +498,24 @@ fn build_json(
             }
             Err(e) => {
                 s.push_str("    {\n");
+                s.push_str(&format!(
+                    "      \"group\": {},\n",
+                    json_str(&patches[*index]
+                        .file_name()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .unwrap_or_default())
+                ));
+                s.push_str(&format!(
+                    "      \"patch\": {},\n",
+                    json_str(&patches[*index].display().to_string())
+                ));
                 s.push_str("      \"ok\": false,\n");
                 s.push_str("      \"status\": \"failed\",\n");
                 s.push_str(&format!("      \"error\": {}\n", json_str(e)));
                 s.push_str("    }");
             }
         }
-        s.push_str(if i + 1 == results.len() { "\n" } else { ",\n" });
+        s.push_str(if pos + 1 == results.len() { "\n" } else { ",\n" });
     }
     s.push_str("  ]\n}\n");
     s
@@ -493,12 +525,14 @@ fn cmd_info(args: &[String]) -> Result<i32, String> {
     if args.is_empty() {
         return Err("至少需要一个 PATCH 文件".into());
     }
+    // 整份输出先拼再写：逐行 println! 在 `| head` 这类场景会因 EPIPE panic。
+    let mut s = String::new();
     for a in args {
         let p = PathBuf::from(a);
         let h = head::parse(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-        println!("{}", p.display());
-        println!(
-            "  {} / {} / {}  head data {} -> {} 字节（解压后 {}，余量 {}）",
+        s.push_str(&format!("{}\n", p.display()));
+        s.push_str(&format!(
+            "  {} / {} / {}  head data {} -> {} 字节（解压后 {}，余量 {}）\n",
             h.version,
             h.compress_type,
             h.checksum_type,
@@ -506,9 +540,9 @@ fn cmd_info(args: &[String]) -> Result<i32, String> {
             h.head.head_data_size,
             h.head_data_len,
             h.head_data_leftover
-        );
-        println!(
-            "  old: {} refs / {}  new: {} refs / {}  samePairs {} ({})  exec {}",
+        ));
+        s.push_str(&format!(
+            "  old: {} refs / {}  new: {} refs / {}  samePairs {} ({})  exec {}\n",
             h.old_refs.len(),
             human(h.old_data_size()),
             h.new_refs.len(),
@@ -516,17 +550,17 @@ fn cmd_info(args: &[String]) -> Result<i32, String> {
             h.head.same_file_pair_count,
             human(h.head.same_file_size),
             h.head.new_execute_count
-        );
-        println!(
-            "  目录标记 old/new = {}/{}  外部数据 reserved/private/extern = {}/{}/{}",
+        ));
+        s.push_str(&format!(
+            "  目录标记 old/new = {}/{}  外部数据 reserved/private/extern = {}/{}/{}\n",
             h.head.old_path_is_dir,
             h.head.new_path_is_dir,
             h.head.private_reserved_data_size,
             h.head.private_extern_data_size,
             h.head.extern_data_size
-        );
-        println!(
-            "  hdiff 段: offset {} 长度 {}  校验: {}",
+        ));
+        s.push_str(&format!(
+            "  hdiff 段: offset {} 长度 {}  校验: {}\n",
             h.hdiff_offset,
             human(h.hdiff_len),
             h.head_checksums
@@ -534,16 +568,17 @@ fn cmd_info(args: &[String]) -> Result<i32, String> {
                 .map(|c| streams::hex32(c))
                 .collect::<Vec<_>>()
                 .join(" ")
-        );
+        ));
         for r in &h.old_refs {
-            println!("    old  {:>12}  {}", r.size, r.path);
+            s.push_str(&format!("    old  {:>12}  {}\n", r.size, r.path));
         }
         for r in &h.new_refs {
-            println!(
-                "    new  {:>12}  {}  extra={:#x}",
+            s.push_str(&format!(
+                "    new  {:>12}  {}  extra={:#x}\n",
                 r.size, r.path, r.extra
-            );
+            ));
         }
     }
+    write_stdout(&s)?;
     Ok(0)
 }

@@ -348,7 +348,13 @@ pub fn parse(patch_path: &Path) -> Result<GroupHead, HeadError> {
         ));
     }
     let head_blob = rd.exact(head.head_data_compressed_size as usize)?;
-    let hdiff_offset = rd.count;
+    // 内嵌 hdiff 段起点 = dir data 末尾 + DiffOffsetAfterDirData + ExtraOffset。
+    // 生产容器这两个字段恒为 0，但不能假设：否则会把夹在中间的额外数据当成差分头。
+    let hdiff_offset = rd
+        .count
+        .checked_add(head.private_extern_data_size)
+        .and_then(|v| v.checked_add(head.extern_data_size))
+        .ok_or_else(|| HeadError::Bad("hdiff 段偏移", "溢出".into()))?;
     if hdiff_offset >= file_len {
         return Err(HeadError::Truncated("hdiff 段"));
     }

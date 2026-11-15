@@ -77,6 +77,11 @@ impl SegRead {
                 ),
             ));
         }
+        // 空引用不占流内字节：它的起点会和后一个引用重合，留在 starts 里会让
+        // locate() 的二分查找有随机命中空段的可能。文件本身仍要求存在（上面已校验）。
+        if len == 0 {
+            return Ok(());
+        }
         self.starts.push(self.total);
         self.total += len;
         self.segs.push(ReadSeg { file, base: 0, len });
@@ -283,6 +288,9 @@ fn receiver_loop(rx: Receiver<(usize, Vec<u8>)>) -> Vec<Md5> {
 /// Concatenation of several write-only files.
 pub struct SegWrite {
     segs: Vec<OutFile>,
+    /// `stream_ix[i]` = 虚拟流里第 i 段在 `segs` 中的下标；空文件是 `None`
+    /// （它们仍要出现在结果里，但不参与虚拟流，避免 starts 出现重复起点）。
+    stream_ix: Vec<Option<usize>>,
     starts: Vec<u64>,
     total: u64,
     counter: Arc<AtomicU64>,
@@ -295,6 +303,7 @@ impl SegWrite {
     pub fn new(counter: Arc<AtomicU64>, verify: bool) -> Self {
         SegWrite {
             segs: Vec::new(),
+            stream_ix: Vec::new(),
             starts: Vec::new(),
             total: 0,
             counter,
@@ -304,21 +313,33 @@ impl SegWrite {
     }
 
     pub fn push_file(&mut self, rel: String, abs: PathBuf, len: u64) -> io::Result<()> {
-        self.starts.push(self.total);
-        self.total += len;
+        let index = self.segs.len();
         self.segs.push(OutFile::new(rel, abs, len)?);
+        if len == 0 {
+            self.stream_ix.push(None);
+        } else {
+            self.starts.push(self.total);
+            self.total += len;
+            self.stream_ix.push(Some(index));
+        }
         Ok(())
     }
 
     fn write_into(&mut self, mut pos: u64, mut data: &[u8]) -> io::Result<()> {
         while !data.is_empty() {
-            let i = locate(&self.starts, pos).ok_or_else(|| {
+            let k = locate(&self.starts, pos).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("写位置 {pos} 超出流长度 {}", self.total),
                 )
             })?;
-            let off_in = pos - self.starts[i];
+            let i = self.stream_ix[k].ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("写位置 {pos} 落在空文件上"),
+                )
+            })?;
+            let off_in = pos - self.starts[k];
             let seg = &mut self.segs[i];
             let avail = seg.len.saturating_sub(off_in);
             let n = std::cmp::min(avail as usize, data.len());
@@ -349,18 +370,34 @@ impl SegWrite {
     /// Flush, hash the files that were written out of order, and report results.
     pub fn finish(mut self, fsync: bool) -> io::Result<Vec<FileOutcome>> {
         // Close the queue first so the hashing thread drains and exits.
-        let mut digests = self.hash.take().map(|hw| hw.finish()).map(|v| v.into_iter());
+        let digests = self.hash.take().map(|hw| hw.finish());
         let mut out = Vec::with_capacity(self.segs.len());
-        for seg in self.segs.drain(..) {
+        for (index, seg) in self.segs.drain(..).enumerate() {
             if fsync {
                 seg.file.sync_all()?;
             }
+            // 写入越序或字节没写完时增量哈希不可信，改按位置重读。
             let malformed = !seg.linear || seg.expect != seg.len;
-            let md5 = match digests.as_mut() {
-                None => None,
+            let md5 = match &digests {
+                None => {
+                    // --no-verify 不产出 md5，但“没写全”仍是硬错误，不能默默放过。
+                    if malformed {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "输出文件不完整 {}: 已写入 {} / {} 字节",
+                                seg.abs.display(),
+                                seg.expect,
+                                seg.len
+                            ),
+                        ));
+                    }
+                    None
+                }
                 Some(_) if malformed => Some(hash_file(&seg.abs)?),
-                Some(it) => match it.next() {
-                    Some(hasher) => Some(hex32(&hasher.finalize())),
+                // 按段下标取，不能用迭代器顺序：某个文件走重读分支后顺序会错位。
+                Some(hashers) => match hashers.get(index) {
+                    Some(hasher) => Some(hex32(&hasher.clone().finalize())),
                     None => Some(hash_file(&seg.abs)?),
                 },
             };

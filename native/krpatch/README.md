@@ -39,17 +39,17 @@ krpatch version
 
 | 选项 | 说明 |
 | --- | --- |
-| `--old-root DIR` | 旧版本根目录，容器里 `oldRefs` 的相对路径在这里解析 |
+| `--old-root DIR` | 旧版本根目录，容器里 `oldRefs` 的相对路径在这里解析。可以直接指向游戏目录，不必先把旧文件复制出来 |
 | `--out-root DIR` | 输出根目录，按容器内相对路径写出（目录自动创建） |
 | `--workers N` | 并发分组数，默认 `min(CPU 核数, 分组数)` |
 | `--cache-mb N` | 每组交给 `patch_decompress_with_cache()` 的临时缓存 MiB，默认 8（实测 1–32MB 都在噪声内，≥64MB 反而更慢，不必调） |
 | `--fsync` | 每个输出文件写完 fsync（默认关；断电即毁的场景再开） |
-| `--no-verify` | 不计算输出 md5（大组从 ~3.1 s 降到 ~1.2 s，JSON 里 `md5` 为 `null`；调用方就拿不到自证依据） |
+| `--no-verify` | 不计算输出 md5（大组从 ~3.1 s 降到 ~1.2 s，JSON 里 `md5` 为 `null`；调用方就拿不到自证依据）。写入字节数不符仍按错误报，不会静默放过 |
 | `--expect FILE` | 期望值表，逐文件比对厂商真值（见下），不一致即判该分组失败 |
 | `--json FILE` | 结果 JSON 写入文件，默认打到 stdout |
 | `--quiet` | 不打印进度和分组合计 |
 
-进度走 stderr（`45.3%  1.2 GiB / 2.6 GiB  530 MiB/s`），结果 JSON 走 stdout，方便 Python 侧直接 `json.loads(stdout)`。
+进度走 stderr（`45.3%  1.2 GiB / 2.6 GiB  530 MiB/s`），约每 0.5 s 刷新一次；结果 JSON 走 stdout，方便 Python 侧直接 `json.loads(stdout)`。管道被提前关闭（如 `| head`）时安静退出，不报 panic。
 
 退出码：
 
@@ -74,6 +74,8 @@ PY
 
 没出现在输出里的条目会被忽略（一个表可以覆盖多组补丁）；路径里的 `\` 会被当成 `/`。这是应用完成后**唯一能证明“和官方客户端逐字节一致”** 的依据，所以校验成本（约 1 GiB/s 的单流 md5）值得付；要快就 `--no-verify`，但别再同时给 `--expect`（没 md5 就没得比，会直接报错）。
 
+反过来，有输出但期望值表里没条目时会记进该分组的 `expect_missing`——调用方可以据此自己补校验，而不用担心“看上去 ok、其实没被检查”。
+
 结果 JSON：
 
 ```json
@@ -94,6 +96,7 @@ PY
       "new_size": 105844690,
       "secs": 0.246,
       "mismatch": [],
+      "expect_missing": [],
       "files": [
         {"path": "Client/Content/Paks/pakchunk42-WindowsNoEditor.pak",
          "size": 105844690, "md5": "37cb7a62c6b2548c43083d079454aaa5",
@@ -108,7 +111,7 @@ PY
 
 `ok` 全局字段在“有分组失败”或“有 mismatch”时都是 `false`；`status` 取 `ok` / `mismatch` / `failed`。没有给 `--expect` 时 `expect_checked` 为 `false`、每个文件的 `expected_*` 与 `matched` 为 `null`。
 
-失败时该分组变成 `{"ok": false, "status": "failed", "error": "..."}`，其余分组照常完成——调用方可以按分组回退（比如用户目录里旧文件缺失、或者补丁没下完）。错误文本优先报**根因**：写盘失败会带具体路径与系统错误，而不是笼统的“校验失败”。
+失败时该分组变成 `{"group": "group_16", "patch": "/path/...", "ok": false, "status": "failed", "error": "..."}`，其余分组照常完成——调用方可以按分组回退（比如用户目录里旧文件缺失、或者补丁没下完）。错误文本优先报**根因**：写盘失败会带具体路径与系统错误，而不是笼统的“校验失败”。
 
 ## 容器格式（`apply` 实际依赖的部分）
 
@@ -131,7 +134,9 @@ PY
 
 另外验证过的失败路径：旧文件缺失、补丁被截断、hdiff 段长度与头部不符、输出路径重复（并发写冲突）、输出盘写满（`ENOSPC` / `EFBIG`）——都会在写坏任何东西之前报错，且错误文本指向真实根因（例如 `应用差分失败：Disk quota exceeded (os error 122)（片段 3133 个，目标共 105844690 字节）`）。
 
-`--expect` 本身的四个行为也验过：厂商 md5 全对 → 退出码 0；篡改一条期望 md5 → 退出码 3、`status: mismatch`、`mismatch` 里点名该文件；反斜杠路径的清单 → 仍能匹配；`--expect` 与 `--no-verify` 同用 → 退出码 2 并拒绝执行。
+`--expect` 本身的四个行为也验过：厂商 md5 全对 → 退出码 0；篡改一条期望 md5 → 退出码 3、`status: mismatch`、`mismatch` 里点名该文件；反斜杠路径的清单 → 仍能匹配；`--expect` 与 `--no-verify` 同用 → 退出码 2 并拒绝执行。`expect_missing` 也验过：只给一条期望值时，另一条输出被单独列进 `expect_missing`，分组仍判 `ok`（说明“没被检查”与“检查通过”是两件事）。
+
+B 服 3.7.1 → 3.8.0 整包（hd 36 个分组 / 98 个旧文件 / 104 个输出 / 45.8 GB）跑通：全部分组成功，104 个输出逐个与官方 index 的 md5 一致，废弃补丁按 `deleteFiles` 清理，端到端 104.6 s（含迁移与版本登记），输出吞吐 0.44 GB/s。另外单独抽了 1 个 19.6 GB 单文件分组（34.5 s）和 1 个 50 → 56 文件的分组（1.0 s）。
 
 ## 性能
 
@@ -167,6 +172,24 @@ PY
 wine 启动方差极大：warm 时约 0.1 s，wineserver 被回收后实测单次 4.57 s（exe 内部只花 0.22 s）。另外旧流程在跑之前要把该组旧文件 `copy2` 到临时目录（本机 btrfs 走 reflink 几乎免费，ext4 上就是实打实的复制），跑完还要再读一遍盘算 md5。
 
 wall 在高负载下仍可能明显超出 user（实测有 13 s 的轮次），那是 dirty page writeback 排队，不是计算慢。
+
+## 与 `ww predownload --apply` 的配合
+
+仓库里的 Python 侧（`src/ww_manager/incremental.py`）优先用 krpatch 应用补丁，拿不到才回退 wine + `hpatchz.exe`。挑选顺序：`WW_APPLIER` 强制 → `WW_KRPATCH` 指定路径 → `PATH` 里的 `krpatch` → 缓存或本 Release 自动下载（校验 `.sha256`）→ 回退。
+
+调用方式与这里的设计正好互补：
+
+- **`--old-root` 直接指向游戏目录**。旧流程要把该组旧文件 `copy2` 到临时目录，45 GB 的包实测光是复制就 72.9 s；krpatch 只读原位置，这趟读写完全省掉。
+- **`--expect` 由 index 的 `dstFiles` 现场生成**，`matched: true` 的输出在 Python 侧直接标记为已校验，迁移阶段不再重读一遍算 md5（又省一次 45 GB 读）。
+- **一次只传一个分组（`--workers 1`）**：并发由 Python 的线程池负责（默认 4），krpatch 线程池留给「一次调用多组」的场景。
+- 不给 `--quiet`：Python 侧读 stderr 里的百分比刷新子任务状态；只有 `mismatch` / 缺失的文件才会整文件回退下载，不再整组回退。
+- `WW_KRPATCH_TIMEOUT`（秒）可覆盖超时：默认按输出字节数算，下限 600 s，约按 20 MiB/s 估。
+
+## 变更记录
+
+- **0.2.1**：修正 `finish()` 按迭代器顺序取 md5 哈希（某文件越序写后改按位置重读时，**后续文件的 md5 会串位**，导致误判不符）；`info` 遇 `| head` 的 EPIPE 不再 panic；进度线程改为 25 ms 分片睡眠（原先固定 500 ms 不可中断，每次非 `--quiet` 调用白等半秒）；失败分组的结果对象补上 `group` / `patch`；空长度 ref 不再让虚拟流的二分查找随机命中空段；`--no-verify` 下写入字节数不符改为硬错误；hdiff 段起点计入 `DiffOffsetAfterDirData` / `ExtraOffset`（生产容器恒为 0，但不再假设）；新增每分组 `expect_missing`。
+- **0.2.0**：新增 `--expect` 真值校验，写盘错误改为报根因。
+- **0.1.0**：首个可用版本（原生应用器 + 分组并发 + md5 与写盘重叠）。
 
 ## 限制
 
