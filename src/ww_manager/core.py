@@ -16,7 +16,6 @@ from urllib.request import Request, urlopen
 from rich.progress import (
     BarColumn,
     Progress,
-    TaskID,
     TextColumn,
     TimeRemainingColumn,
 )
@@ -34,9 +33,9 @@ from ww_manager.config import (
 from ww_manager.download import (
     DownloadSpaceError,
     available_disk_space,
+    batch_download,
     check_space_requirement,
     create_download_progress,
-    download_single_file,
     format_bytes,
     space_shortage,
 )
@@ -284,21 +283,6 @@ class WGameManager:
             logger.error(f"HTTP 请求失败 {url}: {e}")
             return None
 
-    def _download_file(
-        self,
-        url: str,
-        dest: Path,
-        expected_size: int,
-        progress: Optional[Progress] = None,
-        overall_task_id: Optional[TaskID] = None,
-        expected_md5: Optional[str] = None,
-    ) -> bool:
-        """复用通用下载器；校验成功后才覆盖正式文件。"""
-        success = download_single_file(url, dest, expected_size, progress, overall_task_id, expected_md5=expected_md5)
-        if success:
-            self.md5_cache.clear(dest)
-        return success
-
     def _batch_download(self, tasks: List[dict]) -> int:
         """批量下载，返回失败的文件数 (0 = 全部成功)"""
         if not tasks:
@@ -308,32 +292,11 @@ class WGameManager:
         total_size = sum(t["size"] for t in tasks)
         logger.info(f"准备下载 {len(tasks)} 个文件，总大小: {total_size / 1024 / 1024:.2f} MB")
 
-        max_workers = 8
-
         progress = create_download_progress()
-
-        with progress:
-            overall_task = progress.add_task("Total Download", total=total_size)
-
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-                for task in tasks:
-                    future = executor.submit(
-                        self._download_file,
-                        task["url"],
-                        task["path"],
-                        task["size"],
-                        progress,
-                        overall_task,
-                        expected_md5=task.get("md5"),
-                    )
-                    futures.append(future)
-
-                failed = 0
-                for f in as_completed(futures):
-                    if not f.result():
-                        failed += 1
-                        logger.debug("文件下载失败，详情见下载器错误")
+        prepared = [{**task, "name": str(task["path"])} for task in tasks]
+        failed, failed_names = batch_download(prepared, progress=progress)
+        for name in failed_names:
+            self.md5_cache.clear(Path(name))
         return failed
 
     def sync_files(self, force_check_md5=False, tier: Optional[str] = None, force_space: bool = False):

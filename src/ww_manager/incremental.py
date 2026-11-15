@@ -44,7 +44,6 @@ from rich.text import Text
 from ww_manager.download import (
     RAINBOW_COLORS,
     DownloadSpaceError,
-    NetworkError,
     RainbowBarColumn,
     available_disk_space,
     check_space_requirement,
@@ -367,12 +366,16 @@ class IncrementalManager:
     @property
     def default_config(self) -> Dict:
         """获取默认配置（始终可用）"""
-        return self.api_data.get("default", {}).get("config", {})
+        return (self.api_data.get("default") or {}).get("config", {})
 
     @property
     def predownload_config(self) -> Dict:
-        """获取预下载配置（仅在预下载开放期间存在）"""
-        return self.api_data.get("predownload", {}).get("config", {})
+        """获取预下载配置（仅在预下载开放期间存在）。
+
+        真实 3.8 渠道 index 把 ``predownload`` 写成显式 null，
+        不能靠 ``get(key, {})`` 的默认值兜底。
+        """
+        return (self.api_data.get("predownload") or {}).get("config", {})
 
     @property
     def index_file(self) -> Optional[Dict]:
@@ -902,107 +905,9 @@ class IncrementalManager:
         progress: Optional[Progress] = None,
         overall_task_id: Optional[TaskID] = None,
     ) -> bool:
-        """已知大小的文件复用通用下载器；旧接口保留无大小信息的兼容路径。"""
+        """复用通用下载器；expected_size <= 0 表示大小未知。"""
         self.check_download_space([{"path": dest, "size": expected_size or None}])
-        if expected_size > 0:
-            return download_single_file(url, dest, expected_size, progress, overall_task_id, expected_md5=expected_md5)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-
-        task_id = None
-        if progress:
-            task_id = progress.add_task(description=dest.name, total=expected_size if expected_size > 0 else None)
-            color = RAINBOW_COLORS[task_id % len(RAINBOW_COLORS)]
-            progress.update(task_id, description=f"[{color}]{dest.name}[/{color}]")
-
-        temp_file = dest.with_suffix(dest.suffix + ".temp")
-
-        retries = 3
-        success = False
-
-        for attempt in range(retries):
-            try:
-                resume_byte = 0
-                if temp_file.exists():
-                    resume_byte = temp_file.stat().st_size
-                    if expected_size > 0 and resume_byte > expected_size:
-                        _emit_progress_log(progress, "INFO", f"临时文件大小异常，重新下载: {dest.name}")
-                        temp_file.unlink()
-                        resume_byte = 0
-
-                if expected_size > 0 and resume_byte == expected_size:
-                    if expected_md5 and _calculate_file_md5(temp_file) != expected_md5:
-                        _emit_progress_log(progress, "INFO", f"临时文件 MD5 异常，重新下载: {dest.name}")
-                        temp_file.unlink()
-                        resume_byte = 0
-                    else:
-                        if progress and task_id is not None:
-                            progress.update(task_id, completed=expected_size)
-                        success = True
-                        break
-
-                headers = {"User-Agent": "WW-Manager/2.0"}
-                if resume_byte > 0:
-                    headers["Range"] = f"bytes={resume_byte}-"
-                    if progress and task_id is not None:
-                        progress.update(task_id, completed=resume_byte)
-
-                mode = "ab" if resume_byte > 0 else "wb"
-
-                req = Request(url, headers=headers)
-                with urlopen(req, timeout=15) as rsp:
-                    if rsp.status not in (200, 206):
-                        raise NetworkError(f"HTTP {rsp.status}")
-                    if resume_byte > 0 and rsp.status == 200:
-                        # 服务器忽略 Range 时重新写临时文件，避免追加出损坏文件
-                        resume_byte = 0
-                        mode = "wb"
-                        if progress and task_id is not None:
-                            progress.update(task_id, completed=0)
-
-                    with open(temp_file, mode) as f:
-                        while True:
-                            chunk = rsp.read(1024 * 256)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-
-                            if progress:
-                                chunk_len = len(chunk)
-                                if task_id is not None:
-                                    progress.update(task_id, advance=chunk_len)
-                                if overall_task_id is not None:
-                                    progress.update(overall_task_id, advance=chunk_len)
-
-                if expected_size <= 0 or temp_file.stat().st_size == expected_size:
-                    success = True
-                    break
-
-            except Exception as e:
-                if attempt == retries - 1:
-                    _emit_progress_log(progress, "ERROR", f"下载失败 {dest.name}: {e}")
-                    if progress and task_id is not None:
-                        progress.remove_task(task_id)
-                    return False
-                time.sleep(1 + attempt)
-
-        if success and expected_md5:
-            actual_md5 = _calculate_file_md5(temp_file)
-            if actual_md5 != expected_md5:
-                _emit_progress_log(progress, "ERROR", f"文件 MD5 不匹配: {dest.name}")
-                temp_file.unlink()
-                success = False
-
-        if success:
-            try:
-                shutil.move(temp_file, dest)
-            except OSError as e:
-                _emit_progress_log(progress, "ERROR", f"无法保存下载文件 {dest.name}: {e}")
-                success = False
-
-        if progress and task_id is not None:
-            progress.remove_task(task_id)
-
-        return success
+        return download_single_file(url, dest, expected_size, progress, overall_task_id, expected_md5=expected_md5)
 
     def _apply_staged_complete_files(
         self,
@@ -1957,23 +1862,16 @@ class IncrementalManager:
                     _emit_progress_log(progress, "ERROR", f"无法构建修复文件下载 URL: {dest}")
                     return False, dest, expected_size
 
-                task_id = progress.add_task(description=f"[cyan]{file_name[:40]}[/cyan]", total=expected_size)
-
                 try:
                     if not self._is_file_verified(staged_path, expected_size, expected_md5):
-                        headers = {"User-Agent": "WW-Manager/2.0"}
-                        response = requests.get(url, headers=headers, timeout=60, stream=True)
-                        response.raise_for_status()
-
-                        staged_path.parent.mkdir(parents=True, exist_ok=True)
-                        with open(staged_path, "wb") as f:
-                            for chunk in response.iter_content(chunk_size=1024 * 256):
-                                f.write(chunk)
-                                progress.update(task_id, advance=len(chunk))
-                    else:
-                        progress.update(task_id, completed=expected_size)
-
-                    progress.remove_task(task_id)
+                        if not download_single_file(
+                            url,
+                            staged_path,
+                            expected_size,
+                            progress,
+                            expected_md5=expected_md5,
+                        ):
+                            return False, dest, expected_size
 
                     if not self._is_file_verified(staged_path, expected_size, expected_md5):
                         _emit_progress_log(progress, "ERROR", f"修复文件校验失败: {dest}")
@@ -1994,10 +1892,6 @@ class IncrementalManager:
                     _emit_progress_log(progress, "ERROR", f"下载失败 {file_name}: {e}")
                     if staged_path.exists():
                         staged_path.unlink()
-                    try:
-                        progress.remove_task(task_id)
-                    except Exception:
-                        pass
                     return False, dest, expected_size
 
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -2073,58 +1967,12 @@ class IncrementalManager:
         progress: Optional[Progress] = None,
         overall_task_id: Optional[TaskID] = None,
     ) -> bool:
-        """下载完整文件并验证 MD5，支持进度条"""
+        """下载完整文件并验证 MD5；复用通用下载器（大文件自动分段）。"""
         self.check_download_space([{"path": dest, "size": expected_size}])
-        dest.parent.mkdir(parents=True, exist_ok=True)
-
-        task_id = None
-        if progress:
-            task_id = progress.add_task(description=dest.name, total=expected_size)
-            color = RAINBOW_COLORS[task_id % len(RAINBOW_COLORS)]
-            progress.update(task_id, description=f"[{color}]{dest.name}[/{color}]")
-
-        temp_file = dest.with_suffix(dest.suffix + ".temp")
-        headers = {"User-Agent": "WW-Manager/2.0"}
-
-        try:
-            response = requests.get(url, headers=headers, timeout=60, stream=True)
-            response.raise_for_status()
-
-            with open(temp_file, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 256):
-                    f.write(chunk)
-                    if progress and task_id is not None:
-                        chunk_len = len(chunk)
-                        progress.update(task_id, advance=chunk_len)
-                        if overall_task_id is not None:
-                            progress.update(overall_task_id, advance=chunk_len)
-
-            if progress and task_id is not None:
-                progress.remove_task(task_id)
-
-            shutil.move(temp_file, dest)
-
-            actual_size = dest.stat().st_size
-            if actual_size != expected_size:
-                _emit_progress_log(progress, "ERROR", f"文件大小不匹配: {dest.name}")
-                dest.unlink()
-                return False
-
-            actual_md5 = _calculate_file_md5(dest)
-            if actual_md5 != expected_md5:
-                _emit_progress_log(progress, "ERROR", f"文件 MD5 不匹配: {dest.name}")
-                dest.unlink()
-                return False
-
+        if download_single_file(url, dest, expected_size, progress, overall_task_id, expected_md5=expected_md5):
             return True
-
-        except Exception as e:
-            _emit_progress_log(progress, "ERROR", f"下载失败 {dest.name}: {e}")
-            if temp_file.exists():
-                temp_file.unlink()
-            if progress and task_id is not None:
-                progress.remove_task(task_id)
-            return False
+        _emit_progress_log(progress, "ERROR", f"下载失败 {dest.name}")
+        return False
 
     def _download_and_verify(
         self,
@@ -2135,7 +1983,7 @@ class IncrementalManager:
         error_callback: Optional[Callable[[str], None]] = None,
         suppress_success_log: bool = False,
     ) -> bool:
-        """下载文件并验证 MD5"""
+        """下载文件并验证 MD5；复用通用下载器（大文件自动分段）。"""
         self.check_download_space([{"path": dest, "size": expected_size}])
 
         def emit_error(msg: str):
@@ -2144,37 +1992,12 @@ class IncrementalManager:
             else:
                 logger.error(msg)
 
-        try:
-            headers = {"User-Agent": "WW-Manager/2.0"}
-            response = requests.get(url, headers=headers, timeout=60, stream=True)
-            response.raise_for_status()
-
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            with open(dest, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 256):
-                    f.write(chunk)
-
-            actual_size = dest.stat().st_size
-            if actual_size != expected_size:
-                emit_error(f"文件大小不匹配: {dest.name} (期望 {expected_size}, 实际 {actual_size})")
-                dest.unlink()
-                return False
-
-            actual_md5 = _calculate_file_md5(dest)
-            if actual_md5 != expected_md5:
-                emit_error(f"文件 MD5 不匹配: {dest.name}")
-                dest.unlink()
-                return False
-
-            if not suppress_success_log:
-                logger.info(f"修复成功: {dest.name}")
-            return True
-
-        except Exception as e:
-            emit_error(f"下载失败 {dest.name}: {e}")
-            if dest.exists():
-                dest.unlink()
+        if not download_single_file(url, dest, expected_size, expected_md5=expected_md5):
+            emit_error(f"下载失败 {dest.name}")
             return False
+        if not suppress_success_log:
+            logger.info(f"修复成功: {dest.name}")
+        return True
 
     def _update_local_version(self, version_or_data):
         """更新本地版本，可接收版本字符串或 indexFile.json 数据"""
