@@ -5,6 +5,7 @@ import hashlib
 import os
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -207,6 +208,115 @@ class DownloadSegmentTests(unittest.TestCase):
         Path(str(temp) + ".segments").write_text("size 123\nblock 456\n0\n1\n2\n", encoding="utf-8")
         self.assertTrue(download_single_file(self.url, dest, len(PAYLOAD), expected_md5=md5(PAYLOAD)))
         self.assertEqual(dest.read_bytes(), PAYLOAD)
+
+
+class SlowServer(ThreadingHTTPServer):
+    payload: bytes
+    chunk_delay: float
+
+
+class SlowHandler(BaseHTTPRequestHandler):
+    """分块慢速发送，用来验证 Ctrl-C 能不能及时停下。"""
+
+    chunk = 64 * 1024
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_GET(self):
+        assert isinstance(self.server, SlowServer)
+        payload = self.server.payload
+        header = self.headers.get("Range")
+        if header:
+            start, end = header.split("=")[1].split("-")
+            start = int(start)
+            end = int(end) if end else len(payload) - 1
+            end = min(end, len(payload) - 1)
+            body = payload[start : end + 1]
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(payload)}")
+        else:
+            body = payload
+            self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            for offset in range(0, len(body), self.chunk):
+                self.wfile.write(body[offset : offset + self.chunk])
+                self.wfile.flush()
+                time.sleep(self.server.chunk_delay)
+        except (BrokenPipeError, ConnectionResetError):
+            # 客户端按了 Ctrl-C：服务端写不进去是预期结果。
+            return
+
+
+class CancellationTests(unittest.TestCase):
+    """Ctrl-C 必须及时中断下载，并保留续传现场。"""
+
+    PAYLOAD_SIZE = 8 * 1024 * 1024
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = SlowServer(("127.0.0.1", 0), SlowHandler)
+        cls.server.payload = os.urandom(cls.PAYLOAD_SIZE)
+        cls.server.chunk_delay = 0.05
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.url = f"http://127.0.0.1:{cls.server.server_port}/slow"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="ww-cancel-test-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        for name, value in (("SEGMENTS", 4), ("MAX_CONNECTIONS", 4), ("SEGMENT_BLOCK_SIZE", 256 * 1024)):
+            patcher = patch.object(download, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(download, "SEGMENT_THRESHOLD", 256 * 1024)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(download, "_connection_slots", None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_cancel_stops_segmented_download_and_keeps_state(self):
+        dest = self.root / "cancel.pak"
+        errors = []
+
+        def run():
+            try:
+                download_single_file(self.url, dest, self.PAYLOAD_SIZE)
+            except BaseException as exc:  # noqa: BLE001 - 测试需要区分异常类型
+                errors.append(exc)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        time.sleep(0.6)
+        cancelled_at = time.monotonic()
+        download.cancel_downloads()
+        worker.join(timeout=5)
+        elapsed = time.monotonic() - cancelled_at
+
+        self.assertFalse(worker.is_alive(), "取消后下载线程必须退出")
+        self.assertLess(elapsed, 2.0, f"取消响应过慢: {elapsed:.2f}s")
+        self.assertTrue(errors and isinstance(errors[0], KeyboardInterrupt), f"应抛 KeyboardInterrupt，实际: {errors}")
+        self.assertFalse(dest.exists(), "未完成的下载不得落正式文件")
+        self.assertTrue(Path(str(dest) + ".temp").exists(), "临时文件应保留供续传")
+        self.assertTrue(Path(str(dest) + ".temp.segments").exists(), "续传状态应保留")
+
+    def test_cancel_flag_cleared_for_next_download(self):
+        download.cancel_downloads()
+        dest = self.root / "after-cancel.pak"
+        self.server.chunk_delay = 0
+        self.addCleanup(setattr, self.server, "chunk_delay", 0.05)
+        self.assertTrue(download_single_file(self.url, dest, self.PAYLOAD_SIZE))
+        self.assertEqual(dest.stat().st_size, self.PAYLOAD_SIZE)
 
 
 if __name__ == "__main__":

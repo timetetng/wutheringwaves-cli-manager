@@ -62,6 +62,35 @@ SEGMENT_THRESHOLD = _env_int("WW_DL_SEGMENT_THRESHOLD", DEFAULT_SEGMENT_THRESHOL
 _connection_slots: Optional[threading.BoundedSemaphore] = None
 _connection_slots_lock = threading.Lock()
 
+# 用户中断（Ctrl-C）时置位，让所有在飞的块尽快退出并保留续传状态。
+_cancel_event = threading.Event()
+_active_lock = threading.Lock()
+_active_downloads = 0
+
+
+class _DownloadCancelled(Exception):
+    """内部信号：当前下载被用户中止。"""
+
+
+def _enter_download() -> None:
+    """登记一次下载；同一批下载的第一个负责清除上一批遗留的中断标志。"""
+    global _active_downloads
+    with _active_lock:
+        if _active_downloads == 0:
+            _cancel_event.clear()
+        _active_downloads += 1
+
+
+def _exit_download() -> None:
+    global _active_downloads
+    with _active_lock:
+        _active_downloads -= 1
+
+
+def cancel_downloads() -> None:
+    """请求中止所有进行中的下载；已下载的块会写入续传状态。"""
+    _cancel_event.set()
+
 
 def _connection_semaphore() -> threading.BoundedSemaphore:
     """全局连接预算，避免批量下载时 文件数 × 分段数 把连接数撑爆。"""
@@ -247,6 +276,8 @@ def _download_block(
         with temp_file.open("r+b") as stream:
             stream.seek(start)
             while remaining > 0:
+                if _cancel_event.is_set():
+                    raise _DownloadCancelled("下载已中断")
                 chunk = response.read(min(READ_SIZE, remaining))
                 if not chunk:
                     raise NetworkError("分段连接提前结束")
@@ -288,7 +319,7 @@ def _download_segmented(
         def worker() -> None:
             while True:
                 with lock:
-                    if not queue:
+                    if not queue or _cancel_event.is_set():
                         return
                     index = queue.popleft()
                 start = index * block
@@ -301,14 +332,20 @@ def _download_segmented(
                         report(count)
 
                     semaphore.acquire()
+                    failure = None
+                    cancelled = False
                     try:
                         _download_block(url, temp_file, start, end, on_bytes, timeout=timeout)
-                        failure = None
+                    except _DownloadCancelled:
+                        cancelled = True
                     except Exception as exc:
                         failure = exc
                     finally:
                         # 退避期间不能攥着连接预算，否则失败块会拖死其他文件。
                         semaphore.release()
+                    if cancelled:
+                        report(-sent[0])
+                        return
                     if failure is None:
                         break
                     report(-sent[0])
@@ -325,10 +362,25 @@ def _download_segmented(
         threads = [threading.Thread(target=worker, daemon=True) for _ in range(threads_count)]
         for thread in threads:
             thread.start()
-        for thread in threads:
-            thread.join()
+        try:
+            while True:
+                alive = [t for t in threads if t.is_alive()]
+                if not alive:
+                    break
+                # join 加超时才能接住 Ctrl-C：无超时的 join 在 CPython 里不会中断。
+                for thread in alive:
+                    thread.join(0.2)
+        except KeyboardInterrupt:
+            cancel_downloads()
+            deadline = time.monotonic() + 5
+            for thread in threads:
+                thread.join(max(0.0, deadline - time.monotonic()))
+            raise
     finally:
         state_stream.close()
+
+    if _cancel_event.is_set():
+        raise KeyboardInterrupt
 
     if errors:
         logger.debug(f"分段下载未完成 {temp_file.name}: {errors[0]}")
@@ -364,6 +416,7 @@ def download_single_file(
         是否成功
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
+    _enter_download()
 
     task_id = None
     if progress:
@@ -470,6 +523,8 @@ def download_single_file(
                     mode = "ab" if resume_byte else "wb"
                     with temp_file.open(mode) as stream:
                         for chunk in iter(lambda: rsp.read(READ_SIZE), b""):
+                            if _cancel_event.is_set():
+                                raise KeyboardInterrupt
                             stream.write(chunk)
                             resume_byte += len(chunk)
                             if expected_size > 0:
@@ -492,6 +547,7 @@ def download_single_file(
                     return False
                 time.sleep(1 + attempt)
     finally:
+        _exit_download()
         if progress and task_id is not None:
             progress.remove_task(task_id)
     return False
@@ -541,16 +597,22 @@ def batch_download(
                 futures[future] = task.get("name", task["path"].name)
 
             failed = []
-            for future in as_completed(futures):
-                name = futures[future]
-                if not future.result():
-                    failed.append(name)
+            try:
+                for future in as_completed(futures):
+                    name = futures[future]
+                    if not future.result():
+                        failed.append(name)
+            except KeyboardInterrupt:
+                # 先通知其它文件停手，否则 executor.shutdown(wait=True) 会把它们跑完。
+                cancel_downloads()
+                raise
 
     return len(failed), failed
 
 
 __all__ = [
     "create_download_progress",
+    "cancel_downloads",
     "download_single_file",
     "batch_download",
     "probe_range_support",
