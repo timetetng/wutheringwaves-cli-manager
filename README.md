@@ -1,7 +1,7 @@
 <div align="center">
   <h1>WutheringWaves CLI Manager</h1>
   <h3>鸣潮命令行管理器</h3>
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.8-brightgreen.svg" alt="version 2.3.8">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.4.0-brightgreen.svg" alt="version 2.4.0">
 </div>
 
 <p align="center">
@@ -124,6 +124,8 @@ Linux 启动方式和常见问题见 [Linux 启动指南](docs/linux.md)。
 | `ww sync` | 校验并修复文件 |
 | `ww log` | 获取抽卡记录链接 |
 | `ww update` | 更新工具 |
+
+Linux x86_64 上的增量更新默认使用原生应用器 [krpatch](native/krpatch/README.md)：直接读游戏目录里的旧文件，不需要 wine + `hpatchz.exe`。首次使用时自动下载并校验 sha256，应用后用官方清单的 md5 逐文件比对。环境不满足时自动回退到 wine。
 
 `download`、`resource`、`checkout` 不带参数时进入菜单，也可以直接指定参数：
 

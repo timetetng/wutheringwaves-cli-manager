@@ -1,7 +1,7 @@
 <div align="center">
   <h1>WutheringWaves CLI Manager</h1>
   <h3>Command-line manager for Wuthering Waves</h3>
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.3.8-brightgreen.svg" alt="version 2.3.8">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.4.0-brightgreen.svg" alt="version 2.4.0">
 </div>
 
 <p align="center">
@@ -124,6 +124,8 @@ For Linux launch instructions and troubleshooting, see the [Linux guide](linux.m
 | `ww sync` | Verify and repair files |
 | `ww log` | Get the gacha history link |
 | `ww update` | Update the tool |
+
+On Linux x86_64 incremental updates use a native applier, [krpatch](native/krpatch/README.md). It reads the old files in place and needs no wine + `hpatchz.exe`: the binary is downloaded and sha256-verified on first use, and every output is checked against the official manifest's md5. It falls back to wine automatically when unavailable.
 
 `download`, `resource`, and `checkout` open menus when called without arguments. You can also specify arguments directly:
 

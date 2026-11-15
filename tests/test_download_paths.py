@@ -166,7 +166,7 @@ class DownloadPathTests(unittest.TestCase):
 
     def test_resource_tier_download(self):
         dest = "Client/Content/HD/pak7.pak"
-        self.server.files = {f"files/hd/pak7.pak": BIG}
+        self.server.files = {"files/hd/pak7.pak": BIG}
         prepared = {
             "bundle": {"bundles": {"HD": {"resourcePacks": ["common", "hd"]}}},
             "version": "9.9.9",
@@ -234,7 +234,7 @@ class DownloadPathTests(unittest.TestCase):
                             {"version": "1.0.0", "indexFile": "patch/index.json", "baseUrl": "files/patch"}
                         ],
                     }
-                }
+                },
             },
             self.base,
         )

@@ -24,6 +24,15 @@ SOURCE = "3.7.1"
 TARGET = "3.8.0"
 
 
+def setUpModule():
+    # 单元测试不联网：锁定既有 wine + hpatchz 分支，krpatch 接线由 test_krpatch.py 覆盖。
+    os.environ["WW_APPLIER"] = "hpatchz"
+
+
+def tearDownModule():
+    os.environ.pop("WW_APPLIER", None)
+
+
 def file_item(dest, payload=NEW):
     return {"dest": dest, "size": len(payload), "md5": hashlib.md5(payload, usedforsecurity=False).hexdigest()}
 
@@ -312,7 +321,8 @@ class ResourceUpdateTests(unittest.TestCase):
         with self.assertLogs("WW_Manager", level="INFO") as logs:
             self.assertTrue(self.owner.apply_incremental())
         text = "\n".join(logs.output)
-        self.assertEqual(text.count("开始合并"), 2)  # 每个包各一次
+        self.assertEqual(text.count("开始合并"), 0)  # 不再按分包各跑一轮
+        self.assertEqual(text.count("个增量包（2 个分包）"), 1)  # common 与 uhd 合成一轮
         self.assertEqual(text.count("common + uhd 增量完成"), 1)
         self.assertIn("无差分合并组", text)
         self.assertIn("迁移 更新=2", text)
@@ -322,17 +332,19 @@ class ResourceUpdateTests(unittest.TestCase):
 
     def test_second_pack_failure_resumes_without_reapplying_common(self):
         self.assertTrue(self.updater.download())
-        original = PackIncrementalManager.apply_into
+        original = PackIncrementalManager.migrate_outputs
         calls = []
 
         def fail_tier(engine, progress, stats, label=None):
             calls.append(engine.pack_name)
-            return original(engine, progress, stats, label=label) if engine.pack_name == "common" else False
+            if engine.pack_name == "uhd":
+                return False
+            return original(engine, progress, stats, label=label)
 
-        with patch.object(PackIncrementalManager, "apply_into", autospec=True, side_effect=fail_tier):
+        with patch.object(PackIncrementalManager, "migrate_outputs", autospec=True, side_effect=fail_tier):
             with self.assertRaisesRegex(WWError, "主版本未升级"):
                 self.updater.apply()
-        self.assertEqual(calls, ["common", "uhd"])
+        self.assertEqual(calls, ["common", "uhd"])  # 迁移仍按包顺序，失败即停
         self.assertEqual(self.owner.resource_pack_version("common"), TARGET)
         self.assertEqual(self.owner.resource_pack_version("uhd"), SOURCE)
         self.assertEqual(self.read_json("launcherDownloadConfig.json")["version"], SOURCE)
@@ -703,9 +715,7 @@ class ResourceUpdateTests(unittest.TestCase):
             self.assertFalse((self.root / PLAN).exists())
             self.assertFalse(any(url.startswith("/files/") for url in self.server.requested))
             self.assertTrue(self.owner.download_incremental(force_space=True))
-        self.assertEqual(
-            (self.root / ".incremental_download/packs/hd/resources" / destination("hd")).read_bytes(), NEW
-        )
+        self.assertEqual((self.root / ".incremental_download/packs/hd/resources" / destination("hd")).read_bytes(), NEW)
 
     def test_patch_transport_size_not_output_size_is_checked(self):
         diff = b"patch"

@@ -21,3 +21,6 @@ Client/
 
 # Pi 工作目录
 .pi/
+
+# Rust 原生工具链
+native/*/target/

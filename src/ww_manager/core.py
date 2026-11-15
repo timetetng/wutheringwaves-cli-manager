@@ -43,7 +43,7 @@ from ww_manager.incremental import (
     IncrementalError,
     IncrementalManager,
     _resource_rel_path,
-    check_hpatchz_requirements,
+    check_patch_applier,
 )
 
 logger = logging.getLogger("WW_Manager")
@@ -1319,12 +1319,12 @@ class WGameManager:
 
     def apply_incremental_update(self, dry_run: bool = False, force_space: bool = False) -> bool:
         """旧接口保留，调用新的统一管理器"""
-        is_ok, error_msg = check_hpatchz_requirements()
-        if not is_ok:
-            logger.warning(f"增量更新环境检查失败: {error_msg}")
-            return False
-
         if dry_run:
+            # 只做本地检查，不联网下载：原生 krpatch 优先，否则看 wine + hpatchz。
+            is_ok, error_msg = check_patch_applier(self.game_folder / ".ww_manager_cache")
+            if not is_ok:
+                logger.warning(f"增量更新环境检查失败: {error_msg}")
+                return False
             logger.info("增量更新环境检查通过")
             return True
 
