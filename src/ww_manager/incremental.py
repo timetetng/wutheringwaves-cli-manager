@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -57,6 +58,13 @@ logger = logging.getLogger("WW_Manager")
 HPATCHZ_REPO = "timetetng/wutheringwaves-cli-manager"
 HPATCHZ_VERSION = "hpatchz-v4.8.0"
 HPATCHZ_FILENAME = "hpatchz.exe"
+
+# 原生补丁器（native/krpatch）：官方 Release 只提供 Linux x86_64 产物。
+KRPATCH_VERSION = "krpatch-v0.2.1"
+KRPATCH_FILENAME = "krpatch-linux-x86_64"
+KRPATCH_BIN_NAME = "krpatch"
+KRPATCH_RECORD = "krpatch.version"
+_KR_MACHINES = ("x86_64", "amd64")
 
 
 class ApplySpinnerColumn(SpinnerColumn):
@@ -156,6 +164,95 @@ def get_hpatchz_path(cache_dir: Path) -> Path:
         if hpatchz_path.exists():
             hpatchz_path.unlink()
         raise IncrementalError(f"下载 hpatchz.exe 失败: {e}")
+
+
+def _krpatch_supported() -> bool:
+    """官方 Release 只发 Linux x86_64 一个产物。"""
+    return platform.system() == "Linux" and platform.machine().lower() in _KR_MACHINES
+
+
+def find_cached_krpatch(cache_dir: Path) -> Optional[Path]:
+    """本地已有的原生补丁器；不联网。"""
+    if os.environ.get("WW_KRPATCH"):
+        override = Path(os.environ["WW_KRPATCH"]).expanduser()
+        if override.is_file():
+            return override
+        logger.warning(f"WW_KRPATCH 指向的文件不存在: {override}")
+    found = shutil.which(KRPATCH_BIN_NAME)
+    if found:
+        return Path(found)
+    candidate = cache_dir / KRPATCH_BIN_NAME
+    try:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    except OSError as e:
+        logger.debug(f"检查缓存的 krpatch 失败: {e}")
+    return None
+
+
+def get_krpatch_path(cache_dir: Path) -> Optional[Path]:
+    """取原生补丁器：已缓存 → 直接用；否则从 Release 下载并校验 sha256。
+
+    拿不到就返回 None，让调用方回退 wine + hpatchz.exe。
+    """
+    cached = find_cached_krpatch(cache_dir)
+    record = cache_dir / KRPATCH_RECORD
+    if cached is not None:
+        if cached.parent != cache_dir or not record.exists():
+            return cached
+        if record.read_text(encoding="utf-8").strip() == KRPATCH_VERSION:
+            return cached
+        logger.info(f"krpatch 版本不同（缓存 {record.read_text().strip()}），尝试更新")
+
+    if not _krpatch_supported():
+        return cached
+
+    base = f"https://github.com/{HPATCHZ_REPO}/releases/download/{KRPATCH_VERSION}"
+    target = cache_dir / KRPATCH_BIN_NAME
+    temp = cache_dir / f"{KRPATCH_BIN_NAME}.download"
+    logger.info(f"正在下载 {KRPATCH_VERSION} 原生补丁器...")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with requests.get(f"{base}/{KRPATCH_FILENAME}", timeout=60, stream=True) as rsp:
+            rsp.raise_for_status()
+            digest = hashlib.sha256()
+            with open(temp, "wb") as f:
+                for chunk in rsp.iter_content(chunk_size=64 * 1024):
+                    f.write(chunk)
+                    digest.update(chunk)
+        rsp = requests.get(f"{base}/{KRPATCH_FILENAME}.sha256", timeout=30)
+        rsp.raise_for_status()
+        expected = rsp.text.strip().split()[0].lower()
+        if digest.hexdigest() != expected:
+            raise IncrementalError(f"sha256 不符（{digest.hexdigest()[:16]}... != {expected[:16]}...）")
+        os.chmod(temp, 0o755)
+        os.replace(temp, target)
+        record.write_text(KRPATCH_VERSION + "\n", encoding="utf-8")
+        logger.info(f"krpatch 已就绪: {target}")
+        return target
+    except Exception as e:
+        for path in (temp,):
+            if path.exists():
+                path.unlink()
+        if cached is not None:
+            logger.warning(f"krpatch 更新失败（{e}），继续使用已有版本: {cached}")
+            return cached
+        logger.warning(f"无法获取原生补丁器 krpatch（{e}），将回退 wine + hpatchz.exe")
+        return None
+
+
+def check_patch_applier(cache_dir: Path) -> Tuple[bool, str]:
+    """检查有没有可用的补丁应用器（不联网）。"""
+    if find_cached_krpatch(cache_dir) is not None:
+        return True, ""
+    if check_hpatchz_requirements()[0]:
+        return True, ""
+    return False, (
+        "没有可用的增量补丁应用器。\n"
+        "原生 krpatch 可自动下载（Linux x86_64，无需 wine）；\n"
+        "或用 wine + hpatchz.exe：sudo pacman -S wine / sudo apt install wine。\n"
+        "也可以使用 'ww sync' 进行全量同步。"
+    )
 
 
 def _http_get_json(url: str) -> Optional[Any]:
@@ -359,6 +456,9 @@ class IncrementalManager:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.hpatchz_path: Optional[Path] = None
+        # "krpatch"（原生）或 "hpatchz"（wine）；由 apply_into 决定。
+        self.krpatch_path: Optional[Path] = None
+        self.applier: Optional[str] = None
         self._index_file: Optional[Dict] = None
         self._verified_staged_patch_dests: set[str] = set()
         self._verified_staged_patch_lock = threading.Lock()
@@ -1151,11 +1251,17 @@ class IncrementalManager:
 
         group_infos = self.get_group_infos()
         if group_infos:
-            is_ok, error_msg = check_hpatchz_requirements()
-            if not is_ok:
-                raise IncrementalError(error_msg)
-            logger.info(f"{tag}正在准备 hpatchz 工具...")
-            self.hpatchz_path = get_hpatchz_path(self.cache_dir)
+            self.applier = self._select_applier()
+            if self.applier == "krpatch":
+                logger.info(f"{tag}使用原生补丁器 krpatch: {self.krpatch_path}")
+            elif self.applier == "hpatchz":
+                is_ok, error_msg = check_hpatchz_requirements()
+                if not is_ok:
+                    raise IncrementalError(error_msg)
+                logger.info(f"{tag}正在准备 hpatchz 工具...")
+                self.hpatchz_path = get_hpatchz_path(self.cache_dir)
+            else:
+                raise IncrementalError(check_patch_applier(self.cache_dir)[1])
 
         max_workers = max(1, min(4, len(group_infos)))
         # 大文件优先：按 group 总大小降序排列，让最大的先启动
@@ -1424,29 +1530,48 @@ class IncrementalManager:
                 output_dir = Path(temp_dir) / "output"
                 output_dir.mkdir(parents=True, exist_ok=True)
 
-                if not self._run_hpatchz(
-                    krpdiff_path,
-                    output_dir,
-                    src_files,
-                    status_callback=set_status,
-                    error_callback=log_error,
-                ):
-                    set_status(f"hpatchz 失败，回退下载 {len(dst_files)} 个文件")
-                    log_warning(f"hpatchz 应用失败，回退到完整下载: {first_src_path} 等 {len(dst_files)} 个文件")
-                    failed_count = 0
-                    for index, dst_info in enumerate(dst_files, 1):
-                        set_status(f"回退下载 {index}/{len(dst_files)}")
-                        staged_path = self._get_staged_patch_path(download_dir, dst_info["dest"])
-                        if not self._download_full_file_to_stage(dst_info, staged_path, log_error):
-                            failed_count += 1
-                            log_error(f"下载失败: {dst_info['dest']}")
-                        else:
-                            log_info(f"已缓存完整文件: {dst_info['dest']}")
-                    if failed_count > 0:
-                        return krpdiff_name, "failed"
-                    return krpdiff_name, "success"
+                if self.applier == "krpatch" and self.krpatch_path is not None:
+                    source_error = self._ensure_patch_sources(src_files)
+                    if source_error:
+                        set_status(f"源文件不可用，回退下载 {len(dst_files)} 个文件")
+                        log_warning(f"{source_error}，回退全量下载 {len(dst_files)} 个文件")
+                        failed_count = self._fallback_download_group(
+                            dst_files, download_dir, log_info, log_error, set_status
+                        )
+                        return krpdiff_name, "failed" if failed_count > 0 else "success"
 
-                # hpatchz 成功，缓存所有输出文件，最后统一校验并迁移到游戏目录
+                    # krpatch 直接读游戏目录、直接写临时输出目录（不再 copy 源文件），
+                    # 用官方 index 的 md5 作为 --expect 真值，同时在二进制内逐文件比对。
+                    verified_dests, needs_fallback, patch_error = self._run_krpatch(
+                        krpdiff_path, output_dir, dst_files, status_callback=set_status
+                    )
+                    if patch_error:
+                        set_status(f"krpatch 失败，回退下载 {len(dst_files)} 个文件")
+                        log_warning(
+                            f"krpatch 应用失败，回退到完整下载: {first_src_path} 等 "
+                            f"{len(dst_files)} 个文件（{patch_error}）"
+                        )
+                        failed_count = self._fallback_download_group(
+                            dst_files, download_dir, log_info, log_error, set_status
+                        )
+                        return krpdiff_name, "failed" if failed_count > 0 else "success"
+                else:
+                    verified_dests, needs_fallback = set(), set()
+                    if not self._run_hpatchz(
+                        krpdiff_path,
+                        output_dir,
+                        src_files,
+                        status_callback=set_status,
+                        error_callback=log_error,
+                    ):
+                        set_status(f"hpatchz 失败，回退下载 {len(dst_files)} 个文件")
+                        log_warning(f"hpatchz 应用失败，回退到完整下载: {first_src_path} 等 {len(dst_files)} 个文件")
+                        failed_count = self._fallback_download_group(
+                            dst_files, download_dir, log_info, log_error, set_status
+                        )
+                        return krpdiff_name, "failed" if failed_count > 0 else "success"
+
+                # 输出已就位，缓存到 staging，最后统一迁移到游戏目录
                 set_status("缓存输出文件")
                 fail_count = 0
                 for index, dst_info in enumerate(dst_files, 1):
@@ -1454,6 +1579,15 @@ class IncrementalManager:
                     dst_rel_path = dst_info["dest"]
                     output_file = output_dir / _resource_rel_path(dst_rel_path)
                     staged_path = self._get_staged_patch_path(download_dir, dst_rel_path)
+                    dest_key = self._krpatch_key(dst_rel_path)
+
+                    if dest_key in needs_fallback:
+                        set_status(f"输出与官方校验不一致，回退下载 {index}/{len(dst_files)}")
+                        log_warning(f"输出文件与官方 md5 不一致: {dst_rel_path}, 回退下载")
+                        if not self._download_full_file_to_stage(dst_info, staged_path, log_error):
+                            fail_count += 1
+                            log_error(f"回退下载也失败: {dst_rel_path}")
+                        continue
 
                     if not output_file.exists():
                         set_status(f"输出缺失，回退下载 {index}/{len(dst_files)}")
@@ -1463,14 +1597,16 @@ class IncrementalManager:
                             log_error(f"回退下载也失败: {dst_rel_path}")
                         continue
 
-                    set_status(f"校验输出 {index}/{len(dst_files)}")
-                    if not self._is_file_verified(output_file, int(dst_info["size"]), dst_info["md5"]):
-                        set_status(f"输出校验失败，回退下载 {index}/{len(dst_files)}")
-                        log_warning(f"输出文件校验失败: {dst_rel_path}, 回退下载")
-                        if not self._download_full_file_to_stage(dst_info, staged_path, log_error):
-                            fail_count += 1
-                            log_error(f"回退下载也失败: {dst_rel_path}")
-                        continue
+                    # krpatch 已用 --expect 对过官方 md5，不再重复读一遍大文件。
+                    if dest_key not in verified_dests:
+                        set_status(f"校验输出 {index}/{len(dst_files)}")
+                        if not self._is_file_verified(output_file, int(dst_info["size"]), dst_info["md5"]):
+                            set_status(f"输出校验失败，回退下载 {index}/{len(dst_files)}")
+                            log_warning(f"输出文件校验失败: {dst_rel_path}, 回退下载")
+                            if not self._download_full_file_to_stage(dst_info, staged_path, log_error):
+                                fail_count += 1
+                                log_error(f"回退下载也失败: {dst_rel_path}")
+                            continue
 
                     staged_path.parent.mkdir(parents=True, exist_ok=True)
                     if staged_path.exists():
@@ -1574,6 +1710,224 @@ class IncrementalManager:
 
         return _safe_replace_file(staged_path, dest_path)
 
+    KRPATCH_MIN_TIMEOUT = 600.0
+    # 保守下限：本机实测 19.6 GiB 分组（含 md5）约 34 s，即 ~570 MiB/s。
+    KRPATCH_MIN_MB_PER_S = 20.0
+
+    def _select_applier(self) -> Optional[str]:
+        """选补丁应用器：优先原生 krpatch，否则回退 wine + hpatchz。
+
+        ``WW_APPLIER=hpatchz`` 可强制旧路径（调试/对照用）。
+        """
+        forced = (os.environ.get("WW_APPLIER") or "").strip().lower()
+        if forced in ("hpatchz", "wine"):
+            return "hpatchz" if check_hpatchz_requirements()[0] else None
+        if forced not in ("", "auto", "krpatch"):
+            logger.warning(f"未知的 WW_APPLIER={forced}，按 auto 处理")
+
+        krpatch = get_krpatch_path(self.cache_dir)
+        if krpatch is not None:
+            self.krpatch_path = krpatch
+            return "krpatch"
+        if forced == "krpatch":
+            return None
+        return "hpatchz" if check_hpatchz_requirements()[0] else None
+
+    def _krpatch_key(self, dest: str) -> str:
+        """统一容器/清单路径的比较键（都走 '/' 分隔的相对路径）。"""
+        return _resource_rel_path(dest).as_posix()
+
+    def _ensure_patch_sources(self, src_files: List[Dict]) -> Optional[str]:
+        """krpatch 直接读游戏目录，动手前要确认真实源文件都在。
+
+        返回 None 表示就绪；否则返回不能继续的原因（调用方整组回退全量下载）。
+        单文件分组的 .bak 恢复已在上面做过，这里补齐多文件分组的剩馀源文件。
+        """
+        for src in src_files:
+            rel_path = _resource_rel_path(src["dest"])
+            path = self.game_folder / rel_path
+            if path.exists():
+                continue
+            backup = _backup_path(path)
+            if not backup.exists():
+                return f"源文件缺失: {src['dest']}"
+            try:
+                shutil.move(backup, path)
+            except OSError as e:
+                return f"无法恢复中断的更新 {src['dest']}: {e}"
+            logger.info(f"恢复中断的更新: {src['dest']}")
+        return None
+
+    def _krpatch_timeout(self, dst_files: List[Dict]) -> float:
+        """按输出字节数给 krpatch 超时；环境变量 WW_KRPATCH_TIMEOUT 可覆盖。"""
+        override = os.environ.get("WW_KRPATCH_TIMEOUT")
+        if override:
+            try:
+                # 显式覆盖按原意生效（调试/慢盘用），只挡掉非正数
+                return max(1.0, float(override))
+            except ValueError:
+                logger.warning(f"WW_KRPATCH_TIMEOUT 不是数字: {override}，已忽略")
+        total = sum(int(item.get("size") or 0) for item in dst_files)
+        return max(self.KRPATCH_MIN_TIMEOUT, total / (self.KRPATCH_MIN_MB_PER_S * (1 << 20)))
+
+    def _run_krpatch(
+        self,
+        krpdiff_path: Path,
+        output_dir: Path,
+        dst_files: List[Dict],
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> Tuple[set, set, Optional[str]]:
+        """用原生 krpatch 应用一个分组。
+
+        返回 ``(verified_dests, needs_fallback, error)``：
+        ``verified_dests`` 是已经在二进制内部与官方 md5 对过的输出（不必再读一遍）；
+        ``needs_fallback`` 是输出对不上或缺失、要回退完整下载的文件；
+        ``error`` 非空表示整个分组不可用（旧文件缺失、补丁损坏、超时……）。
+        """
+        all_dests = {self._krpatch_key(item["dest"]) for item in dst_files}
+
+        def set_status(msg: str):
+            if status_callback:
+                status_callback(msg)
+
+        if self.krpatch_path is None:
+            return set(), all_dests, "未配置 krpatch 路径"
+
+        patch_temp_dir = self.cache_dir / "patch_temp"
+        patch_temp_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(krpdiff_path).stem
+        expect_path = patch_temp_dir / f"expect_{stem}.tsv"
+        result_path = patch_temp_dir / f"result_{stem}.json"
+
+        try:
+            lines = []
+            for item in dst_files:
+                dest = str(item["dest"]).replace("\\", "/")
+                lines.append(f"{dest}\t{int(item['size'])}\t{item['md5']}\n")
+            expect_path.write_text("".join(lines), encoding="utf-8")
+        except (OSError, KeyError, ValueError) as e:
+            return set(), all_dests, f"无法写入期望值表: {e}"
+
+        cmd = [
+            str(self.krpatch_path),
+            "apply",
+            "--old-root",
+            str(self.game_folder),
+            "--out-root",
+            str(output_dir),
+            "--workers",
+            "1",
+            "--expect",
+            str(expect_path),
+            "--json",
+            str(result_path),
+            str(krpdiff_path),
+        ]
+        logger.debug(f"Running krpatch: {' '.join(cmd)}")
+        set_status("应用差分")
+        timeout = self._krpatch_timeout(dst_files)
+        tail: List[str] = []
+        progress_state: List[int] = []
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        except OSError as e:
+            return set(), all_dests, f"无法启动 krpatch: {e}"
+
+        def drain_stderr(stream) -> None:
+            # 进度行用 \r 刷新，按块读再取最后一个百分比，不依赖行边界
+            buf = ""
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                buf = (buf + chunk)[-4096:]
+                matches = re.findall(r"(\d+(?:\.\d+)?)%", buf)
+                if matches:
+                    pct = int(float(matches[-1]))
+                    if not progress_state or progress_state[-1] != pct:
+                        progress_state.append(pct)
+                tail.append(chunk)
+                if len(tail) > 16:
+                    del tail[:-16]
+
+        reader = threading.Thread(target=drain_stderr, args=(proc.stderr,), daemon=True)
+        reader.start()
+        deadline = time.monotonic() + timeout
+        shown = -1
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if progress_state and progress_state[-1] != shown:
+                        shown = progress_state[-1]
+                        set_status(f"应用差分 {shown}%")
+                    if time.monotonic() > deadline:
+                        proc.kill()
+                        proc.wait(timeout=10)
+                        return (
+                            set(),
+                            all_dests,
+                            f"krpatch 超时（{int(timeout)}s），可用 WW_KRPATCH_TIMEOUT 调大",
+                        )
+        finally:
+            reader.join(timeout=5)
+            if proc.stderr is not None:
+                proc.stderr.close()
+            stderr_text = "".join(tail)
+            try:
+                expect_path.unlink()
+            except OSError:
+                pass
+
+        set_status("检查 krpatch 结果")
+        data = None
+        if result_path.exists():
+            try:
+                data = json.loads(result_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                data = None
+            finally:
+                try:
+                    result_path.unlink()
+                except OSError:
+                    pass
+
+        if proc.returncode not in (0, 3) or not isinstance(data, dict):
+            detail = ""
+            if isinstance(data, dict):
+                groups = data.get("groups") or []
+                first = groups[0] if groups else {}
+                detail = str(first.get("error") or "")
+            if not detail:
+                detail = stderr_text.strip().splitlines()[-1] if stderr_text.strip() else ""
+            return set(), all_dests, f"退出码 {proc.returncode}{'：' + detail if detail else ''}"
+
+        files: Dict[str, Dict] = {}
+        for group in data.get("groups") or []:
+            for item in group.get("files") or []:
+                try:
+                    files[self._krpatch_key(item["path"])] = item
+                except (IncrementalError, KeyError):
+                    continue
+
+        verified: set = set()
+        needs_fallback: set = set()
+        for item in dst_files:
+            key = self._krpatch_key(item["dest"])
+            entry = files.get(key)
+            if entry is None:
+                needs_fallback.add(key)
+            elif entry.get("matched") is True:
+                verified.add(key)
+            elif entry.get("matched") is False:
+                needs_fallback.add(key)
+            # matched 为 None（期望值表没覆盖到）时留给 Python 侧自己校验
+        if needs_fallback:
+            logger.debug(f"krpatch 输出待回退: {sorted(needs_fallback)}")
+        return verified, needs_fallback, None
+
     def _run_hpatchz(
         self,
         krpdiff_path: Path,
@@ -1671,6 +2025,9 @@ class IncrementalManager:
             break
 
         set_status("检查 hpatchz 结果")
+        if result is None:
+            emit_error("hpatchz 未能启动")
+            return False
         if result.returncode != 0:
             emit_error(f"hpatchz 运行失败: {result.stderr}")
             return False

@@ -125,6 +125,8 @@ For Linux launch instructions and troubleshooting, see the [Linux guide](linux.m
 | `ww log` | Get the gacha history link |
 | `ww update` | Update the tool |
 
+On Linux x86_64 incremental updates use a native applier, [krpatch](native/krpatch/README.md). It reads the old files in place and needs no wine + `hpatchz.exe`: the binary is downloaded and sha256-verified on first use, and every output is checked against the official manifest's md5. It falls back to wine automatically when unavailable.
+
 `download`, `resource`, and `checkout` open menus when called without arguments. You can also specify arguments directly:
 
 ```bash

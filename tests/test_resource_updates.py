@@ -24,6 +24,15 @@ SOURCE = "3.7.1"
 TARGET = "3.8.0"
 
 
+def setUpModule():
+    # 单元测试不联网：锁定既有 wine + hpatchz 分支，krpatch 接线由 test_krpatch.py 覆盖。
+    os.environ["WW_APPLIER"] = "hpatchz"
+
+
+def tearDownModule():
+    os.environ.pop("WW_APPLIER", None)
+
+
 def file_item(dest, payload=NEW):
     return {"dest": dest, "size": len(payload), "md5": hashlib.md5(payload, usedforsecurity=False).hexdigest()}
 
