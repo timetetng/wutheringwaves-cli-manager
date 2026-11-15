@@ -125,6 +125,22 @@ class ResourceUpdateTests(unittest.TestCase):
     def set_index(self, pack, index):
         self.serve_json(f"/patch/{pack}.json", index)
 
+    def set_multi_group_index(self, pack, sizes):
+        """为 pack 构造 len(sizes) 个独立组，每组输出多少字节由 sizes 指定。"""
+        groups, served = [], []
+        for idx, size in enumerate(sizes):
+            dest = (
+                f"Client/Content/Paks/g{idx}.pak" if pack == "common" else f"Client/Content/{pack.upper()}/g{idx}.pak"
+            )
+            payload = bytes([65 + idx % 26]) * size
+            self.put(dest, OLD)
+            name = f"{pack}{idx}.krpdiff"
+            self.server.payloads[f"/files/{name}"] = b"p"
+            groups.append({"dest": name, "srcFiles": [file_item(dest, OLD)], "dstFiles": [file_item(dest, payload)]})
+            served.append(file_item(name, b"p"))
+        self.set_index(pack, {"resource": served, "groupInfos": groups})
+        return groups
+
     def read_json(self, relative):
         return json.loads((self.root / relative).read_text())
 
@@ -802,6 +818,70 @@ class ResourceUpdateTests(unittest.TestCase):
             self.assertTrue(self.owner.apply_incremental())
         self.assertEqual((self.root / destination("uhd")).read_bytes(), NEW)
         self.assertEqual(self.owner.resource_pack_version("uhd"), TARGET)
+
+    def test_apply_jobs_ordered_by_output_size_across_packs(self):
+        # 跨包合并调度：所有分包的组放进同一个队列，按输出总量降序，而不是先 common 后画质包。
+        self.set_multi_group_index("common", [300, 50])
+        self.set_multi_group_index("uhd", [900, 20])
+        self.assertTrue(self.updater.download())
+        order = []
+
+        def fake_jobs(engine, jobs, *args, **kwargs):
+            order.extend((job[0].pack_name, job[0]._get_group_size(job[1])) for job in jobs)
+            return {}
+
+        with (
+            patch("ww_manager.incremental.check_hpatchz_requirements", return_value=(True, "")),
+            patch("ww_manager.incremental.get_hpatchz_path", return_value=self.root / "fixture-hpatchz"),
+            patch.object(PackIncrementalManager, "run_apply_jobs", autospec=True, side_effect=fake_jobs),
+            patch.object(PackIncrementalManager, "migrate_outputs", autospec=True, return_value=True),
+        ):
+            self.assertTrue(self.updater.apply())
+        sizes = [size for _pack, size in order]
+        self.assertEqual(len(sizes), 4)
+        self.assertEqual(sizes, sorted(sizes, reverse=True))
+        self.assertEqual({pack for pack, _size in order}, {"common", "uhd"})
+
+    def test_apply_commits_finished_pack_when_other_pack_fails(self):
+        # 单包全部成功就提交版本：画质包失败不应把已完成的 common 退回重跑。
+        sizes = {"common": [100, 60], "uhd": [100, 60]}
+        for pack, pack_sizes in sizes.items():
+            self.set_multi_group_index(pack, pack_sizes)
+        self.assertTrue(self.updater.download())
+
+        fail_uhd = {"pending": True}
+
+        def patch_pack(engine, krpdiff_path, output_dir, src_files, **kwargs):
+            pack = engine.pack_name
+            if pack == "uhd" and fail_uhd["pending"]:
+                fail_uhd["pending"] = False
+                return False
+            idx = int(Path(krpdiff_path).stem.rsplit(pack, 1)[1])
+            for item in (engine.index_file or {}).get("groupInfos") or []:
+                if item["dest"] != Path(krpdiff_path).name:
+                    continue
+                for dst in item["dstFiles"]:
+                    target = Path(output_dir) / dst["dest"]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(bytes([65 + idx % 26]) * sizes[pack][idx])
+            return True
+
+        with (
+            patch("ww_manager.incremental.check_hpatchz_requirements", return_value=(True, "")),
+            patch("ww_manager.incremental.get_hpatchz_path", return_value=self.root / "fixture-hpatchz"),
+            patch.object(PackIncrementalManager, "_run_hpatchz", autospec=True, side_effect=patch_pack),
+        ):
+            with self.assertRaisesRegex(WWError, "uhd 应用未完成"):
+                self.updater.apply()
+            # common 已完整应用并登记，画质包保持源版本且标记未完成。
+            self.assertEqual(self.owner.resource_pack_version("common"), TARGET)
+            self.assertEqual(self.owner.resource_pack_version("uhd"), SOURCE)
+            self.assertIn("uhd", self.owner._read_resource_state()["incomplete"])
+            self.assertTrue((self.root / PLAN).exists())
+            self.assertTrue(self.updater.apply())
+        self.assertEqual(self.owner.resource_pack_version("uhd"), TARGET)
+        self.assertNotIn("uhd", self.owner._read_resource_state()["incomplete"])
+        self.assertFalse((self.root / PLAN).exists())
 
     def test_apply_reuses_staged_output_after_interruption(self):
         diff = b"patch-transport"

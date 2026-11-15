@@ -468,17 +468,20 @@ class ResourceUpdater:
 
                         for name, engine, _groups in prepared:
                             stats.add(name, results.get(id(engine), {}))
+                        done, failed = [], []
                         for name, engine, _groups in prepared:
-                            if any(r in ("failed", "partial_failed") for r in results.get(id(engine), {}).values()):
-                                failed_pack = name
-                                break
-
-                        # 迁移按分包做：各自的下载目录与索引不同。
-                        if not failed_pack:
-                            for name, engine, _groups in prepared:
-                                if not engine.migrate_outputs(progress, stats, label=name):
-                                    failed_pack = name
-                                    break
+                            own = results.get(id(engine), {})
+                            if any(r in ("failed", "partial_failed") for r in own.values()):
+                                failed.append(name)
+                            else:
+                                done.append((name, engine))
+                        # 迁移按分包做：各自的下载目录与索引不同。单个分包全部成功就可以提交
+                        # 版本，和逐包应用时一致；另一个包失败不应该让已完成的包退回重跑。
+                        for name, engine in done:
+                            if not engine.migrate_outputs(progress, stats, label=name):
+                                failed.append(name)
+                        if failed:
+                            failed_pack = failed[0]
             if failed_pack:
                 report_apply(stats)
                 raise WWError(f"{failed_pack} 应用未完成；主版本未升级，请勿启动游戏，重跑 ww incremental --apply 续作")
