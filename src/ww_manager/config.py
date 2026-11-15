@@ -66,7 +66,14 @@ SERVER_CONFIGS = {
         "appId": "10003",
     },
     "global": {
-        "api_url": "https://prod-alicdn-gamestarter.kurogame.com/launcher/game/G153/50004_obOHXFrFanqsaIEOmuKroCcbZkQRBC7c/index.json",
+        # 3.8 起国际服也换成 <appId>_<appKey>/G153/official/index.json；旧 G153/50004_<appKey>/index.json
+        # 仍回 200 但冻结在 3.7.1 老 schema。token 来自国际服启动器 3.0.1.0 包的 Assets/KRApp.conf
+        # （launcher.zip md5 1dc40e5b556babd3218a2f5a7c1a8dbf 与官方 index 记录一致）。
+        "api_url": "https://prod-alicdn-gamestarter.kurogame.com/launcher/game/50004_P7xcUZnEr1AXIGON25E6KjpOgTlVrg6e/G153/official/index.json",
+        "api_urls": (
+            "https://prod-alicdn-gamestarter.kurogame.com/launcher/game/50004_P7xcUZnEr1AXIGON25E6KjpOgTlVrg6e/G153/official/index.json",
+            "https://prod-volcdn-gamestarter.kurogame.net/launcher/game/50004_P7xcUZnEr1AXIGON25E6KjpOgTlVrg6e/G153/official/index.json",
+        ),
         "appId": "50004",
     },
     "bilibili": {
@@ -80,23 +87,34 @@ SERVER_CONFIGS = {
     },
 }
 
+# 国服 / B 服共用这三套 CDN 域
 RESOURCE_CONFIG_HOSTS = (
     "https://prod-cn-alicdn-gamestarter.kurogame.com/",
     "https://prod-volcdn-gamestarter.kurogame.xyz/",
     "https://prod-tencentcdn-gamestarter.kurogame.com/",
 )
 
-# 各渠道自己的画质/分包配置路径（官/B 服 contentId 目录不同，不能共用）
+# 国际服 CDN 与国服不同域（无 "cn" 段），单独登记
+RESOURCE_CONFIG_HOSTS_BY_SERVER = {
+    "global": (
+        "https://prod-alicdn-gamestarter.kurogame.com/",
+        "https://prod-volcdn-gamestarter.kurogame.net/",
+    ),
+}
+
+# 各渠道自己的画质/分包配置路径（官/B/国际服 contentId 目录不同，不能共用）
 RESOURCE_CONFIG_PATHS = {
     "cn": "launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json",
     "bilibili": "launcher/game/10004_IY6xmlAusbImBjWrpPj1OwNuirXEO44x/G152/bilibili/index.json",
+    "global": "launcher/game/50004_P7xcUZnEr1AXIGON25E6KjpOgTlVrg6e/G153/official/index.json",
 }
 
 
 def resource_config_urls(server_type: str) -> tuple:
-    """渠道配置的多 CDN 地址；未登记的国际服沿用官服入口。"""
+    """渠道配置的多 CDN 地址；未登记的渠道沿用官服入口。"""
     path = RESOURCE_CONFIG_PATHS.get(server_type) or RESOURCE_CONFIG_PATHS["cn"]
-    return tuple(host + path for host in RESOURCE_CONFIG_HOSTS)
+    hosts = RESOURCE_CONFIG_HOSTS_BY_SERVER.get(server_type, RESOURCE_CONFIG_HOSTS)
+    return tuple(host + path for host in hosts)
 
 
 # 兼容旧引用（官服）

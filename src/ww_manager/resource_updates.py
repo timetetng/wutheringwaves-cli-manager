@@ -7,7 +7,15 @@ import re
 from typing import Any, Dict, Optional
 
 from .core import ConfigError, NetworkError, WGameManager, WWError
-from .incremental import IncrementalError, IncrementalManager, _is_diff_resource, _resource_rel_path
+from .incremental import (
+    ApplyStats,
+    IncrementalError,
+    IncrementalManager,
+    _is_diff_resource,
+    _resource_rel_path,
+    create_apply_progress,
+    report_apply,
+)
 
 logger = logging.getLogger("WW_Manager")
 PLAN = ".incremental_download/packs/plan.json"
@@ -409,6 +417,8 @@ class ResourceUpdater:
                 ):
                     raise ConfigError(f"{name} 缓存版本或索引与更新计划不匹配，未开始应用")
                 engine.check_downloaded_files()
+            engines = []
+            stats = ApplyStats()
             for name in ("common", plan["tier"]):
                 entry = plan["packs"][name]
                 if self.owner.resource_pack_version(name) == entry["to_version"]:
@@ -417,10 +427,23 @@ class ResourceUpdater:
                 if name != "common":
                     self.owner._unregister_installed_tier(name, self.owner._read_local_config())
                 logger.info(f"应用 {name}: {entry['from_version']} → {entry['to_version']}")
-                if not PackIncrementalManager(
-                    self.owner, name, entry, plan, force_space=force_space
-                ).apply_incremental():
-                    raise WWError(f"{name} 应用未完成；主版本未升级，请勿启动游戏，重跑 ww incremental --apply 续作")
+                engines.append(
+                    (name, PackIncrementalManager(self.owner, name, entry, plan, force_space=force_space))
+                )
+            # common 与画质包共用一个进度条，结束只输出一份统计。
+            failed_pack = None
+            if engines:
+                progress = create_apply_progress()
+                with progress:
+                    for name, engine in engines:
+                        if not engine.apply_into(progress, stats, label=name):
+                            failed_pack = name
+                            break
+            if failed_pack:
+                report_apply(stats)
+                raise WWError(
+                    f"{failed_pack} 应用未完成；主版本未升级，请勿启动游戏，重跑 ww incremental --apply 续作"
+                )
             cfg = self.owner._read_local_config()
             cfg.update(
                 {
@@ -432,7 +455,7 @@ class ResourceUpdater:
             self.owner._write_local_json("launcherDownloadConfig.json", cfg)
             self.owner._write_local_json(HISTORY, plan)
             self.owner._managed_path(PLAN).unlink()
-            logger.info(f"common + {plan['tier']} 全部应用成功；未更新其它档位")
+            report_apply(stats)
             return True
         except (OSError, ValueError, IncrementalError) as e:
             raise WWError(f"分包增量应用失败: {e}；请勿启动游戏，可重跑命令继续") from e

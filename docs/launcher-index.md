@@ -106,14 +106,16 @@ backUpConfigUrl  https://prod-volcdn-gamestarter.kurogame.xyz/launcher/game/1000
 
 ## 5. 结果解读与写入代码
 
-2026-11 实测（官服 3.1.0.1 / B 服 3.0.1.0 安装包）：
+2026-11 实测（官服 3.1.0.1 / B 服 3.0.1.0 / 国际服 3.0.1.0 安装包）：
 
 | 渠道 | resId | gameId | serverCode | appKey | index |
 | --- | --- | --- | --- | --- | --- |
 | 国服 | 10003 | G152 | `official` | `oLNgHF1CESo51DGHN2odtp40e3oI1HfZ` | `https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10003_oLNgHF1CESo51DGHN2odtp40e3oI1HfZ/G152/official/index.json` |
 | B 服 | 10004 | G152 | `bilibili` | `IY6xmlAusbImBjWrpPj1OwNuirXEO44x` | `https://prod-cn-alicdn-gamestarter.kurogame.com/launcher/game/10004_IY6xmlAusbImBjWrpPj1OwNuirXEO44x/G152/bilibili/index.json` |
+| 国际服 | 50004 | G153 | `official` | `P7xcUZnEr1AXIGON25E6KjpOgTlVrg6e` | `https://prod-alicdn-gamestarter.kurogame.com/launcher/game/50004_P7xcUZnEr1AXIGON25E6KjpOgTlVrg6e/G153/official/index.json` |
 
-`backUpConfigUrl` 是备用 CDN（实测为 `prod-volcdn-gamestarter.kurogame.xyz` 同路径），可直接用于 `api_urls` 的第二条。
+`backUpConfigUrl` 是备用 CDN（国服实测为 `prod-volcdn-gamestarter.kurogame.xyz` 同路径），可直接用于 `api_urls` 的第二条。
+国际服的备用域与国服不同：`prod-volcdn-gamestarter.kurogame.net`（`.net` 而非 `.xyz`，也没有 `cn` 段），代码里用 `RESOURCE_CONFIG_HOSTS_BY_SERVER` 单独登记。
 
 把新的 `configUrl` / `backUpConfigUrl` 填进 `src/ww_manager/config.py`：
 
@@ -145,7 +147,7 @@ print('schema:', '3.7 老结构' if 'default' in d else '3.8+ 新结构')
 - **已安装启动器**：直接读 `<启动器根目录>/<启动器版本>/Assets/KRApp.conf`，编码与上面一致。新版本启动器启动后会用内置更新逻辑覆盖这个文件，所以已装启动器时优先读它。
 - **运行时**：启动器 WebView 前端的 jsBridge 方法 `kr_get_launcher_conf` 会把同样的字段回吐给页面（`appId` / `appKey` / `launcherIdentity` / `configUrl` 等）。这是**本地 Bridge 调用，不是 HTTP 请求**，抓包看不到"取 appKey 的接口"。
 - **启动器日志**：`AppData/Roaming/KRLauncher/<appId>/log/App_*.log`（XOR 0x09 混淆），其中 `CallbackDataToH5` 那一行就是上面那份 JSON。
-- **国际服**（`50004` / `G153`）：尚未实测，理论上是同一份 `KRApp.conf`，国际服安装包按本文流程解即可；在拿到实测 token 前，代码里继续使用旧路径（会冻结在旧版本，可能无法更新）。
+- **国际服**（`50004` / `G153`）：2026-11 已实测。国际服启动器 3.0.1.0 的安装包里是同一份 `KRApp.conf`，按本文流程解出的 `configUrl` 形如 `.../launcher/game/50004_<appKey>/G153/official/index.json`；旧地址 `launcher/game/G153/50004_obOHXFrFanqsaIEOmuKroCcbZkQRBC7c/index.json` 仍返回 200，但冻结在 3.7.1 老 schema。
 
 ## 编码细节备忘
 
@@ -159,3 +161,5 @@ print('schema:', '3.7 老结构' if 'default' in d else '3.8+ 新结构')
 - 官服旧 token `10003_Y8xXrXk65DqFHEDgApn3cpK5lfczpFx5` 已 404；B 服旧 token `10004_j5GW…` 仍返回 200，但内容是 3.7.1 老 schema（有 `default`），是最阴的那种"不报错但过期"。
 - 新 schema 没有 `default` 段；工具侧从 `resourcePacks.common` 合成（版本 / `cdnList` / `baseUrl` / 基础 indexFile），见 `WGameManager._normalize_channel_index`。
 - 渠道配置必须各取各的：B 服用官服清单去算增量时，`Client/Binaries/Win64/ClearThirdParty.exe` 等 68 个文件的源 md5 对不上（官服 1859d3ae… vs B 服 cf807c09…），整次 apply 会在迁移前中止。
+- 国际服同样换过 token，且路径结构也变了：旧 `launcher/game/G153/50004_obOHXFrFanqsaIEOmuKroCcbZkQRBC7c/index.json` 仍是 3.7 老 schema（无 `resourcePacks`），新地址改成与官服一致的 `<appId>_<appKey>/G153/official/index.json`，实测 `resourcePacks.{common,hd,sd,uhd}` 全 3.8.0，且各档位都有 `patchConfig`，可与国服走同一条分包增量路径。
+- 正因为国际服 index 已自带画质清单，"国际服复用国服画质清单尚未验证"这个前提不复存在；工具里的 `--allow-untested` 因此改为废弃空转（仍接受旧脚本，但只打一条警告）。

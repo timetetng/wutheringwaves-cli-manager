@@ -16,7 +16,6 @@ from urllib.request import Request, urlopen
 from rich.progress import (
     BarColumn,
     Progress,
-    TaskID,
     TextColumn,
     TimeRemainingColumn,
 )
@@ -34,9 +33,9 @@ from ww_manager.config import (
 from ww_manager.download import (
     DownloadSpaceError,
     available_disk_space,
+    batch_download,
     check_space_requirement,
     create_download_progress,
-    download_single_file,
     format_bytes,
     space_shortage,
 )
@@ -195,7 +194,6 @@ class WGameManager:
         self.game_folder = game_folder.resolve()
         self.server_type = server_type
         self.config = SERVER_CONFIGS[server_type]
-        self.allow_untested = False
 
         self.md5_cache = MD5Cache(self.game_folder / "wwm_md5_cache.json", self.game_folder)
 
@@ -285,21 +283,6 @@ class WGameManager:
             logger.error(f"HTTP 请求失败 {url}: {e}")
             return None
 
-    def _download_file(
-        self,
-        url: str,
-        dest: Path,
-        expected_size: int,
-        progress: Optional[Progress] = None,
-        overall_task_id: Optional[TaskID] = None,
-        expected_md5: Optional[str] = None,
-    ) -> bool:
-        """复用通用下载器；校验成功后才覆盖正式文件。"""
-        success = download_single_file(url, dest, expected_size, progress, overall_task_id, expected_md5=expected_md5)
-        if success:
-            self.md5_cache.clear(dest)
-        return success
-
     def _batch_download(self, tasks: List[dict]) -> int:
         """批量下载，返回失败的文件数 (0 = 全部成功)"""
         if not tasks:
@@ -309,38 +292,15 @@ class WGameManager:
         total_size = sum(t["size"] for t in tasks)
         logger.info(f"准备下载 {len(tasks)} 个文件，总大小: {total_size / 1024 / 1024:.2f} MB")
 
-        max_workers = 8
-
         progress = create_download_progress()
-
-        with progress:
-            overall_task = progress.add_task("Total Download", total=total_size)
-
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-                for task in tasks:
-                    future = executor.submit(
-                        self._download_file,
-                        task["url"],
-                        task["path"],
-                        task["size"],
-                        progress,
-                        overall_task,
-                        expected_md5=task.get("md5"),
-                    )
-                    futures.append(future)
-
-                failed = 0
-                for f in as_completed(futures):
-                    if not f.result():
-                        failed += 1
-                        logger.debug("文件下载失败，详情见下载器错误")
+        prepared = [{**task, "name": str(task["path"])} for task in tasks]
+        failed, failed_names = batch_download(prepared, progress=progress)
+        for name in failed_names:
+            self.md5_cache.clear(Path(name))
         return failed
 
     def sync_files(self, force_check_md5=False, tier: Optional[str] = None, force_space: bool = False):
         tier = self._validate_tier(tier) if tier is not None else self.current_resource_tier()
-        if self.server_type == "global" and tier != "hd":
-            self._require_untested_resources()
         # 确保获取的是当前版本的配置
         default_info = self.launcher_info["default"]
         res_base = default_info.get("resourcesBasePath") or default_info.get("baseUrl")
@@ -351,7 +311,14 @@ class WGameManager:
             common = prepared["bundle"]["resourcePacks"].get("common", {})
             version = default_info["version"]
             if not isinstance(common, dict) or common.get("version") != version or prepared["version"] != version:
-                raise ConfigError("渠道基础包与画质包版本不一致，暂不能组合安装，请稍后重试")
+                common_version = common.get("version") if isinstance(common, dict) else None
+                detail = f"基础包 {version} / 公共包 {common_version or '未知'} / 画质包 {prepared['version']}"
+                hint = (
+                    "；国际服若长期如此，说明 index 冻结在旧版本，参见 docs/launcher-index.md 第 6 步"
+                    if self.server_type != "cn"
+                    else ""
+                )
+                raise ConfigError(f"渠道基础包与画质包版本不一致（{detail}），暂不能组合安装{hint}")
         res_list = self._base_manifest(self.game_index["resource"], tier)
         self._read_local_config()
         self._read_resource_state()
@@ -502,13 +469,8 @@ class WGameManager:
 
     RESOURCE_TIERS = ("hd", "sd", "uhd")
 
-    def _require_untested_resources(self) -> None:
-        if self.server_type == "global" and not self.allow_untested:
-            raise ConfigError("国际服复用国服画质清单尚未验证；如接受兼容性风险，请使用 --allow-untested")
-
     def get_bundle_config(self, config_url: Optional[str] = None) -> Dict[str, Any]:
-        """获取国服画质配置；国际服必须显式允许未经验证的清单复用。"""
-        self._require_untested_resources()
+        """获取当前渠道的画质配置；优先复用 index 自带的 resourcePacks。"""
         if config_url is not None and (not isinstance(config_url, str) or not config_url):
             raise ConfigError("资源档位配置地址为空")
         logger.info("正在获取资源档位配置...")
@@ -750,16 +712,6 @@ class WGameManager:
     def resource_menu_data(self) -> List[dict]:
         """只读获取官方清单与本地情况；不保存哈希缓存或改变安装记录。"""
         states = {s["tier"]: s for s in self.resource_tier_status()}
-        if self.server_type == "global" and not self.allow_untested:
-            return [
-                {
-                    **states[tier],
-                    "installed": False,
-                    "prepared": None,
-                    "error": "国际服复用国服清单未验证；须使用 ww resource --allow-untested",
-                }
-                for tier in ("sd", "hd", "uhd")
-            ]
         bundle = self.get_bundle_config()
         logger.info("正在读取各档位清单与本地文件，首次可能需要一些时间...")
         rows = []
@@ -785,7 +737,6 @@ class WGameManager:
 
     def select_resource_tier(self, tier: str, prepared: dict, force_space: bool = False) -> None:
         """菜单确认：同版本完整登记仅切换默认；其它情况校验、修复后选定。"""
-        self._require_untested_resources()
         tier = self._validate_tier(tier)
         if self._tier_is_current(tier, prepared["version"]):
             state = self._read_resource_state()
@@ -803,7 +754,6 @@ class WGameManager:
         bundle: Optional[dict] = None,
     ) -> dict:
         """只读预检，组合安装须在公共文件下载前确认画质清单有效。"""
-        self._require_untested_resources()
         self._read_resource_state()
         bundle = self.get_bundle_config(config_url) if bundle is None else bundle
         if not isinstance(bundle, dict):
@@ -1394,30 +1344,10 @@ class WGameManager:
             return False
 
     def download_incremental(self, config_url: Optional[str] = None, force_space: bool = False) -> bool:
-        """统一下载 common + 当前档位，未开放的分包渠道不降级到 HD。"""
+        """统一下载 common + 当前档位；渠道未开放的分包不会降级到 HD。"""
         from .resource_updates import ResourceUpdater
 
-        updater = ResourceUpdater(self)
-        if self.server_type != "global" or updater.has_pending_plan():
-            return updater.download(config_url, force_space=force_space)
-        if self.current_resource_tier() != "hd":
-            raise ConfigError(
-                "国际服实验性档位的增量更新尚未验证；请用 ww resource <tier> --allow-untested 校验更新档位"
-            )
-        logger.info("国际服使用默认 HD 基础增量")
-        manager = IncrementalManager(
-            self.game_folder,
-            self.server_type,
-            self.launcher_info,
-            self.cdn_node,
-            force_space=force_space,
-            space_check=self._check_download_space,
-        )
-        try:
-            return manager.download_incremental()
-        except IncrementalError as e:
-            logger.error(f"增量包下载失败: {e}")
-            return False
+        return ResourceUpdater(self).download(config_url, force_space=force_space)
 
     def apply_incremental(self, force_space: bool = False) -> bool:
         """应用已固定的分包更新计划；回退下载也检查空间。"""

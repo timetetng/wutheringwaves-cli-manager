@@ -26,7 +26,7 @@ from ww_manager.menu import MenuOption, MenuShortcut, build_selection_menu
 __version__ = metadata.version("ww-manager")
 
 TIER_NAMES = {"sd": "流畅", "hd": "高清", "uhd": "极致"}
-UNTESTED_HELP = "允许国际服复用国服画质清单（未验证，不保证兼容）"
+UNTESTED_HELP = "已废弃：国际服已改用官方画质清单，此参数不再生效"
 
 
 def parse_version(version_str: str) -> tuple:
@@ -307,7 +307,7 @@ def sync(
             pass
     try:
         mgr = WGameManager(path, server)
-        _configure_untested(mgr, allow_untested)
+        _configure_untested(allow_untested)
         if check_new:
             success = mgr.verify_new_version(force_space=force)
             if not success:
@@ -321,10 +321,10 @@ def sync(
         raise typer.Exit(1)
 
 
-def _configure_untested(manager: WGameManager, allowed: bool) -> None:
-    manager.allow_untested = allowed
-    if allowed and manager.server_type == "global":
-        logger.warning("国际服将复用国服画质清单（未验证）；MD5 仅确认文件与清单一致，不代表游戏兼容")
+def _configure_untested(allowed: bool) -> None:
+    """兼容旧脚本：--allow-untested 已废弃，国际服不再复用国服画质清单。"""
+    if allowed:
+        logger.warning("--allow-untested 已废弃：国际服使用官方画质清单，该参数不再有任何作用")
 
 
 def _run_menu(application: Application[Optional[MenuOption]]) -> Optional[MenuOption]:
@@ -391,22 +391,7 @@ def download(
                 return
             choice = _run_menu(
                 build_selection_menu(
-                    [
-                        MenuOption(
-                            key,
-                            f"{key.upper()} · {name}",
-                            description="未验证 · 国服清单"
-                            if server == ServerType.global_server and key != "hd"
-                            else "",
-                            description_style="fg:ansiyellow"
-                            if server == ServerType.global_server and key != "hd"
-                            else "",
-                            blocked_reason="国际服其他档位未验证；如接受复用国服清单的风险，请加 --allow-untested"
-                            if server == ServerType.global_server and key != "hd" and not allow_untested
-                            else None,
-                        )
-                        for key, name in TIER_NAMES.items()
-                    ],
+                    [MenuOption(key, f"{key.upper()} · {name}") for key, name in TIER_NAMES.items()],
                     "hd",
                     title=f"下载客户端 · 2/2 选择资源档位 · {server.value}",
                     current_label="默认下载",
@@ -416,7 +401,7 @@ def download(
                 return
             tier = choice.key
         mgr = WGameManager(path, server.value)
-        _configure_untested(mgr, allow_untested)
+        _configure_untested(allow_untested)
         mgr.download_full(tier=tier, force_space=force)
         mgr.remind_resource_tiers()
     except (WWError, OSError) as e:
@@ -434,7 +419,7 @@ def run_resource_menu(manager: WGameManager, *, force_space: bool = False) -> No
         for row in rows:
             tier = row["tier"]
             if row["error"]:
-                description = "× 未验证 · 国服清单" if manager.server_type == "global" else "× 暂不可用"
+                description = "× 暂不可用"
                 details = "大小未知（无法获取有效清单）"
                 blocked = row["error"]
             else:
@@ -446,8 +431,6 @@ def run_resource_menu(manager: WGameManager, *, force_space: bool = False) -> No
                     f"完整包 {row['total_size'] / 1024**3:.2f} GiB · 本次下载 {row['download_size'] / 1024**3:.2f} GiB"
                 )
                 blocked = None if force_space else manager.space_shortage(row["download_size"], free)
-            if manager.server_type == "global" and "未验证" not in description:
-                description += " · 未验证（国服清单）"
             options.append(
                 MenuOption(
                     key=tier,
@@ -522,7 +505,7 @@ def resource(
             pass
     try:
         mgr = WGameManager(path, server)
-        _configure_untested(mgr, allow_untested)
+        _configure_untested(allow_untested)
         if tier is None:
             if remove or force_md5 or config_url is not None:
                 raise WWError("使用操作选项时须指定档位，例如 ww resource hd --force-md5")
@@ -535,7 +518,7 @@ def resource(
             for state in mgr.resource_tier_status():
                 name = state["tier"]
                 table.add_row(
-                    f"{name.upper()} · {TIER_NAMES[name]}" + (" · 国服清单未验证" if server == "global" else ""),
+                    f"{name.upper()} · {TIER_NAMES[name]}",
                     state["state"],
                     state["version"] or "—",
                     "●" if state["active"] else "",
@@ -566,6 +549,7 @@ def checkout(
     server: Annotated[Optional[ServerType], typer.Argument(help="目标服务器；省略进入选择菜单")] = None,
     force_sync: Annotated[bool, typer.Option("--force-sync", help="切换后强制同步")] = False,
     force: Annotated[bool, typer.Option("--force", help="仅绕过下载空间检查，不跳过文件校验")] = False,
+    allow_untested: Annotated[bool, typer.Option("--allow-untested", help=UNTESTED_HELP)] = False,
 ):
     """切换服务器
 
@@ -581,6 +565,7 @@ def checkout(
             if server is None:
                 return
         mgr = WGameManager(path, server.value)
+        _configure_untested(allow_untested)
         mgr.checkout(server.value, force_sync=force_sync, force_space=force)
         mgr.remind_resource_tiers()
     except WWError as e:

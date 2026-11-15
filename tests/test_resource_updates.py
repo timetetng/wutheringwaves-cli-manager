@@ -211,20 +211,16 @@ class ResourceUpdateTests(unittest.TestCase):
             self.assertTrue(self.owner.download_incremental())
         download.assert_called_once_with(None, force_space=False)
 
-    def test_global_incremental_keeps_original_hd_engine(self):
+    def test_global_incremental_uses_pack_updater(self):
         self.owner.server_type = "global"
         self.choose("hd")
-        self.owner._launcher_info = {"default": {"version": TARGET}}
-        self.owner._cdn_node = self.url
         with (
-            patch("ww_manager.resource_updates.ResourceUpdater.download") as packs,
+            patch("ww_manager.resource_updates.ResourceUpdater.download", return_value=True) as packs,
             patch("ww_manager.core.IncrementalManager") as legacy,
-            patch("ww_manager.core.check_hpatchz_requirements", return_value=(True, "ok")),
         ):
-            legacy.return_value.download_incremental.return_value = True
             self.assertTrue(self.owner.download_incremental())
-        packs.assert_not_called()
-        legacy.return_value.download_incremental.assert_called_once()
+        packs.assert_called_once()
+        legacy.assert_not_called()
 
     def test_three_tiers_download_and_apply_without_hd_dependency(self):
         for tier in ("uhd", "sd", "hd"):
@@ -310,16 +306,30 @@ class ResourceUpdateTests(unittest.TestCase):
         self.assertTrue(self.updater.download())
         self.assertTrue(self.updater.apply())
 
+    def test_apply_reports_one_combined_summary(self):
+        self.choose("uhd")
+        self.assertTrue(self.owner.download_incremental(config_url="local-fixture"))
+        with self.assertLogs("WW_Manager", level="INFO") as logs:
+            self.assertTrue(self.owner.apply_incremental())
+        text = "\n".join(logs.output)
+        self.assertEqual(text.count("开始合并"), 2)  # 每个包各一次
+        self.assertEqual(text.count("common + uhd 增量完成"), 1)
+        self.assertIn("无差分合并组", text)
+        self.assertIn("迁移 更新=2", text)
+        self.assertEqual(text.count("增量更新应用完成"), 1)
+        self.assertNotIn("已保存索引到缓存", text)
+        self.assertNotIn("正在保存索引", text)
+
     def test_second_pack_failure_resumes_without_reapplying_common(self):
         self.assertTrue(self.updater.download())
-        original = PackIncrementalManager.apply_incremental
+        original = PackIncrementalManager.apply_into
         calls = []
 
-        def fail_tier(engine):
+        def fail_tier(engine, progress, stats, label=None):
             calls.append(engine.pack_name)
-            return original(engine) if engine.pack_name == "common" else False
+            return original(engine, progress, stats, label=label) if engine.pack_name == "common" else False
 
-        with patch.object(PackIncrementalManager, "apply_incremental", autospec=True, side_effect=fail_tier):
+        with patch.object(PackIncrementalManager, "apply_into", autospec=True, side_effect=fail_tier):
             with self.assertRaisesRegex(WWError, "主版本未升级"):
                 self.updater.apply()
         self.assertEqual(calls, ["common", "uhd"])
@@ -687,22 +697,15 @@ class ResourceUpdateTests(unittest.TestCase):
     def test_global_incremental_checks_space_and_supports_force(self):
         self.owner.server_type = "global"
         self.choose("hd")
-        self.owner._launcher_info = {
-            "default": {
-                "version": TARGET,
-                "config": {
-                    "patchConfig": [{"version": SOURCE, "indexFile": "patch/common.json", "baseUrl": "files"}],
-                },
-            }
-        }
-        self.owner._cdn_node = self.url
         with patch.object(self.owner, "available_disk_space", return_value=0):
             with self.assertRaises(DiskSpaceError):
                 self.owner.download_incremental()
-            self.assertFalse((self.root / ".incremental_download/indexFile.json").exists())
+            self.assertFalse((self.root / PLAN).exists())
             self.assertFalse(any(url.startswith("/files/") for url in self.server.requested))
             self.assertTrue(self.owner.download_incremental(force_space=True))
-        self.assertEqual((self.root / ".incremental_download/resources" / destination("common")).read_bytes(), NEW)
+        self.assertEqual(
+            (self.root / ".incremental_download/packs/hd/resources" / destination("hd")).read_bytes(), NEW
+        )
 
     def test_patch_transport_size_not_output_size_is_checked(self):
         diff = b"patch"
