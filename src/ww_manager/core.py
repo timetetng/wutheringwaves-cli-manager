@@ -16,6 +16,7 @@ from urllib.request import Request, urlopen
 from rich.progress import (
     BarColumn,
     Progress,
+    TaskID,
     TextColumn,
     TimeRemainingColumn,
 )
@@ -314,9 +315,10 @@ class WGameManager:
         )
         prepared = None
         if not (tier == "hd" and hd_in_base):
-            packs = self.get_bundle_config().get("resourcePacks")
+            bundle = self.get_bundle_config()
+            packs = bundle.get("resourcePacks")
             if isinstance(packs, dict) and tier in packs:
-                prepared = self._prepare_resource_tier(tier)
+                prepared = self._prepare_resource_tier(tier, bundle=bundle)
             else:
                 logger.warning(f"渠道未提供 {tier.upper()} 档位清单，本次只校验公共资源")
         if prepared:
@@ -336,6 +338,8 @@ class WGameManager:
         self._read_resource_state()
 
         tasks = []
+        tier_tasks: List[dict] = []
+        tier_cache: Optional[MD5Cache] = None
 
         logger.info("正在校验文件 (可能需要几分钟)...")
 
@@ -397,8 +401,18 @@ class WGameManager:
                     progress.update(verify_task, description=f"[cyan]校验中: {file_name}[/cyan]")
                     progress.advance(verify_task)
 
+            # 画质档位单独一条进度：首次校验要算几十 GB 的哈希，否则看起来像卡住。
+            if prepared:
+                tier_cache = MD5Cache(self._managed_path(f"wwm_md5_cache_resource_{tier}.json"), self.game_folder)
+                tier_task = progress.add_task(
+                    f"[cyan]校验 {tier.upper()} 画质档位...", total=len(prepared["resources"])
+                )
+                tier_tasks = self._resource_download_tasks(
+                    tier, prepared, force_check_md5, cache=tier_cache, progress=progress, task_id=tier_task
+                )
+                tier_cache.save()
+
         # 组合安装在写入基础资源前检查公共文件与所选档位的合计需求。
-        tier_tasks = self._resource_download_tasks(tier, prepared, force_check_md5) if prepared else []
         self._check_download_space(tasks + tier_tasks, force_space)
         if tasks:
             for pack in ("common", "hd") if tier == "hd" else ("common",):
@@ -420,7 +434,9 @@ class WGameManager:
         self.md5_cache.save()
         if prepared:
             try:
-                self._install_resource_tier(tier, prepared, force_check_md5, force_space=force_space)
+                self._install_resource_tier(
+                    tier, prepared, force_check_md5, force_space=force_space, cache=tier_cache, tasks=tier_tasks
+                )
             except NetworkError as e:
                 raise NetworkError(f"组合安装未完成，请重跑原 download/sync 命令续传: {e}") from e
         if tier == "hd" and hd_in_base:
@@ -697,6 +713,8 @@ class WGameManager:
         force_check_md5: bool = False,
         *,
         cache: Optional[MD5Cache] = None,
+        progress: Optional[Progress] = None,
+        task_id: Optional[TaskID] = None,
     ) -> List[dict]:
         if cache is None:
             cache = MD5Cache(self._managed_path(f"wwm_md5_cache_resource_{tier}.json"), self.game_folder)
@@ -716,6 +734,8 @@ class WGameManager:
                         "md5": item["md5"],
                     }
                 )
+            if progress is not None and task_id is not None:
+                progress.update(task_id, advance=1, description=f"[cyan]校验 {tier.upper()}: {path.name}[/cyan]")
         return tasks
 
     def _tier_is_current(self, tier: str, version: str) -> bool:
@@ -810,14 +830,18 @@ class WGameManager:
         force_check_md5: bool = False,
         *,
         force_space: bool = False,
+        cache: Optional[MD5Cache] = None,
+        tasks: Optional[List[dict]] = None,
     ) -> None:
         bundle, version = prepared["bundle"], prepared["version"]
         resources = prepared["resources"]
         cfg = self._read_local_config()
         cache_path = self._managed_path(f"wwm_md5_cache_resource_{tier}.json")
-        cache = MD5Cache(cache_path, self.game_folder)
-        logger.info(f"正在校验 {tier.upper()} v{version}: {len(resources)} 个文件")
-        tasks = self._resource_download_tasks(tier, prepared, force_check_md5, cache=cache)
+        if cache is None:
+            cache = MD5Cache(cache_path, self.game_folder)
+        if tasks is None:
+            logger.info(f"正在校验 {tier.upper()} v{version}: {len(resources)} 个文件")
+            tasks = self._resource_download_tasks(tier, prepared, force_check_md5, cache=cache)
         self._check_download_space(tasks, force_space)
         self.game_folder.mkdir(parents=True, exist_ok=True)
         if tasks:
