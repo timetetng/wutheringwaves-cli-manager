@@ -306,7 +306,19 @@ class WGameManager:
         res_base = default_info.get("resourcesBasePath") or default_info.get("baseUrl")
         if not res_base:
             raise WWError("无法获取资源路径配置 (resourcesBasePath 和 baseUrl 均为空)")
-        prepared = self._prepare_resource_tier(tier) if tier != "hd" else None
+        # 3.8 起 HD 走独立 resourcePacks.hd，老 index 才并进全量清单。
+        hd_in_base = any(
+            tuple(p.lower() for p in Path(str(item.get("dest", ""))).parts[:3]) == ("client", "content", "hd")
+            for item in (self.game_index.get("resource") or [])
+            if isinstance(item, dict)
+        )
+        prepared = None
+        if not (tier == "hd" and hd_in_base):
+            packs = self.get_bundle_config().get("resourcePacks")
+            if isinstance(packs, dict) and tier in packs:
+                prepared = self._prepare_resource_tier(tier)
+            else:
+                logger.warning(f"渠道未提供 {tier.upper()} 档位清单，本次只校验公共资源")
         if prepared:
             common = prepared["bundle"]["resourcePacks"].get("common", {})
             version = default_info["version"]
@@ -411,10 +423,8 @@ class WGameManager:
                 self._install_resource_tier(tier, prepared, force_check_md5, force_space=force_space)
             except NetworkError as e:
                 raise NetworkError(f"组合安装未完成，请重跑原 download/sync 命令续传: {e}") from e
-        if tier == "hd" and any(
-            tuple(p.lower() for p in Path(item["dest"]).parts[:3]) == ("client", "content", "hd") for item in res_list
-        ):
-            # HD 已包含在渠道全量清单中，无需再拉取独立画质配置。
+        if tier == "hd" and hd_in_base:
+            # 老结构：HD 已包含在渠道全量清单中，无需再拉取独立画质配置。
             self._register_installed_tier(
                 tier, default_info["version"], {"bundles": {"HD": {"resourcePacks": ["common", "hd"]}}}
             )
@@ -425,7 +435,7 @@ class WGameManager:
 
         # Issue #19: 清理已从 manifest 移除的旧文件（如升级后残留的旧 pak）。
         # UE 会挂载 Paks 目录下所有 .pak，过期文件会覆盖新文件导致启动失败。
-        self._cleanup_stale_files(res_list, tier=tier)
+        self._cleanup_stale_files(res_list)
 
     def _base_manifest(self, resources: Any, tier: str) -> List[dict]:
         """保留当前渠道的公共文件；非 HD 安装不带入全量清单中的 HD。"""
@@ -946,16 +956,11 @@ class WGameManager:
                 "请用 ww resource 查看，ww resource <tier> 校验修复"
             )
 
-    def _cleanup_stale_files(self, res_list, tier: str = "hd") -> None:
-        """删除磁盘上已从当前 manifest 移除的旧文件（Issue #19）。
+    def _cleanup_stale_files(self, res_list) -> None:
+        """删除本工具管理过、但已不在当前 manifest 中的旧文件（Issue #19）。
 
-        只清理「本工具曾管理过、现已废弃」的文件：
-        - 判据 = 文件在 md5 缓存中有记录（说明曾由本工具校验/下载），
-          且不在当前 manifest 中；
-        - 扫描范围 = manifest 声明过的顶层资源目录（如 Client/、Engine/），
-          跳过 `Saved/` 子目录（玩家截图/存档/运行时语音视频资源由游戏自身管理）。
-
-        绝不删除用户自行放置的文件：不在 md5 缓存中的文件一律保留。
+        跳过 `Saved/` 和 `Client/Content/{SD,HD,UHD}`：档位包由档位清单管理，
+        公共清单不会列出。不在 md5 缓存中的文件一律保留。
         """
         # 1) 当前 manifest 声明的全部相对路径（POSIX 风格）
         expected_dests = set()
@@ -979,16 +984,11 @@ class WGameManager:
             if not scan_root.is_dir():
                 continue
             for dirpath, dirnames, filenames in os.walk(scan_root):
-                # 跳过隐藏目录与 Saved/ 目录（玩家截图/存档/运行时资源由游戏自身管理）
+                # 跳过隐藏目录、Saved/（存档与运行时资源）与画质档位目录。
                 dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != "Saved"]
                 relative = Path(dirpath).relative_to(self.game_folder)
                 if tuple(p.lower() for p in relative.parts) == ("client", "content"):
-                    # 未选中的画质包仍属于有效安装，不能当作过期公共文件清理。
-                    dirnames[:] = [
-                        d
-                        for d in dirnames
-                        if d.lower() not in self.RESOURCE_TIERS or (tier == "hd" and d.lower() == "hd")
-                    ]
+                    dirnames[:] = [d for d in dirnames if d.lower() not in self.RESOURCE_TIERS]
                 for name in filenames:
                     if name.startswith(".") or name.endswith((".temp", ".bak", ".tmp")):
                         continue
@@ -996,8 +996,7 @@ class WGameManager:
                     rel_str = full.relative_to(self.game_folder).as_posix()
                     if rel_str in expected_dests:
                         continue
-                    # 只清理本工具曾管理过的文件（md5 缓存有记录），
-                    # 不在缓存中的文件（运行时资源/用户文件）直接跳过
+                    # 只清理本工具校验/下载过的文件。
                     if rel_str in self.md5_cache.cache:
                         removed.append((full, rel_str))
 
@@ -1010,6 +1009,8 @@ class WGameManager:
                 logger.warning(f"清理旧文件失败 {rel_str}: {e}")
         if removed:
             logger.info(f"清理完成: 共删除 {len(removed)} 个已废弃文件")
+            # clear() 只改内存，不落盘会让下次清理再命中。
+            self.md5_cache.save()
 
     def download_full(self, tier: str = "hd", force_space: bool = False):
         """按显式档位初始化，成功后记住选择供后续同步使用。"""

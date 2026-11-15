@@ -754,6 +754,35 @@ class ResourceTierTests(unittest.TestCase):
         self.manager.sync_files()
         self.assertEqual(hd.read_bytes(), GOOD)
 
+    def prepare_split_hd_sync(self):
+        """3.8 结构的清单：渠道全量清单不含 HD，HD 走独立 resourcePacks.hd。"""
+        self.manager._launcher_info = {"default": {"version": "3.8.0", "resourcesBasePath": "channel"}}
+        self.manager._cdn_node = self.url
+        self.manager._game_index = {"resource": [item("Client/Content/Paks/common.pak")]}
+        self.bundle["resourcePacks"]["common"] = {"version": "3.8.0"}
+        self.bundle["resourcePacks"]["hd"] = {"version": "3.8.0", "baseUrl": "files", "indexFile": "manifest.json"}
+        self.bundle["bundles"]["HD"] = {"resourcePacks": ["common", "hd"]}
+
+    def test_sync_keeps_tier_paks_absent_from_channel_manifest(self):
+        # 3.8 清单不含 Client/Content/HD/*；旧实现会把缓存里登记过的 HD 包当废弃文件删掉。
+        self.prepare_split_hd_sync()
+        self.put("Client/Content/Paks/common.pak", GOOD)
+        hd = self.put("Client/Content/HD/pakchunk101-HD-WindowsNoEditor.pak", GOOD)
+        self.manager.md5_cache.get(hd)
+        self.manager.md5_cache.save()
+        self.server.resources = [item("Client/Content/HD/pakchunk101-HD-WindowsNoEditor.pak")]
+        self.manager.sync_files(tier="hd")
+        self.assertEqual(hd.read_bytes(), GOOD)
+
+    def test_sync_repairs_missing_tier_files(self):
+        # sync 不再整体跳过 hd 档位。
+        self.prepare_split_hd_sync()
+        self.put("Client/Content/Paks/common.pak", GOOD)
+        dest = "Client/Content/HD/test.pak"
+        self.server.resources = [item(dest)]
+        self.manager.sync_files(tier="hd")
+        self.assertEqual((self.root / dest).read_bytes(), GOOD)
+
     def test_sync_repairs_corrupt_file_by_chunk(self):
         # 已装好的公共文件坏了一个分块：ww sync 只重取该分块，不整文件重下。
         self.prepare_full_download()

@@ -143,7 +143,9 @@ class DownloadPathTests(unittest.TestCase):
         intact.parent.mkdir(parents=True, exist_ok=True)
         intact.write_bytes(SMALL)
 
-        manager.sync_files(tier="hd")
+        # 下面只测公共资源，不让 hd 档位清单去联网。
+        with patch.object(manager, "get_bundle_config", return_value={"resourcePacks": {}, "cdnList": []}):
+            manager.sync_files(tier="hd")
 
         self.assertEqual((self.game / pak).read_bytes(), BIG)
         self.assertEqual(intact.read_bytes(), SMALL)
@@ -158,8 +160,9 @@ class DownloadPathTests(unittest.TestCase):
         self.server.files = {f"files/{pak}": BIG}
         manager = self._manager()
         manager._game_index = {"resource": [{"dest": pak, "size": len(BIG), "md5": "0" * 32}]}
-        with self.assertRaises(Exception):
-            manager.sync_files(tier="hd")
+        with patch.object(manager, "get_bundle_config", return_value={"resourcePacks": {}, "cdnList": []}):
+            with self.assertRaises(Exception):
+                manager.sync_files(tier="hd")
         self.assertFalse((self.game / pak).exists(), "MD5 不符不得落正式文件")
 
     # --- 资源档位下载：ww resource sd/hd/uhd ---
