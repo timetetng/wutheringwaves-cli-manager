@@ -306,16 +306,30 @@ class ResourceUpdateTests(unittest.TestCase):
         self.assertTrue(self.updater.download())
         self.assertTrue(self.updater.apply())
 
+    def test_apply_reports_one_combined_summary(self):
+        self.choose("uhd")
+        self.assertTrue(self.owner.download_incremental(config_url="local-fixture"))
+        with self.assertLogs("WW_Manager", level="INFO") as logs:
+            self.assertTrue(self.owner.apply_incremental())
+        text = "\n".join(logs.output)
+        self.assertEqual(text.count("开始合并"), 2)  # 每个包各一次
+        self.assertEqual(text.count("common + uhd 增量完成"), 1)
+        self.assertIn("无差分合并组", text)
+        self.assertIn("迁移 更新=2", text)
+        self.assertEqual(text.count("增量更新应用完成"), 1)
+        self.assertNotIn("已保存索引到缓存", text)
+        self.assertNotIn("正在保存索引", text)
+
     def test_second_pack_failure_resumes_without_reapplying_common(self):
         self.assertTrue(self.updater.download())
-        original = PackIncrementalManager.apply_incremental
+        original = PackIncrementalManager.apply_into
         calls = []
 
-        def fail_tier(engine):
+        def fail_tier(engine, progress, stats, label=None):
             calls.append(engine.pack_name)
-            return original(engine) if engine.pack_name == "common" else False
+            return original(engine, progress, stats, label=label) if engine.pack_name == "common" else False
 
-        with patch.object(PackIncrementalManager, "apply_incremental", autospec=True, side_effect=fail_tier):
+        with patch.object(PackIncrementalManager, "apply_into", autospec=True, side_effect=fail_tier):
             with self.assertRaisesRegex(WWError, "主版本未升级"):
                 self.updater.apply()
         self.assertEqual(calls, ["common", "uhd"])

@@ -215,6 +215,68 @@ def _backup_path(path: Path) -> Path:
     return path.with_suffix(path.suffix + ".bak")
 
 
+class ApplyStats:
+    """一次 apply 的合并统计。多个包共用一份，结束时只输出一次。"""
+
+    def __init__(self) -> None:
+        self.packs: List[str] = []
+        self.groups = 0
+        self.success = 0
+        self.skipped = 0
+        self.failed = 0
+        self.failed_groups: List[str] = []
+        self.moved = 0
+        self.reused = 0
+        self._started = time.monotonic()
+
+    def add(self, label: Optional[str], results: Dict[str, str]) -> None:
+        if label and label not in self.packs:
+            self.packs.append(label)
+        self.groups += len(results)
+        self.success += sum(1 for r in results.values() if r == "success")
+        self.skipped += sum(1 for r in results.values() if r == "skipped")
+        failed = [dest for dest, r in results.items() if r in ("failed", "partial_failed")]
+        self.failed += len(failed)
+        self.failed_groups += [f"{label}:{dest}" if label else dest for dest in failed]
+
+    @property
+    def elapsed(self) -> float:
+        return time.monotonic() - self._started
+
+    def describe(self) -> str:
+        scope = " + ".join(self.packs) if self.packs else "增量包"
+        if self.groups:
+            merged = f"合并 成功={self.success} 跳过={self.skipped} 失败={self.failed}（{self.groups} 组）"
+        else:
+            merged = "无差分合并组"
+        migrated = f"迁移 更新={self.moved} 已是目标版本={self.reused}"
+        return f"{scope} 增量完成: {merged}；{migrated}（用时 {self.elapsed:.1f}s）"
+
+
+def report_apply(stats: ApplyStats) -> None:
+    """整次 apply 只打印一份统计；common 与画质包合并计数。"""
+    logger.info(stats.describe())
+    if stats.failed:
+        logger.warning(f"失败组: {stats.failed_groups}")
+        logger.warning(f"有 {stats.failed} 个增量包应用存在失败。请运行 'ww sync' 修复。")
+        return
+    logger.info("增量更新应用完成。建议运行 'ww sync --new' 做最终校验。")
+
+
+def create_apply_progress() -> Progress:
+    """apply 阶段的统一进度条；多个包共用同一个实例。"""
+    return Progress(
+        ApplySpinnerColumn("dots"),
+        TextColumn("{task.description}"),
+        ApplyRainbowBarColumn(bar_width=40),
+        ApplyPercentageColumn(),
+        ApplyCountColumn(),
+        TimeElapsedColumn(),
+        transient=False,
+        expand=True,
+    )
+
+
 def _format_progress_log(level: str, msg: str) -> str:
     """生成 Rich Progress 中手动输出日志的统一格式。"""
     return f"{time.strftime('%H:%M:%S')} [{level}] {msg}"
@@ -942,8 +1004,22 @@ class IncrementalManager:
 
         return success
 
-    def _apply_staged_complete_files(self, download_dir: Path) -> bool:
-        """将下载阶段缓存的完整资源文件迁移到游戏目录"""
+    def _apply_staged_complete_files(
+        self,
+        download_dir: Path,
+        *,
+        progress: Optional[Progress] = None,
+        stats: Optional["ApplyStats"] = None,
+        label: Optional[str] = None,
+    ) -> bool:
+        """将下载阶段缓存的完整资源文件迁移到游戏目录；传入 progress 时并入同一个进度条。"""
+        if progress is None:
+            with create_apply_progress() as own_progress:
+                return self._apply_staged_complete_files(
+                    download_dir, progress=own_progress, stats=stats or ApplyStats(), label=label
+                )
+        stats = stats or ApplyStats()
+        tag = f"[{label}] " if label else ""
         resources = (self.index_file or {}).get("resource", [])
         complete_files = [r for r in resources if not _is_diff_resource(r["dest"])]
         if not complete_files:
@@ -953,22 +1029,13 @@ class IncrementalManager:
         skipped_count = 0
         failed = []
 
-        logger.info(f"开始迁移并校验完整资源文件: 共 {len(complete_files)} 个")
-        progress = Progress(
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(bar_width=40),
-            "[progress.percentage]{task.percentage:>3.1f}%",
-            TextColumn("({task.completed}/{task.total})"),
-            TimeElapsedColumn(),
-            transient=False,
-        )
+        logger.info(f"{tag}开始迁移并校验完整资源文件: 共 {len(complete_files)} 个")
+        task_id = progress.add_task(f"[bold cyan]{tag}迁移完整资源", total=len(complete_files))
 
-        with progress:
-            task_id = progress.add_task("[bold cyan]迁移完整资源", total=len(complete_files))
-
+        try:
             for item in complete_files:
                 dest = item["dest"]
-                progress.update(task_id, description=f"[bold cyan]迁移完整资源: {Path(dest).name[:60]}")
+                progress.update(task_id, description=f"[bold cyan]{tag}迁移完整资源: {Path(dest).name[:60]}")
 
                 expected_size = int(item["size"])
                 expected_md5 = item["md5"]
@@ -995,12 +1062,16 @@ class IncrementalManager:
                     failed.append(dest)
                 finally:
                     progress.advance(task_id)
+        finally:
+            progress.remove_task(task_id)
 
         if failed:
-            logger.error(f"完整文件迁移失败: {failed}")
+            logger.error(f"{tag}完整文件迁移失败: {failed}")
             return False
 
-        logger.info(f"完整文件迁移完成: 更新={moved_count}, 已是目标版本={skipped_count}")
+        stats.moved += moved_count
+        stats.reused += skipped_count
+        logger.debug(f"{tag}完整文件迁移完成: 更新={moved_count}, 已是目标版本={skipped_count}")
         return True
 
     def _apply_delete_files(self, delete_files: List[str]) -> int:
@@ -1036,8 +1107,22 @@ class IncrementalManager:
             logger.warning(f"{failed} 个废弃补丁删除失败")
         return removed
 
-    def _apply_staged_patch_files(self, download_dir: Path) -> bool:
-        """将已校验的增量输出文件统一迁移到游戏目录"""
+    def _apply_staged_patch_files(
+        self,
+        download_dir: Path,
+        *,
+        progress: Optional[Progress] = None,
+        stats: Optional["ApplyStats"] = None,
+        label: Optional[str] = None,
+    ) -> bool:
+        """将已校验的增量输出文件统一迁移到游戏目录；传入 progress 时并入同一个进度条。"""
+        if progress is None:
+            with create_apply_progress() as own_progress:
+                return self._apply_staged_patch_files(
+                    download_dir, progress=own_progress, stats=stats or ApplyStats(), label=label
+                )
+        stats = stats or ApplyStats()
+        tag = f"[{label}] " if label else ""
         resources = (self.index_file or {}).get("resource", [])
         complete_dests = {r["dest"] for r in resources if r.get("dest") and not _is_diff_resource(r["dest"])}
 
@@ -1055,25 +1140,16 @@ class IncrementalManager:
         failed = []
 
         if not patch_targets:
-            logger.info("没有需要迁移的增量输出文件")
+            logger.info(f"{tag}没有需要迁移的增量输出文件")
             return True
 
-        logger.info(f"开始覆盖并校验增量输出文件: 共 {len(patch_targets)} 个")
-        progress = Progress(
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(bar_width=40),
-            "[progress.percentage]{task.percentage:>3.1f}%",
-            TextColumn("({task.completed}/{task.total})"),
-            TimeElapsedColumn(),
-            transient=False,
-        )
+        logger.info(f"{tag}开始覆盖并校验增量输出文件: 共 {len(patch_targets)} 个")
+        task_id = progress.add_task(f"[bold cyan]{tag}覆盖并校验增量输出", total=len(patch_targets))
 
-        with progress:
-            task_id = progress.add_task("[bold cyan]覆盖并校验增量输出", total=len(patch_targets))
-
+        try:
             for dst_info in patch_targets:
                 dest = dst_info["dest"]
-                progress.update(task_id, description=f"[bold cyan]覆盖/校验: {Path(dest).name[:60]}")
+                progress.update(task_id, description=f"[bold cyan]{tag}覆盖/校验: {Path(dest).name[:60]}")
 
                 expected_size = int(dst_info["size"])
                 expected_md5 = dst_info["md5"]
@@ -1111,44 +1187,61 @@ class IncrementalManager:
                     failed.append(dest)
                 finally:
                     progress.advance(task_id)
+        finally:
+            progress.remove_task(task_id)
 
         if failed:
-            logger.error(f"增量输出迁移失败: {failed}")
+            logger.error(f"{tag}增量输出迁移失败: {failed}")
             return False
 
-        logger.info(f"增量输出迁移完成: 更新={moved_count}, 已是目标版本={skipped_count}")
+        stats.moved += moved_count
+        stats.reused += skipped_count
+        logger.debug(f"{tag}增量输出迁移完成: 更新={moved_count}, 已是目标版本={skipped_count}")
         return True
 
     def apply_incremental(self) -> bool:
-        """应用已下载的增量更新包"""
-        logger.info("正在准备应用增量更新...")
+        """应用已下载的增量更新包；单包入口，自带进度条与一份统计。"""
+        stats = ApplyStats()
+        progress = create_apply_progress()
+        with progress:
+            ok = self.apply_into(progress, stats)
+        report_apply(stats)
+        return ok
+
+    def apply_into(
+        self, progress: Progress, stats: "ApplyStats", label: Optional[str] = None
+    ) -> bool:
+        """把本包的合并与应用并入调用方的进度条；统计累加进 stats，不在内部输出。"""
+        tag = f"[{label}] " if label else ""
+        for info in ("正在准备应用增量更新...",):
+            logger.info(f"{tag}{info}")
         download_dir = self.download_dir
         version_file = download_dir / "version_info.json"
 
         if not download_dir.exists() or not version_file.exists():
-            logger.error("未找到增量更新包，请先执行 'ww incremental' 下载")
+            logger.error(f"{tag}未找到增量更新包，请先执行 'ww incremental' 下载")
             return False
 
         try:
             version_info = json.loads(version_file.read_text())
         except Exception:
-            logger.error("增量更新版本信息损坏")
+            logger.error(f"{tag}增量更新版本信息损坏")
             return False
 
         if version_info.get("server") != self.server_type:
-            logger.error(f"服务器不匹配: 预期 {version_info.get('server')}, 实际 {self.server_type}")
+            logger.error(f"{tag}服务器不匹配: 预期 {version_info.get('server')}, 实际 {self.server_type}")
             return False
 
-        logger.info(f"开始应用增量更新: {version_info.get('from_version')} -> {version_info.get('to_version')}")
+        logger.info(f"{tag}开始应用增量更新: {version_info.get('from_version')} -> {version_info.get('to_version')}")
         index_file = download_dir / "indexFile.json"
         if not index_file.exists():
-            logger.error("无法找到 indexFile.json")
+            logger.error(f"{tag}无法找到 indexFile.json")
             return False
 
         try:
             self._index_file = json.loads(index_file.read_text())
         except Exception:
-            logger.error("无法解析 indexFile.json")
+            logger.error(f"{tag}无法解析 indexFile.json")
             return False
 
         group_infos = self.get_group_infos()
@@ -1156,14 +1249,14 @@ class IncrementalManager:
             is_ok, error_msg = check_hpatchz_requirements()
             if not is_ok:
                 raise IncrementalError(error_msg)
-            logger.info("正在准备 hpatchz 工具...")
+            logger.info(f"{tag}正在准备 hpatchz 工具...")
             self.hpatchz_path = get_hpatchz_path(self.cache_dir)
 
         max_workers = max(1, min(4, len(group_infos)))
         # 大文件优先：按 group 总大小降序排列，让最大的先启动
         group_infos = sorted(group_infos, key=lambda g: self._get_group_size(g), reverse=True)
         logger.info(
-            f"开始合并 {len(group_infos)} 个增量包，并发 {max_workers} 个部分大文件可能耗时数分钟，请勿中断进程。"
+            f"{tag}开始合并 {len(group_infos)} 个增量包，并发 {max_workers} 个；部分大文件可能耗时数分钟，请勿中断进程。"
         )
 
         results = {}
@@ -1224,116 +1317,92 @@ class IncrementalManager:
             finally:
                 emit("finish")
 
-        progress = Progress(
-            ApplySpinnerColumn("dots"),
-            TextColumn("{task.description}"),
-            ApplyRainbowBarColumn(bar_width=40),
-            ApplyPercentageColumn(),
-            ApplyCountColumn(),
-            TimeElapsedColumn(),
-            transient=False,
-            expand=True,
-        )
+        task_id = progress.add_task(f"{tag}[bold cyan]应用增量包", total=len(group_infos), kind="overall")
+        active_tasks = {}
 
-        with progress:
-            task_id = progress.add_task("[bold cyan]应用增量包", total=len(group_infos), kind="overall")
-            active_tasks = {}
+        _child_color_counter = 0
+        _child_color_map: dict = {}
 
-            _child_color_counter = 0
-            _child_color_map: dict = {}
+        def drain_status_events():
+            nonlocal _child_color_counter
+            while True:
+                try:
+                    kind, event_target, msg = status_events.get_nowait()
+                except Empty:
+                    break
 
-            def drain_status_events():
-                nonlocal _child_color_counter
-                while True:
-                    try:
-                        kind, event_target, msg = status_events.get_nowait()
-                    except Empty:
-                        break
+                if kind in ("start", "status"):
+                    child_task_id = active_tasks.get(event_target)
+                    if child_task_id is None:
+                        c = group_color(_child_color_counter)
+                        _child_color_map[event_target] = _child_color_counter
+                        _child_color_counter += 1
+                        description = group_description(event_target, msg, color=c)
+                        active_tasks[event_target] = progress.add_task(description, total=None, kind="group")
+                    else:
+                        idx = _child_color_map.get(event_target, 0)
+                        description = group_description(event_target, msg, color=group_color(idx))
+                        progress.update(child_task_id, description=description)
+                elif kind == "log":
+                    _emit_progress_log(progress, event_target, msg)
+                elif kind == "finish":
+                    child_task_id = active_tasks.pop(event_target, None)
+                    _child_color_map.pop(event_target, None)
+                    if child_task_id is not None:
+                        progress.remove_task(child_task_id)
 
-                    if kind in ("start", "status"):
-                        child_task_id = active_tasks.get(event_target)
-                        if child_task_id is None:
-                            c = group_color(_child_color_counter)
-                            _child_color_map[event_target] = _child_color_counter
-                            _child_color_counter += 1
-                            description = group_description(event_target, msg, color=c)
-                            active_tasks[event_target] = progress.add_task(description, total=None, kind="group")
-                        else:
-                            idx = _child_color_map.get(event_target, 0)
-                            description = group_description(event_target, msg, color=group_color(idx))
-                            progress.update(child_task_id, description=description)
-                    elif kind == "log":
-                        _emit_progress_log(progress, event_target, msg)
-                    elif kind == "finish":
-                        child_task_id = active_tasks.pop(event_target, None)
-                        _child_color_map.pop(event_target, None)
-                        if child_task_id is not None:
-                            progress.remove_task(child_task_id)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            pending = {executor.submit(apply_wrapper, group): group for group in group_infos}
+            while pending:
+                done, pending_futures = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                pending = pending_futures
+                drain_status_events()
 
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                pending = {executor.submit(apply_wrapper, group): group for group in group_infos}
-                while pending:
-                    done, pending_futures = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
-                    pending = pending_futures
-                    drain_status_events()
+                for future in done:
+                    dest, result = future.result()
+                    results[dest] = result
+                    progress.update(task_id, advance=1)
 
-                    for future in done:
-                        dest, result = future.result()
-                        results[dest] = result
-                        progress.update(task_id, advance=1)
+                drain_status_events()
 
-                    drain_status_events()
+        # 兜底清理仍显示的子任务，避免异常路径残留。
+        for child_task_id in list(active_tasks.values()):
+            progress.remove_task(child_task_id)
+        progress.remove_task(task_id)
 
-            # 兜底清理仍显示的子任务，避免异常路径残留。
-            for child_task_id in list(active_tasks.values()):
-                progress.remove_task(child_task_id)
-
-        success_count = sum(1 for r in results.values() if r == "success")
-        skip_count = sum(1 for r in results.values() if r == "skipped")
-        fail_count = sum(1 for r in results.values() if r in ("failed", "partial_failed"))
-        failed_groups = [dest for dest, r in results.items() if r in ("failed", "partial_failed")]
-
-        logger.info(
-            f"增量包合并阶段完成: 成功={success_count}, 跳过={skip_count}, "
-            f"失败={fail_count}。接下来将覆盖并校验游戏目录文件。"
-        )
-
-        if fail_count > 0:
-            logger.warning(f"失败组: {failed_groups}")
-            logger.warning(f"有 {fail_count} 个增量包应用存在失败。请运行 'ww sync' 修复。")
+        stats.add(label, results)
+        if stats.failed and any(r in ("failed", "partial_failed") for r in results.values()):
             return False
 
-        if not self._apply_staged_patch_files(download_dir):
-            logger.warning("增量输出迁移失败，请运行 'ww sync' 修复。")
+        if not self._apply_staged_patch_files(download_dir, progress=progress, stats=stats, label=label):
+            logger.warning(f"{tag}增量输出迁移失败，请运行 'ww sync' 修复。")
             return False
 
-        if not self._apply_staged_complete_files(download_dir):
-            logger.warning("完整文件迁移失败，请运行 'ww sync' 修复。")
+        if not self._apply_staged_complete_files(download_dir, progress=progress, stats=stats, label=label):
+            logger.warning(f"{tag}完整文件迁移失败，请运行 'ww sync' 修复。")
             return False
 
         delete_files = (self.index_file or {}).get("deleteFiles", [])
         if delete_files:
             self._apply_delete_files(delete_files)
 
-        logger.info("正在保存索引并清理临时目录...")
+        logger.debug(f"{tag}正在保存索引并清理临时目录...")
         saved_index = self.cache_dir / "indexFile.json"
         if index_file.exists():
             shutil.copy2(index_file, saved_index)
-            logger.info("已保存索引到缓存")
+            logger.debug(f"{tag}已保存索引到缓存")
 
         # 先提交分包断点；登记失败时保留下载目录，允许继续校验和应用。
         self._update_local_version(version_info.get("to_version"))
         try:
             shutil.rmtree(download_dir)
-            logger.info("已清理增量下载目录")
+            logger.debug(f"{tag}已清理增量下载目录")
         except OSError as e:
             # 已完成迁移和版本登记；仅临时清理失败不应伪装成更新失败。
-            logger.warning(f"增量更新已完成，但临时下载目录清理失败: {e}")
+            logger.warning(f"{tag}增量更新已完成，但临时下载目录清理失败: {e}")
 
         self._cleanup_cache_dir()
-        logger.info("已清理缓存临时目录")
-
-        logger.info("增量更新应用完成。建议运行 'ww sync --new' 做最终校验。")
+        logger.debug(f"{tag}已清理缓存临时目录")
 
         return True
 
