@@ -1,7 +1,7 @@
 <div align="center">
   <h1>WutheringWaves CLI Manager</h1>
   <h3>Command-line manager for Wuthering Waves</h3>
-  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.4.0-brightgreen.svg" alt="version 2.4.0">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.9%2B-blue.svg" alt="Python 3.9+"></a>&nbsp;<a href="https://github.com/astral-sh/uv"><img src="https://img.shields.io/badge/Tool-uv-purple.svg" alt="uv"></a>&nbsp;<img src="https://img.shields.io/badge/Version-2.4.1-brightgreen.svg" alt="version 2.4.1">
 </div>
 
 <p align="center">
@@ -121,11 +121,13 @@ For Linux launch instructions and troubleshooting, see the [Linux guide](linux.m
 | `ww status` | Show game and tool status |
 | `ww predownload` | Download an incremental update |
 | `ww predownload --apply` | Apply a downloaded incremental update |
-| `ww sync` | Verify and repair files |
+| `ww sync` | Verify and repair launcher files and the current quality tier |
 | `ww log` | Get the gacha history link |
 | `ww update` | Update the tool |
 
 On Linux x86_64 incremental updates use a native applier, [krpatch](native/krpatch/README.md). It reads the old files in place and needs no wine + `hpatchz.exe`: the binary is downloaded and sha256-verified on first use, and every output is checked against the official manifest's md5. It falls back to wine automatically when unavailable.
+
+`ww sync` checks the launcher manifest plus the current tier's `resourcePacks.<tier>` manifest, so both launcher files and quality packs are verified and missing files are fetched; use `ww resource <tier>` to repair a single tier.
 
 `download`, `resource`, and `checkout` open menus when called without arguments. You can also specify arguments directly:
 
