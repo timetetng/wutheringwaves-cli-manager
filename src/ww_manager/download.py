@@ -87,6 +87,11 @@ def _exit_download() -> None:
         _active_downloads -= 1
 
 
+def download_cancelled() -> bool:
+    """供分块修复等外部循环复用的取消标志。"""
+    return _cancel_event.is_set()
+
+
 def cancel_downloads() -> None:
     """请求中止所有进行中的下载；已下载的块会写入续传状态。"""
     _cancel_event.set()
@@ -396,6 +401,7 @@ def download_single_file(
     overall_task_id: Optional[TaskID] = None,
     resume_support: bool = True,
     expected_md5: Optional[str] = None,
+    chunk_infos: Optional[List[dict]] = None,
 ) -> bool:
     """
     下载单个文件，支持断点续传和进度显示
@@ -411,6 +417,7 @@ def download_single_file(
         overall_task_id: 总任务ID（用于更新总进度）
         resume_support: 是否支持断点续传
         expected_md5: 可选的清单 MD5，临时文件通过校验后才替换目标
+        chunk_infos: 可选的 chunkInfos；目标文件已存在但不合格时只重取坏块
 
     Returns:
         是否成功
@@ -467,6 +474,14 @@ def download_single_file(
         return digest.hexdigest() == expected_md5.lower()
 
     try:
+        # 目标已存在且已损坏时，按官方分块 md5 只重取坏块：丢一个 100 MiB 块不该重下整个补丁。
+        if chunk_infos and expected_size > 0 and dest.is_file() and not dest.is_symlink():
+            from .chunk_repair import repair_file
+
+            if repair_file(url, dest, chunk_infos, expected_md5, cancelled=download_cancelled):
+                update_progress(expected_size)
+                return True
+
         for attempt in range(3):
             try:
                 if dest.is_symlink() or temp_file.is_symlink():
@@ -562,7 +577,7 @@ def batch_download(
     并行下载任务列表
 
     Args:
-        tasks: [{"url": ..., "path": ..., "size": ...}, ...]
+        tasks: [{"url": ..., "path": ..., "size": ..., "md5": ..., "chunkInfos": ...}, ...]
         progress: 可选的Progress实例
         max_workers: 最大线程数
 
@@ -593,6 +608,7 @@ def batch_download(
                     progress,
                     overall_task,
                     expected_md5=task.get("md5"),
+                    chunk_infos=task.get("chunkInfos"),
                 )
                 futures[future] = task.get("name", task["path"].name)
 
@@ -613,6 +629,7 @@ def batch_download(
 __all__ = [
     "create_download_progress",
     "cancel_downloads",
+    "download_cancelled",
     "download_single_file",
     "batch_download",
     "probe_range_support",

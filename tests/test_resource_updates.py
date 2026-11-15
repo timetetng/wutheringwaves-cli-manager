@@ -755,6 +755,84 @@ class ResourceUpdateTests(unittest.TestCase):
         self.put(".incremental_download/packs/uhd/uhd.krpdiff", diff)
         self.assertEqual(engine.pending_download_tasks(), [])
 
+    def test_corrupt_transport_repaired_by_chunk_instead_of_redownload(self):
+        # 传输包大小对、整包 md5 不符：有 chunkInfos 时先补坏块，不整包重下。
+        diff = bytes(range(256)) * 8
+        half = len(diff) // 2
+        digest = lambda data: hashlib.md5(data, usedforsecurity=False).hexdigest()  # noqa: E731
+        chunks = [
+            {"start": 0, "end": half - 1, "md5": digest(diff[:half])},
+            {"start": half, "end": len(diff) - 1, "md5": digest(diff[half:])},
+        ]
+        self.server.payloads["/files/uhd.krpdiff"] = diff
+        self.set_index(
+            "uhd",
+            {
+                "resource": [{"dest": "uhd.krpdiff", "size": len(diff), "md5": digest(diff), "chunkInfos": chunks}],
+                "groupInfos": [
+                    {
+                        "dest": "uhd.krpdiff",
+                        "srcFiles": [file_item(destination("uhd"), OLD)],
+                        "dstFiles": [file_item(destination("uhd"))],
+                    }
+                ],
+            },
+        )
+        staged = self.put(".incremental_download/packs/uhd/uhd.krpdiff", diff[:half] + b"\0" * (len(diff) - half))
+        self.server.requested.clear()
+        calls = []
+
+        def fake_repair(url, path, infos, expected_md5=None, **kwargs):
+            calls.append((url, len(infos), expected_md5))
+            path.write_bytes(diff)
+            return True
+
+        with patch("ww_manager.incremental._repair_file", side_effect=fake_repair):
+            self.assertTrue(self.updater.download())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], 2)
+        self.assertEqual(calls[0][2], digest(diff))
+        self.assertNotIn("/files/uhd.krpdiff", self.server.requested)
+        self.assertEqual(staged.read_bytes(), diff)
+
+    def test_check_downloaded_files_repairs_bad_transport_by_chunk(self):
+        # 应用前的缓存复核也走分块修复，不因一个坏块把用户挡去整包重下。
+        diff = bytes(range(256)) * 4
+        digest = lambda data: hashlib.md5(data, usedforsecurity=False).hexdigest()  # noqa: E731
+        half = len(diff) // 2
+        chunks = [
+            {"start": 0, "end": half - 1, "md5": digest(diff[:half])},
+            {"start": half, "end": len(diff) - 1, "md5": digest(diff[half:])},
+        ]
+        self.server.payloads["/files/uhd.krpdiff"] = diff
+        self.set_index(
+            "uhd",
+            {
+                "resource": [{"dest": "uhd.krpdiff", "size": len(diff), "md5": digest(diff), "chunkInfos": chunks}],
+                "groupInfos": [
+                    {
+                        "dest": "uhd.krpdiff",
+                        "srcFiles": [file_item(destination("uhd"), OLD)],
+                        "dstFiles": [file_item(destination("uhd"))],
+                    }
+                ],
+            },
+        )
+        plan = self.updater._create_plan(None)
+        engine = PackIncrementalManager(self.owner, "uhd", plan["packs"]["uhd"], plan)
+        staged = self.put(".incremental_download/packs/uhd/uhd.krpdiff", b"\0" * len(diff))
+        calls = []
+
+        def fake_repair(url, path, infos, expected_md5=None, **kwargs):
+            calls.append(len(infos))
+            path.write_bytes(diff)
+            return True
+
+        with patch("ww_manager.resource_updates._repair_file", side_effect=fake_repair):
+            engine.check_downloaded_files()
+        self.assertEqual(calls, [2])
+        self.assertEqual(staged.read_bytes(), diff)
+
     def test_apply_fallback_checks_space_and_force_can_resume(self):
         diff = b"patch-transport"
         self.server.payloads["/files/uhd.krpdiff"] = diff

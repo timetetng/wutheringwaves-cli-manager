@@ -754,6 +754,27 @@ class ResourceTierTests(unittest.TestCase):
         self.manager.sync_files()
         self.assertEqual(hd.read_bytes(), GOOD)
 
+    def test_sync_repairs_corrupt_file_by_chunk(self):
+        # 已装好的公共文件坏了一个分块：ww sync 只重取该分块，不整文件重下。
+        self.prepare_full_download()
+        self.manager.download_full("uhd")
+        target = "Client/Content/Paks/common.pak"
+        half = len(GOOD) // 2
+        chunks = [
+            {"start": 0, "end": half - 1, "md5": md5(GOOD[:half])},
+            {"start": half, "end": len(GOOD) - 1, "md5": md5(GOOD[half:])},
+        ]
+        self.manager._game_index = {"resource": [{**item(target), "chunkInfos": chunks}]}
+        bad = bytearray(GOOD)
+        bad[half] ^= 0xFF
+        self.put(target, bytes(bad))
+        self.manager.md5_cache.clear(self.root / target)
+        self.server.requests.clear()
+        self.manager.sync_files()
+        self.assertEqual((self.root / target).read_bytes(), GOOD)
+        ranges = [r for path, r in self.server.requests if r and path.endswith(target)]
+        self.assertEqual(ranges, [f"bytes={half}-{len(GOOD) - 1}"])
+
     def test_corrupt_base_same_size_is_repaired(self):
         self.prepare_full_download("hd")
         self.put("Client/Content/Paks/common.pak", b"x" * len(GOOD))

@@ -6,7 +6,9 @@ import logging
 import re
 from typing import Any, Dict, Optional
 
+from .chunk_repair import repair_file as _repair_file
 from .core import ConfigError, NetworkError, WGameManager, WWError
+from .download import download_cancelled
 from .incremental import (
     APPLY_MAX_WORKERS,
     ApplyStats,
@@ -165,11 +167,21 @@ class PackIncrementalManager(IncrementalManager):
             size, md5 = item["size"], item["md5"]
             if _is_diff_resource(dest):
                 candidates = [self.download_dir / _resource_rel_path(dest)]
+                url = self._build_krpdiff_url(dest)
             else:
                 candidates = [
                     self.game_folder / _resource_rel_path(dest),
                     self._get_staged_complete_path(self.download_dir, dest),
                 ]
+                url = self._build_resource_url(item, self._full_resource_base())
+            if not any(self._is_file_verified(p, size, md5) for p in candidates):
+                # 先按分块 md5 修坏块，不把用户挡去整包重下。
+                if item.get("chunkInfos") and url:
+                    for candidate in candidates:
+                        if candidate.is_file() and _repair_file(
+                            url, candidate, item["chunkInfos"], md5, cancelled=download_cancelled
+                        ):
+                            break
             if not any(self._is_file_verified(p, size, md5) for p in candidates):
                 raise ConfigError(f"{self.pack_name} 下载缓存缺失或损坏: {dest}；请重跑 ww incremental")
 

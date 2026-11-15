@@ -364,6 +364,9 @@ class WGameManager:
                         "size": expected_size,
                         "md5": expected_md5,
                     }
+                    # 官方给了 100 MiB 分块 md5 时，已存在的文件可以只补坏块。
+                    if item.get("chunkInfos") and dest_path.is_file():
+                        download_info["chunkInfos"] = item["chunkInfos"]
                 return download_info, dest_path.name
 
             # 开启多线程池并发校验（最大线程数设为 8，兼顾 SSD IO 性能和 CPU 负载）

@@ -42,6 +42,7 @@ from rich.progress import (
 )
 from rich.text import Text
 
+from ww_manager.chunk_repair import repair_file as _repair_file
 from ww_manager.download import (
     RAINBOW_COLORS,
     DownloadSpaceError,
@@ -50,6 +51,7 @@ from ww_manager.download import (
     cancel_downloads,
     check_space_requirement,
     create_download_progress,
+    download_cancelled,
     download_single_file,
 )
 
@@ -295,6 +297,22 @@ def _calculate_file_md5(file_path: Path) -> str:
     except OSError as e:
         raise IncrementalError(f"无法校验文件 {file_path}: {e}") from e
     return hash_md5.hexdigest()
+
+
+def _repair_transport(path: Path, url: str, size: Optional[int], md5: Optional[str], info: Dict[str, Any]) -> bool:
+    """按 chunkInfos 就地修复传输文件；不可修或未完全修好时返回 False。"""
+    chunks = info.get("chunkInfos") if isinstance(info, dict) else None
+    if not chunks or not path.is_file():
+        return False
+    return _repair_file(url, path, chunks, md5, cancelled=download_cancelled)
+
+
+def _repair_chunked(path: Path, url: Optional[str], item: Dict[str, Any], md5: Optional[str]) -> bool:
+    """按 chunkInfos 修复已存在的完整资源文件（含游戏目录内的正式文件）。"""
+    chunks = item.get("chunkInfos")
+    if not chunks or not url or not path.is_file():
+        return False
+    return _repair_file(url, path, chunks, md5, cancelled=download_cancelled)
 
 
 def _is_diff_resource(dest: str) -> bool:
@@ -882,15 +900,18 @@ class IncrementalManager:
                     logger.debug(f"跳过已完成的增量包: {krpdiff_name}")
                     skipped_groups.append(krpdiff_name)
                     continue
-                elif local_size < expected_size:
-                    logger.info(f"检测到不完整的增量包，将重新下载: {krpdiff_name}")
-                    krpdiff_path.unlink()
-                else:
-                    logger.info(f"文件大小或 MD5 异常，重新下载: {krpdiff_name}")
-                    krpdiff_path.unlink()
+                # 官方给了 100 MiB 分块 md5：先只补坏块，补不上（或 CDN 不支持 Range）再整包重下。
+                if _repair_transport(krpdiff_path, krpdiff_url, expected_size, expected_md5, krpdiff_info):
+                    skipped_groups.append(krpdiff_name)
+                    continue
+                logger.info(f"文件大小或 MD5 异常，重新下载: {krpdiff_name}")
+                krpdiff_path.unlink()
             elif krpdiff_path.exists() and expected_md5:
                 if _calculate_file_md5(krpdiff_path) == expected_md5:
                     logger.debug(f"跳过已完成的增量包: {krpdiff_name}")
+                    skipped_groups.append(krpdiff_name)
+                    continue
+                if _repair_transport(krpdiff_path, krpdiff_url, None, expected_md5, krpdiff_info):
                     skipped_groups.append(krpdiff_name)
                     continue
                 logger.info(f"增量包 MD5 异常，重新下载: {krpdiff_name}")
@@ -931,6 +952,17 @@ class IncrementalManager:
                 if self._is_file_verified(staged_path, expected_size, expected_md5):
                     complete_ready_count += 1
                     continue
+                # 分块 md5 可用时先补坏块：1.5 GB 的 pak 丢一个块不该整份重下。
+                if item.get("chunkInfos"):
+                    restore_url = self._build_resource_url(item, res_base)
+                    repaired = False
+                    for candidate in (staged_path, game_path):
+                        if candidate.is_file() and _repair_chunked(candidate, restore_url, item, expected_md5):
+                            complete_ready_count += 1
+                            repaired = True
+                            break
+                    if repaired:
+                        continue
                 if staged_path.exists():
                     logger.info(f"缓存完整文件校验失败，将重新下载: {item['dest']}")
                     staged_path.unlink()
