@@ -1,7 +1,6 @@
 """原生补丁器 krpatch 接线回归；用假的 krpatch 脚本，不联网、不碰真实游戏。"""
 
 import hashlib
-import json
 import os
 import sys
 import tempfile
@@ -25,7 +24,7 @@ SRC_PAYLOAD = b"old-release-data"
 # 假 krpatch 约定：输出内容 = b"new:" + dest
 DST_PAYLOAD = ("new:" + DST).encode()
 
-FAKE_KRPATCH = '''#!{python}
+FAKE_KRPATCH = """#!{python}
 import hashlib, json, os, sys, time
 from pathlib import Path
 
@@ -107,7 +106,7 @@ def main():
     return 3 if mismatch else (1 if failed else 0)
 
 sys.exit(main())
-'''
+"""
 
 
 def file_item(dest, payload):
@@ -229,7 +228,6 @@ class KrpatchApplyTests(unittest.TestCase):
         self.assertEqual(status, "success")
         self.assertEqual(self.fallbacks, [DST])
         self.assertLess(time.monotonic() - started, 25, "超时应按 WW_KRPATCH_TIMEOUT 及时返回")
-
 
 
 class KrpatchSelectionTests(unittest.TestCase):

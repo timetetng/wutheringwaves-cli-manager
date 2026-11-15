@@ -47,12 +47,17 @@ from ww_manager.download import (
     DownloadSpaceError,
     RainbowBarColumn,
     available_disk_space,
+    cancel_downloads,
     check_space_requirement,
     create_download_progress,
     download_single_file,
 )
 
 logger = logging.getLogger("WW_Manager")
+
+# 应用阶段同时运行的增量包数量：取 4 是因为单组已经是多线程读写，
+# 再高只会让 md5 与写盘抢同一批带宽。
+APPLY_MAX_WORKERS = 4
 
 
 HPATCHZ_REPO = "timetetng/wutheringwaves-cli-manager"
@@ -309,6 +314,63 @@ def _resource_rel_path(dest: str) -> Path:
 def _backup_path(path: Path) -> Path:
     """获取替换文件时使用的备份路径"""
     return path.with_suffix(path.suffix + ".bak")
+
+
+def _group_description(dest: Optional[str], stage: Optional[str] = None, color: str = "cyan") -> str:
+    label = Path(dest).stem if dest else "unknown"
+    if stage:
+        return f"[{color}]{label}[/{color}] [dim]{stage}[/dim]"
+    return f"[{color}]{label}[/{color}]"
+
+
+class _GroupActivityTracker:
+    """把工作线程上报的进度事件翻译成 Rich 子任务；多个分包共用一份，避免颜色与任务号冲突。"""
+
+    def __init__(self, progress: Progress):
+        self.progress = progress
+        self.events: Queue = Queue()
+        self.active: Dict[str, TaskID] = {}
+        self.color_map: Dict[str, int] = {}
+        self.counter = 0
+
+    def push(self, kind: str, target: Optional[str], msg: Optional[str] = None) -> None:
+        self.events.put((kind, target, msg))
+
+    def _color(self, target: str) -> str:
+        return RAINBOW_COLORS[self.color_map.get(target, 0) % len(RAINBOW_COLORS)]
+
+    def drain(self) -> None:
+        while True:
+            try:
+                kind, target, msg = self.events.get_nowait()
+            except Empty:
+                return
+            if kind in ("start", "status"):
+                task_id = self.active.get(target)
+                if task_id is None:
+                    self.color_map[target] = self.counter
+                    self.counter += 1
+                    color = self._color(target)
+                    self.active[target] = self.progress.add_task(
+                        _group_description(target, msg, color), total=None, kind="group"
+                    )
+                else:
+                    self.progress.update(task_id, description=_group_description(target, msg, self._color(target)))
+            elif kind == "log":
+                _emit_progress_log(self.progress, target, msg)
+            elif kind == "finish":
+                task_id = self.active.pop(target, None)
+                self.color_map.pop(target, None)
+                if task_id is not None:
+                    self.progress.remove_task(task_id)
+
+    def close(self) -> None:
+        """兜底清理仍显示的子任务，避免异常路径残留。"""
+        self.drain()
+        for task_id in list(self.active.values()):
+            self.progress.remove_task(task_id)
+        self.active.clear()
+        self.color_map.clear()
 
 
 class ApplyStats:
@@ -604,12 +666,17 @@ class IncrementalManager:
         return self._build_index_url(patch_info)
 
     def _get_group_size(self, group: Dict) -> int:
-        """获取 group 的增量包大小"""
+        """输出总量，用作“大组先跑”的排序键。
+
+        真实 index 的 groupInfos 没有 size 字段，只看 dstFiles[0] 的话，多文件组的
+        首个文件往往只有 0.1 MiB，1–2 GiB 的组会被排到最后，收尾时只剩它单独在跑。
+        """
         if group.get("size"):
-            return group["size"]
-        dst_files = group.get("dstFiles", [])
-        if dst_files:
-            return dst_files[0].get("size", 0)
+            return int(group["size"])
+        for key in ("dstFiles", "srcFiles"):
+            total = sum(int(f.get("size") or 0) for f in group.get(key) or [])
+            if total:
+                return total
         return 0
 
     def _get_resource_base_for_item(self, item: Dict, fallback_base: Optional[str] = None) -> Optional[str]:
@@ -730,12 +797,16 @@ class IncrementalManager:
                 tasks.append({"path": staged, "size": size})
         return tasks
 
-    def download_incremental(self) -> bool:
-        """下载增量更新包"""
+    def plan_download(self) -> Optional[Dict[str, Any]]:
+        """检查本地缓存、登记下载记录并返回待下载作业；不启动任何下载线程。
+
+        作业清单可以交给 DownloadBatch，把 common 与画质包合并成一条进度条下载。
+        返回 None 表示索引或缓存检查不通过，调用方不应继续下载。
+        """
         current_version = self.get_current_version()
         if not current_version:
             logger.error("无法获取当前版本")
-            return False
+            return None
 
         index_url = self.get_index_url()
         if not index_url:
@@ -745,14 +816,14 @@ class IncrementalManager:
                 "  2. 网络连接异常\n"
                 "  请先运行 'ww sync' 更新到最新版本后再试。"
             )
-            return False
+            return None
 
         logger.info(f"正在获取增量更新信息: {current_version}")
 
         index_data = self._index_file if self._index_file is not None else _http_get_json(index_url)
         if not index_data:
             logger.error("获取增量更新索引失败")
-            return False
+            return None
 
         self._index_file = index_data
 
@@ -775,7 +846,7 @@ class IncrementalManager:
             (download_dir / "version_info.json").write_text(json.dumps(version_info, indent=4), encoding="utf-8")
         except OSError as e:
             logger.error(f"无法保存增量下载记录: {e}")
-            return False
+            return None
 
         resources = index_data.get("resource", [])
         resource_by_dest = {r["dest"]: r for r in resources if r.get("dest")}
@@ -867,7 +938,7 @@ class IncrementalManager:
                 url = self._build_resource_url(item, res_base)
                 if not url:
                     logger.error(f"无法构建完整文件下载 URL: {item['dest']}")
-                    return False
+                    return None
                 complete_tasks.append(
                     {
                         "url": url,
@@ -880,121 +951,25 @@ class IncrementalManager:
             if complete_tasks:
                 complete_total = sum(t["size"] for t in complete_tasks)
                 total_size += complete_total
-                logger.info(f"待下载完整文件: {len(complete_tasks)} 个 ({complete_total / 1024 / 1024:.2f} MB)")
 
-        if complete_total_count:
-            logger.info(
-                f"本地下载资源检查完成: 增量包 已就绪 {len(skipped_groups)}/{len(group_infos)}, "
-                f"待下载 {len(pending_groups)}; 完整文件 已就绪 {complete_ready_count}/{complete_total_count}, "
-                f"待下载 {len(complete_tasks)}"
-            )
-        else:
-            logger.info(
-                f"本地下载资源检查完成: 增量包 已就绪 {len(skipped_groups)}/{len(group_infos)}, "
-                f"待下载 {len(pending_groups)}"
-            )
+        return {
+            "patch_jobs": pending_groups,
+            "complete_jobs": complete_tasks,
+            "patch_total": len(group_infos),
+            "patch_skipped": len(skipped_groups),
+            "complete_total": complete_total_count,
+            "complete_ready": complete_ready_count,
+            "pending_patch_bytes": pending_size,
+            "pending_complete_bytes": sum(t["size"] for t in complete_tasks),
+            "total_bytes": total_size,
+        }
 
-        if not pending_groups and not complete_tasks:
-            logger.info("无需下载，所有增量更新资源已在本地就绪")
-            return True
-
-        if pending_groups:
-            logger.info(f"待下载: {len(pending_groups)} 个增量包 ({pending_size / 1024 / 1024:.2f} MB)")
-        already_downloaded_count = len(skipped_groups)
-
-        progress = create_download_progress()
-
-        max_workers = 8
-        failed_patches = []
-        failed_complete_files = []
-        downloaded_patch_count = already_downloaded_count
-        downloaded_complete_count = complete_ready_count
-
-        def overall_description() -> str:
-            parts = [f"增量包 {downloaded_patch_count}/{len(group_infos)}"]
-            if complete_total_count:
-                parts.append(f"完整文件 {downloaded_complete_count}/{complete_total_count}")
-            return f"下载资源 ({'，'.join(parts)})"
-
-        download_jobs = []
-        max_job_count = max(len(pending_groups), len(complete_tasks))
-        for i in range(max_job_count):
-            if i < len(pending_groups):
-                download_jobs.append(("patch", pending_groups[i]))
-            if i < len(complete_tasks):
-                download_jobs.append(("complete", complete_tasks[i]))
-
-        with progress:
-            overall_task = progress.add_task(
-                overall_description(),
-                total=total_size if total_size > 0 else None,
-            )
-
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {}
-                for kind, payload in download_jobs:
-                    if kind == "patch":
-                        group, krpdiff_path, krpdiff_url, size, expected_md5 = payload
-                        krpdiff_name = group.get("dest")
-                        future = executor.submit(
-                            self._download_file,
-                            krpdiff_url,
-                            krpdiff_path,
-                            size,
-                            expected_md5,
-                            progress,
-                            overall_task,
-                        )
-                        futures[future] = ("patch", krpdiff_name)
-                    else:
-                        task = payload
-                        future = executor.submit(
-                            self._download_and_verify_complete,
-                            task["url"],
-                            task["path"],
-                            task["size"],
-                            task["md5"],
-                            progress,
-                            overall_task,
-                        )
-                        futures[future] = ("complete", task["dest"])
-
-                for future in as_completed(futures):
-                    kind, dest = futures[future]
-                    try:
-                        success = future.result()
-                    except Exception as e:
-                        _emit_progress_log(progress, "ERROR", f"下载任务异常 {dest}: {e}")
-                        success = False
-
-                    if success:
-                        if kind == "patch":
-                            downloaded_patch_count += 1
-                        else:
-                            downloaded_complete_count += 1
-                    elif kind == "patch":
-                        failed_patches.append(dest)
-                    else:
-                        failed_complete_files.append(dest)
-
-                    progress.update(overall_task, description=overall_description())
-
-        if failed_patches or failed_complete_files:
-            if failed_patches:
-                logger.error(f"增量包下载失败: {failed_patches}")
-            if failed_complete_files:
-                logger.error(f"完整文件下载失败: {failed_complete_files}")
+    def download_incremental(self) -> bool:
+        """单个分包自成一批下载（旧调用方与测试仍用这个入口）。"""
+        plan = self.plan_download()
+        if plan is None:
             return False
-
-        if complete_total_count:
-            logger.info(
-                f"下载完成: 增量包 {downloaded_patch_count}/{len(group_infos)}, "
-                f"完整文件 {downloaded_complete_count}/{complete_total_count}"
-            )
-        else:
-            logger.info(f"增量包下载完成: {downloaded_patch_count}/{len(group_infos)}")
-
-        return True
+        return DownloadBatch([self], [plan]).run()
 
     def _download_file(
         self,
@@ -1213,42 +1188,43 @@ class IncrementalManager:
         report_apply(stats)
         return ok
 
-    def apply_into(
-        self, progress: Progress, stats: "ApplyStats", label: Optional[str] = None
-    ) -> bool:
-        """把本包的合并与应用并入调用方的进度条；统计累加进 stats，不在内部输出。"""
+    def prepare_apply(self, label: Optional[str] = None) -> Optional[List[Dict]]:
+        """检查下载缓存与索引、选好补丁器，返回按输出总量降序排列的 group 列表。
+
+        返回 None 表示本包当前不能应用（缺缓存、版本或服务器不符）；此时不应写任何游戏文件。
+        """
         tag = f"[{label}] " if label else ""
-        for info in ("正在准备应用增量更新...",):
-            logger.info(f"{tag}{info}")
+        logger.info(f"{tag}正在准备应用增量更新...")
         download_dir = self.download_dir
         version_file = download_dir / "version_info.json"
 
         if not download_dir.exists() or not version_file.exists():
             logger.error(f"{tag}未找到增量更新包，请先执行 'ww incremental' 下载")
-            return False
+            return None
 
         try:
             version_info = json.loads(version_file.read_text())
         except Exception:
             logger.error(f"{tag}增量更新版本信息损坏")
-            return False
+            return None
 
         if version_info.get("server") != self.server_type:
             logger.error(f"{tag}服务器不匹配: 预期 {version_info.get('server')}, 实际 {self.server_type}")
-            return False
+            return None
 
         logger.info(f"{tag}开始应用增量更新: {version_info.get('from_version')} -> {version_info.get('to_version')}")
         index_file = download_dir / "indexFile.json"
         if not index_file.exists():
             logger.error(f"{tag}无法找到 indexFile.json")
-            return False
+            return None
 
         try:
             self._index_file = json.loads(index_file.read_text())
         except Exception:
             logger.error(f"{tag}无法解析 indexFile.json")
-            return False
+            return None
 
+        self._apply_version_info = version_info
         group_infos = self.get_group_infos()
         if group_infos:
             self.applier = self._select_applier()
@@ -1263,40 +1239,37 @@ class IncrementalManager:
             else:
                 raise IncrementalError(check_patch_applier(self.cache_dir)[1])
 
-        max_workers = max(1, min(4, len(group_infos)))
-        # 大文件优先：按 group 总大小降序排列，让最大的先启动
-        group_infos = sorted(group_infos, key=lambda g: self._get_group_size(g), reverse=True)
-        logger.info(
-            f"{tag}开始合并 {len(group_infos)} 个增量包，并发 {max_workers} 个；部分大文件可能耗时数分钟，请勿中断进程。"
-        )
+        # 大文件优先：按 group 输出总量降序，让最大的先启动。
+        return sorted(group_infos, key=lambda g: self._get_group_size(g), reverse=True)
 
-        results = {}
-        status_events = Queue()
+    def run_apply_jobs(
+        self,
+        jobs: List[tuple],
+        progress: Progress,
+        tracker: "_GroupActivityTracker",
+        overall_task: Optional[TaskID] = None,
+        tag: str = "",
+    ) -> Dict[int, Dict[str, str]]:
+        """在共享进度条上应用 (engine, group) 作业，返回按引擎聚合的结果。
 
-        def group_label(dest: Optional[str]) -> str:
-            if not dest:
-                return "unknown"
-            return Path(dest).stem
+        作业列表可以同时包含 common 与画质包：排序由调用方负责，这里只调度。
+        """
+        results: Dict[int, Dict[str, str]] = {}
+        if not jobs:
+            return results
+        max_workers = max(1, min(APPLY_MAX_WORKERS, len(jobs)))
+        own_task = overall_task is None
+        if own_task:
+            overall_task = progress.add_task(f"{tag}[bold cyan]应用增量包", total=len(jobs), kind="overall")
 
-        _group_colors = RAINBOW_COLORS
-
-        def group_color(task_idx: int) -> str:
-            return _group_colors[task_idx % len(_group_colors)]
-
-        def group_description(dest: Optional[str], stage: Optional[str] = None, color: str = "cyan") -> str:
-            label = group_label(dest)
-            if stage:
-                return f"[{color}]{label}[/{color}] [dim]{stage}[/dim]"
-            return f"[{color}]{label}[/{color}]"
-
-        def apply_wrapper(group):
+        def apply_wrapper(engine: "IncrementalManager", group: Dict) -> tuple:
             dest = group.get("dest")
 
             def emit(kind: str, msg: Optional[str] = None):
-                status_events.put((kind, dest, msg))
+                tracker.push(kind, dest, msg)
 
             def emit_log(level: str, msg: str):
-                status_events.put(("log", level, msg))
+                tracker.push("log", level, msg)
 
             def update_status(msg: str):
                 emit("status", msg)
@@ -1313,77 +1286,44 @@ class IncrementalManager:
 
             emit("start", "开始处理")
             try:
-                dest, result = self._apply_single_group(
+                group_dest, result = engine._apply_single_group(
                     group,
-                    download_dir,
+                    engine.download_dir,
                     log_info,
                     log_warning,
                     log_error,
                     update_status,
                 )
-                return dest, result
+                return engine, group_dest, result
             except Exception as e:
                 log_error(f"应用增量包异常: {e}")
-                return dest, "failed"
+                return engine, dest, "failed"
             finally:
                 emit("finish")
 
-        task_id = progress.add_task(f"{tag}[bold cyan]应用增量包", total=len(group_infos), kind="overall")
-        active_tasks = {}
-
-        _child_color_counter = 0
-        _child_color_map: dict = {}
-
-        def drain_status_events():
-            nonlocal _child_color_counter
-            while True:
-                try:
-                    kind, event_target, msg = status_events.get_nowait()
-                except Empty:
-                    break
-
-                if kind in ("start", "status"):
-                    child_task_id = active_tasks.get(event_target)
-                    if child_task_id is None:
-                        c = group_color(_child_color_counter)
-                        _child_color_map[event_target] = _child_color_counter
-                        _child_color_counter += 1
-                        description = group_description(event_target, msg, color=c)
-                        active_tasks[event_target] = progress.add_task(description, total=None, kind="group")
-                    else:
-                        idx = _child_color_map.get(event_target, 0)
-                        description = group_description(event_target, msg, color=group_color(idx))
-                        progress.update(child_task_id, description=description)
-                elif kind == "log":
-                    _emit_progress_log(progress, event_target, msg)
-                elif kind == "finish":
-                    child_task_id = active_tasks.pop(event_target, None)
-                    _child_color_map.pop(event_target, None)
-                    if child_task_id is not None:
-                        progress.remove_task(child_task_id)
-
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            pending = {executor.submit(apply_wrapper, group): group for group in group_infos}
+            pending = {executor.submit(apply_wrapper, engine, group): (engine, group) for engine, group in jobs}
             while pending:
                 done, pending_futures = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
                 pending = pending_futures
-                drain_status_events()
+                tracker.drain()
 
                 for future in done:
-                    dest, result = future.result()
-                    results[dest] = result
-                    progress.update(task_id, advance=1)
+                    engine, dest, result = future.result()
+                    results.setdefault(id(engine), {})[dest] = result
+                    progress.update(overall_task, advance=1)
 
-                drain_status_events()
+                tracker.drain()
 
-        # 兜底清理仍显示的子任务，避免异常路径残留。
-        for child_task_id in list(active_tasks.values()):
-            progress.remove_task(child_task_id)
-        progress.remove_task(task_id)
+        if own_task:
+            progress.remove_task(overall_task)
+        return results
 
-        stats.add(label, results)
-        if stats.failed and any(r in ("failed", "partial_failed") for r in results.values()):
-            return False
+    def migrate_outputs(self, progress: Progress, stats: "ApplyStats", label: Optional[str] = None) -> bool:
+        """迁移已校验的输出、删除废弃补丁、登记版本并清理下载目录。"""
+        tag = f"[{label}] " if label else ""
+        download_dir = self.download_dir
+        index_file = download_dir / "indexFile.json"
 
         if not self._apply_staged_patch_files(download_dir, progress=progress, stats=stats, label=label):
             logger.warning(f"{tag}增量输出迁移失败，请运行 'ww sync' 修复。")
@@ -1404,7 +1344,7 @@ class IncrementalManager:
             logger.debug(f"{tag}已保存索引到缓存")
 
         # 先提交分包断点；登记失败时保留下载目录，允许继续校验和应用。
-        self._update_local_version(version_info.get("to_version"))
+        self._update_local_version((self._apply_version_info or {}).get("to_version"))
         try:
             shutil.rmtree(download_dir)
             logger.debug(f"{tag}已清理增量下载目录")
@@ -1416,6 +1356,30 @@ class IncrementalManager:
         logger.debug(f"{tag}已清理缓存临时目录")
 
         return True
+
+    def apply_into(self, progress: Progress, stats: "ApplyStats", label: Optional[str] = None) -> bool:
+        """单包应用入口：自带总进度任务，结束后统计累加进 stats。"""
+        tag = f"[{label}] " if label else ""
+        group_infos = self.prepare_apply(label)
+        if group_infos is None:
+            return False
+
+        max_workers = max(1, min(APPLY_MAX_WORKERS, len(group_infos)))
+        logger.info(
+            f"{tag}开始合并 {len(group_infos)} 个增量包，并发 {max_workers} 个；"
+            "部分大文件可能耗时数分钟，请勿中断进程。"
+        )
+
+        tracker = _GroupActivityTracker(progress)
+        task_id = progress.add_task(f"{tag}[bold cyan]应用增量包", total=len(group_infos), kind="overall")
+        results = self.run_apply_jobs([(self, group) for group in group_infos], progress, tracker, task_id, tag)
+        tracker.close()
+        progress.remove_task(task_id)
+
+        stats.add(label, results.get(id(self), {}))
+        if stats.failed:
+            return False
+        return self.migrate_outputs(progress, stats, label)
 
     def _apply_single_group(
         self,
@@ -2384,3 +2348,123 @@ class IncrementalManager:
                 logger.info(f"本地版本已更新: {new_version}")
             except Exception as e:
                 logger.error(f"更新本地版本失败: {e}")
+
+
+class DownloadBatch:
+    """一次命令里的全部待下载资源：多个分包共用一条进度条与一个线程池。
+
+    以前 common 与画质包各自跑一轮检查和下载，界面上会出现两段列表、两条进度条，
+    分组之间还有一次吞吐掉底。合并后统一按作业大小降序提交，大包先起飞。
+    """
+
+    MAX_WORKERS = 8
+
+    def __init__(self, engines: List["IncrementalManager"], plans: List[Dict[str, Any]]):
+        if len(engines) != len(plans):
+            raise ValueError("engines 与 plans 数量不一致")
+        self.pairs = list(zip(engines, plans))
+        self.patch_total = sum(p["patch_total"] for p in plans)
+        self.patch_done = sum(p["patch_skipped"] for p in plans)
+        self.complete_total = sum(p["complete_total"] for p in plans)
+        self.complete_done = sum(p["complete_ready"] for p in plans)
+        self.total_bytes = sum(p["total_bytes"] for p in plans)
+        self.failed_patches: List[str] = []
+        self.failed_complete_files: List[str] = []
+
+    def has_pending(self) -> bool:
+        return any(p["patch_jobs"] or p["complete_jobs"] for _engine, p in self.pairs)
+
+    def describe(self) -> str:
+        parts = [f"增量包 {self.patch_done}/{self.patch_total}"]
+        if self.complete_total:
+            parts.append(f"完整文件 {self.complete_done}/{self.complete_total}")
+        return f"下载资源 ({'，'.join(parts)})"
+
+    def _jobs(self) -> List[tuple]:
+        jobs = []
+        for engine, plan in self.pairs:
+            for payload in plan["patch_jobs"]:
+                jobs.append((engine, "patch", payload[3] or 0, payload))
+            for task in plan["complete_jobs"]:
+                jobs.append((engine, "complete", task.get("size") or 0, task))
+        # 大作业先跑：否则最后只剩最大的几个在收尾。
+        jobs.sort(key=lambda job: job[2], reverse=True)
+        return jobs
+
+    def run(self) -> bool:
+        if not self.has_pending():
+            logger.info("无需下载，所有增量更新资源已在本地就绪")
+            return True
+
+        n_patch = sum(len(p["patch_jobs"]) for _engine, p in self.pairs)
+        n_complete = sum(len(p["complete_jobs"]) for _engine, p in self.pairs)
+        if n_patch:
+            size = sum(p["pending_patch_bytes"] for _engine, p in self.pairs) / 1024 / 1024
+            logger.info(f"待下载: {n_patch} 个增量包 ({size:.2f} MB)")
+        if n_complete:
+            size = sum(p["pending_complete_bytes"] for _engine, p in self.pairs) / 1024 / 1024
+            logger.info(f"待下载完整文件: {n_complete} 个 ({size:.2f} MB)")
+
+        progress = create_download_progress()
+        executor = ThreadPoolExecutor(max_workers=self.MAX_WORKERS)
+        try:
+            with progress:
+                overall_task = progress.add_task(self.describe(), total=self.total_bytes or None)
+                futures = {}
+                for engine, kind, _size, payload in self._jobs():
+                    if kind == "patch":
+                        group, path, url, size, md5 = payload
+                        future = executor.submit(engine._download_file, url, path, size, md5, progress, overall_task)
+                        futures[future] = ("patch", group.get("dest"))
+                    else:
+                        future = executor.submit(
+                            engine._download_and_verify_complete,
+                            payload["url"],
+                            payload["path"],
+                            payload["size"],
+                            payload["md5"],
+                            progress,
+                            overall_task,
+                        )
+                        futures[future] = ("complete", payload["dest"])
+
+                try:
+                    for future in as_completed(futures):
+                        kind, dest = futures[future]
+                        try:
+                            ok = bool(future.result())
+                        except Exception as e:
+                            _emit_progress_log(progress, "ERROR", f"下载任务异常 {dest}: {e}")
+                            ok = False
+                        if ok:
+                            if kind == "patch":
+                                self.patch_done += 1
+                            else:
+                                self.complete_done += 1
+                        elif kind == "patch":
+                            self.failed_patches.append(dest)
+                        else:
+                            self.failed_complete_files.append(dest)
+                        progress.update(overall_task, description=self.describe())
+                except KeyboardInterrupt:
+                    # 先让在飞的下载停手，否则 shutdown(wait=True) 会把它们跑完。
+                    cancel_downloads()
+                    raise
+        finally:
+            executor.shutdown(wait=True)
+
+        if self.failed_patches:
+            logger.error(f"增量包下载失败: {self.failed_patches}")
+        if self.failed_complete_files:
+            logger.error(f"完整文件下载失败: {self.failed_complete_files}")
+        if self.failed_patches or self.failed_complete_files:
+            return False
+
+        if self.complete_total:
+            logger.info(
+                f"下载完成: 增量包 {self.patch_done}/{self.patch_total}, "
+                f"完整文件 {self.complete_done}/{self.complete_total}"
+            )
+        else:
+            logger.info(f"增量包下载完成: {self.patch_done}/{self.patch_total}")
+        return True

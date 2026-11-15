@@ -8,9 +8,12 @@ from typing import Any, Dict, Optional
 
 from .core import ConfigError, NetworkError, WGameManager, WWError
 from .incremental import (
+    APPLY_MAX_WORKERS,
     ApplyStats,
+    DownloadBatch,
     IncrementalError,
     IncrementalManager,
+    _GroupActivityTracker,
     _is_diff_resource,
     _resource_rel_path,
     create_apply_progress,
@@ -371,11 +374,17 @@ class ResourceUpdater:
                 engines.append(engine)
             self.owner._check_download_space(pending, force_space)
             self.owner._write_local_json(PLAN, plan)
+            # common 与画质包一次性检查完，合成一条进度条下载，不再分两轮。
+            batch_plans = []
             for engine in engines:
                 name, entry = engine.pack_name, engine.entry
                 logger.info(f"下载 {name}: {entry['from_version']} → {entry['to_version']}")
-                if not engine.download_incremental():
-                    raise NetworkError(f"{name} 下载失败，游戏未更新；重跑 ww incremental 可续传")
+                batch_plan = engine.plan_download()
+                if batch_plan is None:
+                    raise NetworkError(f"{name} 增量包检查失败，游戏未更新；重跑 ww incremental 可续传")
+                batch_plans.append(batch_plan)
+            if not DownloadBatch(engines, batch_plans).run():
+                raise NetworkError("增量包下载失败，游戏未更新；重跑 ww incremental 可续传")
             plan["ready"] = True
             self.owner._write_local_json(PLAN, plan)
             if plan.get("predownload"):
@@ -427,23 +436,52 @@ class ResourceUpdater:
                 if name != "common":
                     self.owner._unregister_installed_tier(name, self.owner._read_local_config())
                 logger.info(f"应用 {name}: {entry['from_version']} → {entry['to_version']}")
-                engines.append(
-                    (name, PackIncrementalManager(self.owner, name, entry, plan, force_space=force_space))
-                )
-            # common 与画质包共用一个进度条，结束只输出一份统计。
+                engines.append((name, PackIncrementalManager(self.owner, name, entry, plan, force_space=force_space)))
+            # 先把所有分包的缓存检查做完，再一次性应用：common 与画质包共用一条总进度条，
+            # 大组跨包统一优先，不用等 common 全部跑完才启动画质包的最大文件。
             failed_pack = None
             if engines:
-                progress = create_apply_progress()
-                with progress:
-                    for name, engine in engines:
-                        if not engine.apply_into(progress, stats, label=name):
-                            failed_pack = name
-                            break
+                prepared = []
+                for name, engine in engines:
+                    groups = engine.prepare_apply(label=name)
+                    if groups is None:
+                        failed_pack = name
+                        break
+                    prepared.append((name, engine, groups))
+
+                if not failed_pack:
+                    jobs = [(engine, group) for _name, engine, groups in prepared for group in groups]
+                    # 三个包都按输出总量降序，再合并成一个全局顺序。
+                    jobs.sort(key=lambda job: job[0]._get_group_size(job[1]), reverse=True)
+                    progress = create_apply_progress()
+                    with progress:
+                        logger.info(
+                            f"开始应用 {len(jobs)} 个增量包（{len(prepared)} 个分包），"
+                            f"并发 {max(1, min(APPLY_MAX_WORKERS, len(jobs)))} 个；"
+                            "部分大文件可能耗时数分钟，请勿中断进程。"
+                        )
+                        tracker = _GroupActivityTracker(progress)
+                        overall = progress.add_task("[bold cyan]应用增量包", total=len(jobs), kind="overall")
+                        results = prepared[0][1].run_apply_jobs(jobs, progress, tracker, overall)
+                        tracker.close()
+                        progress.remove_task(overall)
+
+                        for name, engine, _groups in prepared:
+                            stats.add(name, results.get(id(engine), {}))
+                        for name, engine, _groups in prepared:
+                            if any(r in ("failed", "partial_failed") for r in results.get(id(engine), {}).values()):
+                                failed_pack = name
+                                break
+
+                        # 迁移按分包做：各自的下载目录与索引不同。
+                        if not failed_pack:
+                            for name, engine, _groups in prepared:
+                                if not engine.migrate_outputs(progress, stats, label=name):
+                                    failed_pack = name
+                                    break
             if failed_pack:
                 report_apply(stats)
-                raise WWError(
-                    f"{failed_pack} 应用未完成；主版本未升级，请勿启动游戏，重跑 ww incremental --apply 续作"
-                )
+                raise WWError(f"{failed_pack} 应用未完成；主版本未升级，请勿启动游戏，重跑 ww incremental --apply 续作")
             cfg = self.owner._read_local_config()
             cfg.update(
                 {
