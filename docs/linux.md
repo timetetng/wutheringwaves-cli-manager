@@ -42,6 +42,8 @@ scripts/setup-linux.sh --game-dir ~/Games/WutheringWaves
 
 脚本依次完成：下载并校验 DWProton、准备 riched20 UTF-8 补丁组件（修复登录协议正文乱码）、建立独立 prefix（DXVK、vkd3d-proton、dxvk-nvapi、NVIDIA 的 NGX 运行时、ICU、字体、DLL 覆盖），初始化后逐项自检并补装缺项，最后把启动器装到 `~/.local/bin/run_ww`，并写入桌面启动器入口 `ww.desktop`（图标从游戏自带启动器里提取）。
 
+DWProton 版本从 dawn.wine 的发布接口实时解析，默认取最新正式发布：已经装过就不再下载，出现新版本时重跑脚本即自动升级。升级后留下的旧版本目录与归档，脚本会在安装结束时列出体积并询问是否删除，默认保留（`-y` 或非交互运行时一律保留）。固定版本用 `--proton 11.0-17` 或环境变量 `WW_DWPROTON_VERSION`；离线时回退到本机已装版本，没装过才用内置兜底版本。校验值默认抓发布里的 `.sha512sum`，也可用 `WW_DWPROTON_SHA512` 指定。
+
 常用开关：
 
 | 开关 | 作用 |
@@ -50,10 +52,13 @@ scripts/setup-linux.sh --game-dir ~/Games/WutheringWaves
 | `--no-install` | 不装任何系统包，只提示 |
 | `--check` | 只检查路径与档位，不启动游戏 |
 | `--rebuild` | 忽略仓库内的预编译组件，从源码重编 riched20 |
+| `--proton <版本>` | 指定 DWProton 版本（如 `11.0-17`），默认 `latest` |
 
 安装时检查 gamemode（启动时默认启用，实测对帧率有提升）与 PE 交叉工具链（仅重编组件时需要，mingw-w64 或 clang+lld 任一即可），缺失则询问是否安装；选择跳过则不打补丁，登录协议等文本可能乱码，但游戏仍可正常启动。MangoHud 属可选项，默认不装。脚本支持断点续传，并会复用其它安装根里已下载的归档；下载长期失败时可设 `https_proxy` 重试，或用 `WW_WINE_SOURCE_URL`、`WW_DWPROTON_URL` 换镜像源。
 
-已存在的 DWProton（`$DWPROTON`、`~/.local/share/dwproton/`、Lutris/Steam 目录等）和已有 prefix 会被直接复用，不重复下载也不移动。
+补丁组件复用看溯源而不是哈希：wine 默认非可复现构建，每次编译都把当时时间写进 PE 头，同一份源码重编一次哈希就变，所以校验值只用于仓库随包的预编译产物。编过或装上组件后脚本会写 `~/.local/share/ww-linux/component/BUILD-INFO`（源码提交、补丁 sha256、产物哈希、构建时间）；溯源和当前脚本不一致时只警告并继续复用，要跟新基线请 `--rebuild`。
+
+已存在的同版本 DWProton（`$DWPROTON`、`~/.local/share/dwproton/`、Lutris/Steam 目录等）和已有 prefix 会被直接复用，不重复下载也不移动。
 
 安装后用 `run_ww` 启动（或点桌面图标），默认经 gamemoderun 启动（`WW_GAMEMODE=0` 关闭）。脚本的画质档位自动读取游戏目录的 `wwm_resource_state.json`，`run_ww --check` 只检查路径和档位。日志在 `~/.local/share/ww-linux/logs/game.log`。
 
