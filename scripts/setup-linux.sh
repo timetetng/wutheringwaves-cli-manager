@@ -14,12 +14,18 @@
 # 默认读 ww-cli 记录的游戏目录；--check 只自检不改动。
 set -euo pipefail
 
-readonly DWPROTON_VERSION="11.0-15"
-readonly DWPROTON_ASSET="dwproton-${DWPROTON_VERSION}-x86_64"
-readonly DWPROTON_URL="${WW_DWPROTON_URL:-https://dawn.wine/dawn-winery/dwproton/releases/download/dwproton-${DWPROTON_VERSION}/${DWPROTON_ASSET}.tar.xz}"
-readonly DWPROTON_SHA512="ec8985d14b6492df3459f93a3d90278814d9be2fe618e1ccd76f72f732c797e639d7f33fdf801be28585d0855e73bdda27858552ce709ba05cf3f60a17d2e817"
+# DWProton 默认跟随 dawn.wine 的最新正式发布；--proton / WW_DWPROTON_VERSION 可固定版本。
+readonly DWPROTON_RELEASE_API="${WW_DWPROTON_RELEASE_API:-https://dawn.wine/api/v1/repos/dawn-winery/dwproton/releases/latest}"
+readonly DWPROTON_DOWNLOAD_BASE="${WW_DWPROTON_DOWNLOAD_BASE:-https://dawn.wine/dawn-winery/dwproton/releases/download}"
+# 接口取不到版本号、本机也没装过时退回的内置版本，保证离线也能走完流程
+readonly DWPROTON_FALLBACK_VERSION="11.0-17"
+# 以下三项由 resolve_dwproton 解析填充
+DWPROTON_VERSION=""
+DWPROTON_ASSET=""
+DWPROTON_URL=""
 
-# 补丁针对该版本提交构建，后续升级未验证，升级 DWProton 后需重新编译
+# 补丁按该提交构建；组件是独立 PE DLL，可跨 DWProton 版本复用。
+# DWProton 升级后若登录文本出问题，先 --rebuild 重编一次再排查。
 readonly WINE_COMMIT="b75a4125963073b01d2b3bfce6060d697d02066b"
 readonly WINE_SOURCE_URL="${WW_WINE_SOURCE_URL:-https://dawn.wine/api/v1/repos/dawn-winery/wine-dwproton/archive/${WINE_COMMIT}.tar.gz}"
 readonly WINE_SOURCE_SHA256="657e9fbb61a3bd3bde414ca09eb60ec94e13edc1f07175861823dc055c076c90"
@@ -56,6 +62,8 @@ usage() {
 
   --game-dir <目录>  游戏安装目录；省略时读取 ww 的配置，读不到则报错
   --rebuild          忽略仓库内的预编译组件，强制从 Wine 源码重编译 riched20
+  --proton <版本>    指定 DWProton 版本（如 11.0-17，可省略 dwproton- 前缀）；
+                     默认 latest：每次重跑脚本都自动升级到 dawn.wine 的最新发布
   --check            只自检 prefix（缺什么列出来），不安装也不改动
   -y, --yes          缺少系统依赖时直接安装，不逐项询问
   --no-install       不调用包管理器，缺依赖只给提示
@@ -64,7 +72,11 @@ usage() {
 安装根目录为 ~/.local/share/ww-linux（可用 WW_LINUX_HOME 覆盖），
 启动器安装到 ~/.local/bin/run_ww，桌面入口为 ww.desktop。
 画质档位读取游戏目录里的 wwm_resource_state.json。
-已有的 DWProton 和 prefix 会被直接复用，不重复下载也不移动。
+DWProton 默认跟随 dawn.wine 的最新正式发布，重跑脚本即自动升级；
+升级后若留下了旧版本目录/归档，安装结束时列出体积并询问是否删除（默认保留）。
+固定版本用 --proton 或 WW_DWPROTON_VERSION，换镜像用 WW_DWPROTON_URL，
+指定校验值用 WW_DWPROTON_SHA512（默认抓发布里的 .sha512sum）。
+已有同版本 DWProton 和 prefix 会被直接复用，不重复下载也不移动。
 可用 WW_WINEPREFIX 指定要使用的 prefix。
 
 缺 gamemode、构建工具或 PE 交叉工具链时脚本会询问后用 sudo 安装（-y 跳过询问）。
@@ -79,6 +91,7 @@ while (($#)); do
     case "$1" in
         --game-dir) GAME_DIR="${2:-}"; shift 2 ;;
         --rebuild)  REBUILD=1; shift ;;
+        --proton)   WW_DWPROTON_VERSION="${2:-}"; shift 2 ;;
         --check)    CHECK_ONLY=1; shift ;;
         -y|--yes)   ASSUME_YES=1; shift ;;
         --no-install) NO_INSTALL=1; shift ;;
@@ -293,6 +306,68 @@ component_needs_build() {
     return 0
 }
 
+# ---- riched20 组件溯源 ----------------------------------------------------
+# wine 默认非可复现构建：每次编译都把当时的时间写进 PE 头 TimeDateStamp，
+# 同一份源码重编一次哈希就变。所以 COMPONENT_SHA256 只用于校验“仓库随包发布的
+# 预编译产物”，复用的判定改成看组件由哪个源码提交 + 哪版补丁编出来。
+patch_sha256() {
+    sha256sum "$VENDOR_DIR/riched20-utf8-rtf.patch" 2>/dev/null | awk '{print $1}'
+}
+
+component_info_get() {
+    local info="$WW_HOME/component/BUILD-INFO" key="$1"
+    [[ -f "$info" ]] || return 1
+    awk -F= -v want="$key" '$1 == want { sub(/^[^=]*=/, ""); print; exit }' "$info"
+}
+
+# 记录产物溯源（源码提交 + 补丁哈希 + 产物哈希），只做记录，不参与相等判定
+write_component_info() {
+    local target="$1" note="${2:-}" info="$WW_HOME/component/BUILD-INFO"
+    [[ -f "$target" ]] || return 1
+    mkdir -p -- "$(dirname -- "$info")"
+    {
+        printf '%s\n' '# riched20 补丁组件溯源，由 setup-linux.sh 生成；哈希仅作留档'
+        printf 'wine_commit=%s\n' "$WINE_COMMIT"
+        printf 'patch_sha256=%s\n' "$(patch_sha256)"
+        printf 'source_archive_sha256=%s\n' "$WINE_SOURCE_SHA256"
+        printf 'dwproton_version=%s\n' "$DWPROTON_VERSION"
+        printf 'dll_sha256=%s\n' "$(sha256sum "$target" | awk '{print $1}')"
+        printf 'dll_size=%s\n' "$(stat -c %s "$target")"
+        printf 'built_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        if [[ -n "$note" ]]; then printf 'note=%s\n' "$note"; fi
+    } >"$info"
+}
+
+# 溯源与当前脚本一致
+component_info_fresh() {
+    [[ "$(component_info_get wine_commit)" == "$WINE_COMMIT" ]] || return 1
+    [[ "$(component_info_get patch_sha256)" == "$(patch_sha256)" ]] || return 1
+    return 0
+}
+
+# 旧版脚本编的组件没有溯源记录：vendor/SOURCE.json 记了同一源码提交时按它采纳。
+# 只在 BUILD-INFO 缺失时用，已有记录就算上游提交不匹配也不能覆盖（那是漂移，要报警）
+adopt_legacy_component_info() {
+    local target="$1" source="$VENDOR_DIR/SOURCE.json" recorded
+    [[ -f "$WW_HOME/component/BUILD-INFO" ]] && return 1
+    [[ -f "$source" ]] || return 1
+    recorded="$(grep -o '"wine_commit"[[:space:]]*:[[:space:]]*"[^"]*"' "$source" 2>/dev/null \
+        | head -n1 | sed 's/.*"\([0-9a-f]\{7,\}\)"$/\1/')"
+    [[ "$recorded" == "$WINE_COMMIT" ]] || return 1
+    write_component_info "$target" \
+        'adopted from vendor/SOURCE.json; 补丁哈希按当前 patch 回填，未经产物校验'
+}
+
+warn_component_drift() {
+    local stale_commit stale_patch
+    stale_commit="$(component_info_get wine_commit)"
+    stale_patch="$(component_info_get patch_sha256)"
+    warn "补丁组件溯源与当前脚本不一致，仍照旧复用（不自动重编）:"
+    warn "  已装组件: wine_commit=${stale_commit:-未知} patch=${stale_patch:-未知}"
+    warn "  脚本期望: wine_commit=${WINE_COMMIT} patch=$(patch_sha256)"
+    warn "  要跟新基线请重编: scripts/setup-linux.sh --rebuild"
+}
+
 # 驱动自带的 NGX 运行时目录（Proton 的 proton 脚本也从这里取）
 nvidia_wine_dir() {
     local candidate glx
@@ -372,16 +447,126 @@ preflight() {
     log "安装根目录: $WW_HOME"
 }
 
-# 判断目录里是不是本脚本要求的 DWProton 版本
+# 询问 dawn.wine 当前最新正式发布的版本号（tag_name 形如 dwproton-11.0-17）
+dwproton_latest_version() {
+    local tag
+    tag="$(curl -fsSL "${CURL_OPTS[@]}" --connect-timeout 20 --max-time 60 \
+        "$DWPROTON_RELEASE_API" 2>/dev/null \
+        | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 \
+        | sed 's/.*"\([^"]*\)"$/\1/')" || true
+    tag="${tag#dwproton-}"
+    [[ "$tag" =~ ^[0-9][0-9A-Za-z._-]*$ ]] || return 1
+    printf '%s\n' "$tag"
+}
+
+# 本机已装的 DWProton 版本（离线时优先复用它，别为了兜底版本重下一遍）
+installed_dwproton_version() {
+    local dir ver
+    for dir in "$(cat "$WW_HOME/dwproton.path" 2>/dev/null || true)" "$WW_HOME"/dwproton-*-x86_64; do
+        [[ -n "$dir" && -f "$dir/version" ]] || continue
+        ver="$(awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^dwproton-/) { print substr($i, 10); exit } }' "$dir/version")"
+        if [[ -n "$ver" ]]; then
+            printf '%s\n' "$ver"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 解析要用的 DWProton 版本与下载地址
+# 优先级：--proton / WW_DWPROTON_VERSION > 发布接口的 latest > 本机已装 > 内置兜底版本
+resolve_dwproton() {
+    local want="${WW_DWPROTON_VERSION:-latest}" ver=""
+    case "$want" in
+        ""|latest|LATEST|Latest) ver="$(dwproton_latest_version || true)" ;;
+        *) ver="$want" ;;
+    esac
+    ver="${ver#dwproton-}"
+    ver="${ver%-x86_64}"
+    if [[ -n "$ver" && ! "$ver" =~ ^[0-9][0-9A-Za-z._-]*$ ]]; then
+        die "无法识别的 DWProton 版本: $ver（示例：11.0-17 / latest）"
+    fi
+    if [[ -z "$ver" ]]; then
+        ver="$(installed_dwproton_version || true)"
+        [[ -n "$ver" ]] || ver="$DWPROTON_FALLBACK_VERSION"
+        warn "取不到 DWProton 最新版本号（离线或接口变更），改用 $ver；要指定版本用 --proton。"
+    fi
+
+    DWPROTON_VERSION="$ver"
+    DWPROTON_ASSET="dwproton-${DWPROTON_VERSION}-x86_64"
+    if [[ -n "${WW_DWPROTON_URL:-}" ]]; then
+        DWPROTON_URL="$WW_DWPROTON_URL"
+    else
+        DWPROTON_URL="$DWPROTON_DOWNLOAD_BASE/dwproton-${DWPROTON_VERSION}/${DWPROTON_ASSET}.tar.xz"
+    fi
+}
+
+# 官方发布里带同名 .sha512sum，跟着资产一起取；资产名对不上或取不到时返回非零
+dwproton_published_sha512() {
+    local url="$1" name sum
+    name="$(basename -- "$url")"
+    name="${name%.tar.xz}"
+    [[ "$name" == "$DWPROTON_ASSET" ]] || return 1
+    sum="$(curl -fsSL "${CURL_OPTS[@]}" --connect-timeout 20 --max-time 60 \
+        "${url%/*}/$name.sha512sum" 2>/dev/null | awk 'NR==1{print tolower($1)}')" || return 1
+    [[ "$sum" =~ ^[0-9a-f]{128}$ ]] || return 1
+    printf '%s\n' "$sum"
+}
+
+# 升级后清理 $WW_HOME 里遗留的旧 DWProton 目录与归档。
+# 只动安装根内的路径；-y 或非交互运行时不问也不删，一律保留。
+cleanup_stale_dwproton() {
+    local -a stale=()
+    local item skip answer
+
+    for item in "$WW_HOME"/dwproton-*-x86_64 "$WW_HOME/downloads"/dwproton-*.tar*; do
+        [[ -e "$item" ]] || continue
+        for skip in "$DW" "$WW_HOME/downloads/${DWPROTON_ASSET}.tar.xz"; do
+            [[ "$item" == "$skip" ]] && continue 2
+        done
+        stale+=("$item")
+    done
+    ((${#stale[@]})) || return 0
+
+    log "发现升级前留下的 DWProton（当前在用 ${DWPROTON_VERSION}，不在这批里）:"
+    for item in "${stale[@]}"; do
+        log "  $(du -sh -- "$item" 2>/dev/null | cut -f1)  $item"
+    done
+
+    if [[ "$ASSUME_YES" == 1 ]] || [[ ! -t 0 ]]; then
+        warn "非交互运行，旧版本保留；确认没用后自行删上面这些路径。"
+        return 0
+    fi
+    read -r -p "删除上面这些旧 DWProton？[y/N] " answer || answer=""
+    case "$answer" in
+        [yY]|[yY][eE][sS]) ;;
+        *) log "已保留旧版本" ; return 0 ;;
+    esac
+
+    for item in "${stale[@]}"; do
+        # 兜底：只删安装根内的旧版本目录与归档，越界路径直接跳过
+        case "$item" in
+            "$WW_HOME"/dwproton-*-x86_64|"$WW_HOME"/downloads/dwproton-*.tar*) rm -rf -- "$item" ;;
+            *) warn "跳过不在安装根内的路径: $item" ;;
+        esac
+    done
+    log "旧 DWProton 已清理"
+}
+
+# 判断目录里是不是本脚本要求的 DWProton 版本（按 version 文件里的字段精确比对，
+# 避免 11.0-1 这类前缀误匹配 11.0-15）
 dwproton_ok() {
     local dir="$1"
     [[ -n "$dir" && -x "$dir/files/bin/wine" && -f "$dir/version" ]] || return 1
-    grep -q "dwproton-${DWPROTON_VERSION}" "$dir/version"
+    awk -v want="dwproton-${DWPROTON_VERSION}" '
+        { for (i = 1; i <= NF; i++) if ($i == want) found = 1 }
+        END { exit found ? 0 : 1 }' "$dir/version"
 }
 
 # 复用用户已有的 DWProton（环境变量 → 已有安装 → 常见目录），不移动也不复制
 # 找不到匹配版本时下载到安装根目录。
 ensure_dwproton() {
+    resolve_dwproton
     local candidate record="$WW_HOME/dwproton.path"
     local -a candidates=(
         "${DWPROTON:-}"
@@ -423,7 +608,12 @@ ensure_dwproton() {
     fi
 
     log "校验 DWProton"
-    if [[ "$(sha512sum "$archive" | awk '{print $1}')" != "$DWPROTON_SHA512" ]]; then
+    local expect="${WW_DWPROTON_SHA512:-}" actual
+    [[ -n "$expect" ]] || expect="$(dwproton_published_sha512 "$DWPROTON_URL" || true)"
+    actual="$(sha512sum "$archive" | awk '{print $1}')"
+    if [[ -z "$expect" ]]; then
+        warn "未取到 DWProton 官方 SHA512，跳过校验（可设 WW_DWPROTON_SHA512 指定）。"
+    elif [[ "$actual" != "$expect" ]]; then
         rm -f "$archive" "$archive.part"
         die "DWProton 校验失败，已删除下载文件，请重试。"
     fi
@@ -433,6 +623,7 @@ ensure_dwproton() {
     tar -xJf "$archive" -C "$WW_HOME"
     [[ -x "$DW/files/bin/wine" ]] || die "解压后找不到 $DW/files/bin/wine"
     printf '%s\n' "$DW" >"$record"
+    cleanup_stale_dwproton
 }
 
 # 优先使用仓库内的预编译组件，缺失或哈希不符时从源码编译
@@ -443,12 +634,20 @@ install_component() {
     if [[ "$REBUILD" == 0 && -f "$source_dll" ]] \
         && [[ "$(sha256sum "$source_dll" | awk '{print $1}')" == "$COMPONENT_SHA256" ]]; then
         cp -p "$source_dll" "$target"
+        write_component_info "$target" 'copied from vendor prebuilt'
         log "补丁组件已就绪（仓库预编译）"
         return
     fi
     # 重装时复用上次在本机编好的组件，避免再拉 Wine 源码（--rebuild 可强制重编）
     if [[ "$REBUILD" == 0 && -f "$target" ]] && [[ "$(head -c2 "$target" 2>/dev/null)" == "MZ" ]]; then
-        log "复用已编译的补丁组件: $target"
+        if component_info_fresh; then
+            log "复用已编译的补丁组件: $target"
+        elif adopt_legacy_component_info "$target"; then
+            log "复用已编译的补丁组件（已按 vendor/SOURCE.json 补溯源记录）: $target"
+        else
+            log "复用已编译的补丁组件: $target"
+            warn_component_drift
+        fi
         return
     fi
     build_component "$target" || {
@@ -545,9 +744,9 @@ build_component() {
         || { warn "产物不是 PE 组件（检查 PE 交叉工具链），跳过补丁。"; return 1; }
     local actual
     actual="$(sha256sum "$built" | awk '{print $1}')"
-    [[ "$actual" == "$COMPONENT_SHA256" ]] \
-        || warn "重建产物哈希与发布值不同（工具链差异属正常），继续使用。"
+    # 构建非可复现（PE 头写入构建时间），产物哈希必然与发布值不同，只留档不比对
     cp -p "$built" "$target"
+    write_component_info "$target" "built locally; 原始产物 sha256=${actual}"
 }
 
 # 链接内置 DLL 回 DWProton 的库目录
@@ -767,19 +966,29 @@ install_fonts() {
     [[ -d "$src" ]] || die "DWProton 缺少字体目录: $src"
     mkdir -p "$dest"
 
-    local font name added=0
+    local font name added=0 relinked=0 current
     for font in "$src"/*; do
         [[ -f "$font" ]] || continue
         name="$(basename "$font")"
-        if [[ ! -e "$dest/$name" ]]; then
-            ln -sfn "$font" "$dest/$name"
+        current="$dest/$name"
+        if [[ -L "$current" ]]; then
+            # 换过 DWProton 版本后旧链接可能还指向旧目录；旧版本一被清理就成了悬空链接
+            [[ "$(readlink -f "$current" 2>/dev/null)" == "$(readlink -f "$font")" ]] && continue
+            ln -sfn "$font" "$current"
+            relinked=$((relinked + 1))
+        elif [[ ! -e "$current" ]]; then
+            ln -sfn "$font" "$current"
             added=$((added + 1))
         fi
     done
 
     [[ -f "$dest/msyh.ttf" && -f "$dest/simsun.ttc" ]] \
         || die "字体链接不完整，缺少 msyh.ttf 或 simsun.ttc。"
-    log "字体已链接（新增 $added 个）"
+    if ((relinked > 0)); then
+        log "字体已链接（新增 $added 个，改指向 $relinked 个）"
+    else
+        log "字体已链接（新增 $added 个）"
+    fi
 }
 
 # 从游戏自带启动器里提取图标
@@ -983,4 +1192,7 @@ main() {
     log "安装完成，启动方式：run_ww"
 }
 
-main
+# 允许被测试脚本 source 而不直接执行安装
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main
+fi
