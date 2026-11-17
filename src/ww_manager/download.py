@@ -3,7 +3,6 @@
 通用下载模块：单文件下载（大文件自动多连接分段）与批量并行下载
 """
 
-import hashlib
 import logging
 import os
 import re
@@ -13,7 +12,7 @@ import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 from urllib.request import Request, urlopen
 
 from rich.progress import (
@@ -27,6 +26,8 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 from rich.progress_bar import ProgressBar
+
+from ww_manager import verify
 
 logger = logging.getLogger("WW_Manager")
 
@@ -402,6 +403,7 @@ def download_single_file(
     resume_support: bool = True,
     expected_md5: Optional[str] = None,
     chunk_infos: Optional[List[dict]] = None,
+    on_verified: Optional[Callable[[Path, str], None]] = None,
 ) -> bool:
     """
     下载单个文件，支持断点续传和进度显示
@@ -418,6 +420,7 @@ def download_single_file(
         resume_support: 是否支持断点续传
         expected_md5: 可选的清单 MD5，临时文件通过校验后才替换目标
         chunk_infos: 可选的 chunkInfos；目标文件已存在但不合格时只重取坏块
+        on_verified: 落盘后回调 (dest, md5)，把刚算过的摘要交给调用方，避免再读一遍
 
     Returns:
         是否成功
@@ -456,29 +459,43 @@ def download_single_file(
                     progress.update(overall_task_id, advance=delta)
                 reported += delta
 
+    verified_digest: List[Optional[str]] = [None]
+
     def verified() -> bool:
         if not temp_file.is_file():
             return False
         # expected_size <= 0 表示大小未知：下载完即视为成功。
         if expected_size <= 0:
             return True
-        if temp_file.stat().st_size != expected_size:
+        try:
+            if temp_file.stat().st_size != expected_size:
+                return False
+        except OSError:
             return False
         if expected_md5 is None:
             return True
-        # 官方清单仅提供 MD5，此处用于资源一致性而非安全认证。
-        digest = hashlib.md5(usedforsecurity=False)
-        with temp_file.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest() == expected_md5.lower()
+        digest = verify.safe_file_md5(temp_file)
+        if digest is None:
+            return False
+        verified_digest[0] = digest
+        return digest == expected_md5.lower()
+
+    def accept() -> bool:
+        """校验通过后落盘，并把已算出的摘要回报给调用方（名单没给 md5 时不回报）。"""
+        clear_segment_state(temp_file)
+        temp_file.replace(dest)
+        update_progress(expected_size)
+        digest = verified_digest[0]
+        if on_verified is not None and digest and expected_md5 is not None and digest == expected_md5.lower():
+            on_verified(dest, digest)
+        return True
 
     try:
         # 目标已存在且已损坏时，按官方分块 md5 只重取坏块：丢一个 100 MiB 块不该重下整个补丁。
         if chunk_infos and expected_size > 0 and dest.is_file() and not dest.is_symlink():
             from .chunk_repair import repair_file
 
-            if repair_file(url, dest, chunk_infos, expected_md5, cancelled=download_cancelled):
+            if repair_file(url, dest, chunk_infos, expected_md5, cancelled=download_cancelled, on_verified=on_verified):
                 update_progress(expected_size)
                 return True
 
@@ -490,10 +507,7 @@ def download_single_file(
                     raise NetworkError("文件大小不能为负数")
                 if expected_size > 0 and temp_file.exists() and temp_file.stat().st_size >= expected_size:
                     if verified():
-                        clear_segment_state(temp_file)
-                        temp_file.replace(dest)
-                        update_progress(expected_size)
-                        return True
+                        return accept()
                     # 分段状态还在时保留文件和状态，交给分段下载按块续传。
                     if not _segment_state_path(temp_file).exists():
                         temp_file.unlink()
@@ -507,10 +521,7 @@ def download_single_file(
                             logger.debug(f"分段下载未完成，保留临时文件以便续传: {dest.name}")
                             raise NetworkError(f"分段下载未完成: {dest.name}")
                         if verified():
-                            clear_segment_state(temp_file)
-                            temp_file.replace(dest)
-                            update_progress(expected_size)
-                            return True
+                            return accept()
                         clear_segment_state(temp_file)
                         temp_file.unlink(missing_ok=True)
                         update_progress(0)
@@ -548,9 +559,7 @@ def download_single_file(
                                 update_progress(resume_byte)
 
                 if verified():
-                    clear_segment_state(temp_file)
-                    temp_file.replace(dest)
-                    return True
+                    return accept()
                 if expected_size > 0 and temp_file.stat().st_size >= expected_size:
                     temp_file.unlink()
                     clear_segment_state(temp_file)
@@ -572,6 +581,7 @@ def batch_download(
     tasks: List[dict],
     progress: Optional[Progress] = None,
     max_workers: int = 8,
+    on_verified: Optional[Callable[[Path, str], None]] = None,
 ) -> tuple:
     """
     并行下载任务列表
@@ -580,6 +590,7 @@ def batch_download(
         tasks: [{"url": ..., "path": ..., "size": ..., "md5": ..., "chunkInfos": ...}, ...]
         progress: 可选的Progress实例
         max_workers: 最大线程数
+        on_verified: 每个文件落盘后回调 (dest, md5)，供调用方复用刚算出的摘要
 
     Returns:
         (failed_count, failed_names)
@@ -609,6 +620,7 @@ def batch_download(
                     overall_task,
                     expected_md5=task.get("md5"),
                     chunk_infos=task.get("chunkInfos"),
+                    on_verified=on_verified,
                 )
                 futures[future] = task.get("name", task["path"].name)
 

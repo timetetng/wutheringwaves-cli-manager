@@ -10,13 +10,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from . import verify
 
 logger = logging.getLogger("WW_Manager")
 
@@ -85,24 +86,8 @@ def _as_list(value: object) -> Iterable:
 
 
 def file_md5(path: Path) -> str:
-    digest = hashlib.md5(usedforsecurity=False)
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
-def _range_md5(stream, start: int, end: int) -> str:
-    digest = hashlib.md5(usedforsecurity=False)
-    stream.seek(start)
-    remaining = end - start + 1
-    while remaining > 0:
-        block = stream.read(min(RANGE_READ_SIZE, remaining))
-        if not block:
-            break
-        digest.update(block)
-        remaining -= len(block)
-    return digest.hexdigest()
+    """整文件 MD5；分块修复的所有摘要计算都走 :mod:`ww_manager.verify`。"""
+    return verify.file_md5(path)
 
 
 def bad_chunks(path: Path, chunks: object) -> List[Chunk]:
@@ -117,15 +102,8 @@ def _bad_of(path: Path, chunks: List[Chunk]) -> List[Chunk]:
     """返回本地 md5 不符的分块；文件比总分块短时，超出部分也算坏块。"""
     if not path.is_file():
         return []
-    size = path.stat().st_size
-    bad: List[Chunk] = []
-    with path.open("rb") as stream:
-        for start, end, digest in chunks:
-            if end >= size:
-                bad.append((start, end, digest))
-            elif _range_md5(stream, start, end) != digest:
-                bad.append((start, end, digest))
-    return bad
+    digests = verify.chunk_digests(path, chunks)
+    return [chunk for chunk, digest in zip(chunks, digests) if digest != chunk[2]]
 
 
 def _fetch_range(url: str, start: int, end: int) -> Optional[bytes]:
@@ -164,11 +142,13 @@ def repair_file(
     *,
     label: Optional[str] = None,
     cancelled: Optional[Callable[[], bool]] = None,
+    on_verified: Optional[Callable[[Path, str], None]] = None,
 ) -> bool:
     """就地重取坏块并复验；返回 True 表示文件现在与清单一致。
 
     调用前文件可以不存在、被截断或内容损坏；任一分块取不到就返回 False，
     由调用方退回整文件下载。整文件名单 md5 优先，没有 md5 时以各分块 md5 为准。
+    on_verified 会在修复好的摘要算完时回调 (path, md5)，供缓存直接复用这份结果。
     """
     name = label or path.name
     normalized = normalize_chunks(chunks)
@@ -178,9 +158,12 @@ def repair_file(
     if path.stat().st_size > total:
         logger.debug(f"{name}: 文件比分块总和更长，放弃分块修复")
         return False
-    bad = _bad_of(path, normalized)
+    # 一次读取同时得到整文件与各分块摘要，省掉「先按块比对、再算整文件」的第二遍盘。
+    whole_md5, digests = verify.scan(path, normalized)
+    bad = [chunk for chunk, digest in zip(normalized, digests) if digest != chunk[2]]
     if not bad:
-        return expected_md5 is None or file_md5(path) == expected_md5.lower()
+        # 分块全对但整文件名单不同，说明分块表与清单不是同一版，不能认为修好了。
+        return expected_md5 is None or whole_md5 == expected_md5.lower()
     # 文件比清单短说明尾部整段缺失，补齐这些块才能让大小恢复。
     repaired_mib = sum(end - start + 1 for start, end, _ in bad) // 1048576
     logger.info(f"{name}: 按分块修复 {len(bad)}/{len(normalized)} 个块（约 {repaired_mib} MiB）")
@@ -190,7 +173,7 @@ def repair_file(
                 if cancelled and cancelled():
                     raise KeyboardInterrupt
                 payload = _fetch_range(url, start, end)
-                if payload is None or hashlib.md5(payload, usedforsecurity=False).hexdigest() != digest:
+                if payload is None or verify.digest_of(payload) != digest:
                     return False
                 stream.seek(start)
                 stream.write(payload)
@@ -200,13 +183,17 @@ def repair_file(
     except OSError as e:
         logger.debug(f"{name}: 写入分块失败: {e}")
         return False
-    if expected_md5 is not None and file_md5(path) != expected_md5.lower():
-        logger.warning(f"{name}: 分块已重取但整文件 MD5 仍不符，将整文件重下")
-        return False
-    if _bad_of(path, normalized):
+    whole_md5, digests = verify.scan(path, normalized)
+    if expected_md5 is not None:
+        if whole_md5 != expected_md5.lower():
+            logger.warning(f"{name}: 分块已重取但整文件 MD5 仍不符，将整文件重下")
+            return False
+    elif any(digest != chunk[2] for chunk, digest in zip(normalized, digests)):
         logger.warning(f"{name}: 分块 md5 复验失败，将整文件重下")
         return False
     logger.info(f"{name}: 分块修复完成")
+    if on_verified is not None and expected_md5 is not None:
+        on_verified(path, whole_md5)
     return True
 
 

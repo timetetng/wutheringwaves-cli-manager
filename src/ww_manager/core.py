@@ -1,13 +1,11 @@
 # core.py
 import gzip
-import hashlib
 import json
 import logging
 import os
 import re
 import shutil
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urljoin
@@ -16,7 +14,6 @@ from urllib.request import Request, urlopen
 from rich.progress import (
     BarColumn,
     Progress,
-    TaskID,
     TextColumn,
     TimeRemainingColumn,
 )
@@ -46,6 +43,7 @@ from ww_manager.incremental import (
     _resource_rel_path,
     check_patch_applier,
 )
+from ww_manager.verify import check_files, safe_file_md5
 
 logger = logging.getLogger("WW_Manager")
 
@@ -165,15 +163,30 @@ class MD5Cache:
 
     def _calculate_md5(self, file_path: Path) -> Optional[str]:
         logger.debug(f"计算 MD5: {file_path.name}")
+        digest = safe_file_md5(file_path)
+        if digest is None:
+            logger.error(f"计算 MD5 错误 {file_path}")
+        return digest
+
+    def set(self, file_path: Path, md5: str) -> None:
+        """写入已知摘要：下载器落盘时算过的那个，登记前就不必再读一遍大盘。"""
         try:
-            hash_md5 = hashlib.md5()
-            with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(4096 * 1024), b""):
-                    hash_md5.update(chunk)
-            return hash_md5.hexdigest()
-        except Exception as e:
-            logger.error(f"计算 MD5 错误 {file_path}: {e}")
-            return None
+            stat = file_path.stat()
+        except OSError:
+            return
+        try:
+            rel_path = str(file_path.relative_to(self.game_root)).replace("\\", "/")
+        except ValueError:
+            rel_path = file_path.name
+        with self._lock:
+            self.cache[rel_path] = {
+                "mtime": stat.st_mtime,
+                "mtime_ns": stat.st_mtime_ns,
+                "ctime_ns": stat.st_ctime_ns,
+                "size": stat.st_size,
+                "md5": md5.lower(),
+            }
+            self._updated = True
 
     def clear(self, file_path: Path) -> None:
         try:
@@ -284,7 +297,7 @@ class WGameManager:
             logger.error(f"HTTP 请求失败 {url}: {e}")
             return None
 
-    def _batch_download(self, tasks: List[dict]) -> int:
+    def _batch_download(self, tasks: List[dict], cache: Optional[MD5Cache] = None) -> int:
         """批量下载，返回失败的文件数 (0 = 全部成功)"""
         if not tasks:
             logger.info("没有文件需要下载")
@@ -293,11 +306,13 @@ class WGameManager:
         total_size = sum(t["size"] for t in tasks)
         logger.info(f"准备下载 {len(tasks)} 个文件，总大小: {total_size / 1024 / 1024:.2f} MB")
 
+        cache = cache or self.md5_cache
         progress = create_download_progress()
         prepared = [{**task, "name": str(task["path"])} for task in tasks]
-        failed, failed_names = batch_download(prepared, progress=progress)
+        # 下载器落盘前已算过 MD5，直接回填缓存，后续复验只比大小和缓存值。
+        failed, failed_names = batch_download(prepared, progress=progress, on_verified=cache.set)
         for name in failed_names:
-            self.md5_cache.clear(Path(name))
+            cache.clear(Path(name))
         return failed
 
     def sync_files(self, force_check_md5=False, tier: Optional[str] = None, force_space: bool = False):
@@ -352,63 +367,47 @@ class WGameManager:
             transient=True,  # 进度条完成后自动消失
         ) as progress:
             # 添加总校验任务
-            verify_task = progress.add_task("[cyan]准备校验...", total=len(res_list))
+            if force_check_md5:
+                for item in res_list:
+                    self.md5_cache.clear(self._managed_path(item["dest"]))
 
-            # 定义供多线程调用的单个文件校验函数
-            def check_file(item):
+            def _base_path(item):
                 try:
-                    dest_path = self.game_folder / _resource_rel_path(item["dest"])
+                    return self.game_folder / _resource_rel_path(item["dest"])
                 except IncrementalError as e:
                     raise ConfigError(f"非法基础资源路径: {item['dest']}") from e
-                expected_md5 = item["md5"]
+
+            status = check_files(
+                [(item["dest"], _base_path(item), int(item["size"]), item["md5"]) for item in res_list],
+                cache=self.md5_cache,
+                progress=progress,
+                description="校验游戏文件",
+            )
+
+            for item in res_list:
+                if status.get(item["dest"]) == "ok":
+                    continue
+                dest_path = _base_path(item)
                 expected_size = int(item["size"])
-
-                if force_check_md5:
-                    self.md5_cache.clear(dest_path)
-                need_download = (
-                    not dest_path.is_file()
-                    or dest_path.stat().st_size != expected_size
-                    or self.md5_cache.get(dest_path) != expected_md5
-                )
-
-                download_info = None
-                if need_download:
-                    url = urljoin(self.cdn_node, f"{res_base}/{item['dest']}")
-                    download_info = {
-                        "url": quote(url, safe=":/"),
-                        "path": dest_path,
-                        "size": expected_size,
-                        "md5": expected_md5,
-                    }
-                    # 官方给了 100 MiB 分块 md5 时，已存在的文件可以只补坏块。
-                    if item.get("chunkInfos") and dest_path.is_file():
-                        download_info["chunkInfos"] = item["chunkInfos"]
-                return download_info, dest_path.name
-
-            # 开启多线程池并发校验（最大线程数设为 8，兼顾 SSD IO 性能和 CPU 负载）
-            max_workers = 8
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # 提交所有任务
-                futures = {executor.submit(check_file, item): item for item in res_list}
-
-                # 收集结果并更新进度条
-                for future in as_completed(futures):
-                    download_info, file_name = future.result()
-                    if download_info:
-                        tasks.append(download_info)
-
-                    # 在主线程中更新进度条，避免多线程直接操作 UI 导致闪烁
-                    progress.update(verify_task, description=f"[cyan]校验中: {file_name}[/cyan]")
-                    progress.advance(verify_task)
+                expected_md5 = item["md5"]
+                logger.debug(f"校验失败: {item['dest']}")
+                url = urljoin(self.cdn_node, f"{res_base}/{item['dest']}")
+                download_info = {
+                    "url": quote(url, safe=":/"),
+                    "path": dest_path,
+                    "size": expected_size,
+                    "md5": expected_md5,
+                }
+                # 官方给了 100 MiB 分块 md5 时，已存在的文件可以只补坏块。
+                if item.get("chunkInfos") and dest_path.is_file():
+                    download_info["chunkInfos"] = item["chunkInfos"]
+                tasks.append(download_info)
 
             # 画质档位单独一条进度：首次校验要算几十 GB 的哈希，否则看起来像卡住。
             if prepared:
                 tier_cache = MD5Cache(self._managed_path(f"wwm_md5_cache_resource_{tier}.json"), self.game_folder)
-                tier_task = progress.add_task(
-                    f"[cyan]校验 {tier.upper()} 画质档位...", total=len(prepared["resources"])
-                )
                 tier_tasks = self._resource_download_tasks(
-                    tier, prepared, force_check_md5, cache=tier_cache, progress=progress, task_id=tier_task
+                    tier, prepared, force_check_md5, cache=tier_cache, progress=progress
                 )
                 tier_cache.save()
 
@@ -424,13 +423,16 @@ class WGameManager:
         else:
             logger.info("所有文件校验通过，无需下载。")
         # 下载器返回成功并不等于正式文件一定完整，登记前再次核对。
-        for task in tasks:
-            self.md5_cache.clear(task["path"])
-        for item in res_list:
-            path = self._managed_path(item["dest"])
-            if not path.is_file() or path.stat().st_size != item["size"] or self.md5_cache.get(path) != item["md5"]:
-                self.md5_cache.save()
-                raise NetworkError(f"基础资源校验失败: {item['dest']}；请重跑下载命令或 ww sync")
+        # 下载器落盘前算过的 MD5 已回填缓存，这里命中缓存只比大小，不再重算一遍。
+        status = check_files(
+            [(item["dest"], self._managed_path(item["dest"]), int(item["size"]), item["md5"]) for item in res_list],
+            cache=self.md5_cache,
+            description="复核下载文件",
+        )
+        bad = next((dest for dest, state in status.items() if state != "ok"), None)
+        if bad is not None:
+            self.md5_cache.save()
+            raise NetworkError(f"基础资源校验失败: {bad}；请重跑下载命令或 ww sync")
         self.md5_cache.save()
         if prepared:
             try:
@@ -714,28 +716,31 @@ class WGameManager:
         *,
         cache: Optional[MD5Cache] = None,
         progress: Optional[Progress] = None,
-        task_id: Optional[TaskID] = None,
     ) -> List[dict]:
+        """校验档位文件并返回需要下载的项；校验走与基础资源同一套并发逻辑。"""
         if cache is None:
             cache = MD5Cache(self._managed_path(f"wwm_md5_cache_resource_{tier}.json"), self.game_folder)
+        entries = [
+            (item["dest"], self._managed_path(item["dest"]), int(item["size"]), item["md5"])
+            for item in prepared["resources"]
+        ]
+        if force_check_md5:
+            for _, path, _, _ in entries:
+                cache.clear(path)
+        status = check_files(entries, cache=cache, progress=progress, description=f"校验 {tier.upper()} 档位")
         tasks = []
         for item in prepared["resources"]:
-            path = self._managed_path(item["dest"])
-            if force_check_md5:
-                cache.clear(path)
-            valid = path.is_file() and path.stat().st_size == item["size"] and cache.get(path) == item["md5"]
-            if not valid:
-                source = f"{prepared['base'].strip('/')}/{item['source']}"
-                tasks.append(
-                    {
-                        "url": quote(urljoin(prepared["cdn"], source), safe=":/"),
-                        "path": path,
-                        "size": item["size"],
-                        "md5": item["md5"],
-                    }
-                )
-            if progress is not None and task_id is not None:
-                progress.update(task_id, advance=1, description=f"[cyan]校验 {tier.upper()}: {path.name}[/cyan]")
+            if status.get(item["dest"]) == "ok":
+                continue
+            source = f"{prepared['base'].strip('/')}/{item['source']}"
+            tasks.append(
+                {
+                    "url": quote(urljoin(prepared["cdn"], source), safe=":/"),
+                    "path": self._managed_path(item["dest"]),
+                    "size": item["size"],
+                    "md5": item["md5"],
+                }
+            )
         return tasks
 
     def _tier_is_current(self, tier: str, version: str) -> bool:
@@ -848,20 +853,23 @@ class WGameManager:
             # 正式文件即将改变，旧安装标记不能继续宣称该档位完整。
             self._record_resource_pack(tier, self.resource_pack_version(tier) or version, incomplete=True)
             self._unregister_installed_tier(tier, cfg)
-            failed = self._batch_download(tasks)
-            for task in tasks:
-                cache.clear(task["path"])
+            failed = self._batch_download(tasks, cache=cache)
             if failed:
                 cache.save()
                 raise NetworkError(f"{failed} 个文件下载失败，{tier} 档位未完成；请重跑 ww resource {tier} 续传")
 
         # 对所有正式文件校验，确保下载器结果与清单一致后才清理、登记。
-        for item in resources:
-            path = self._managed_path(item["dest"])
-            if not path.is_file() or path.stat().st_size != item["size"] or cache.get(path) != item["md5"]:
-                self._unregister_installed_tier(tier, cfg)
-                cache.save()
-                raise NetworkError(f"档位文件校验失败: {item['dest']}")
+        # 刚下载的文件命中下载器回填的摘要，这里只比大小，不再重读一遍大盘。
+        status = check_files(
+            [(item["dest"], self._managed_path(item["dest"]), int(item["size"]), item["md5"]) for item in resources],
+            cache=cache,
+            description=f"复核 {tier.upper()} 档位",
+        )
+        bad = next((dest for dest, state in status.items() if state != "ok"), None)
+        if bad is not None:
+            self._unregister_installed_tier(tier, cfg)
+            cache.save()
+            raise NetworkError(f"档位文件校验失败: {bad}")
         self._cleanup_tier_stale_files(tier, resources, cache)
         cache.save()
         self._register_installed_tier(tier, version, bundle)
@@ -1263,14 +1271,7 @@ class WGameManager:
     def _safe_md5(self, path: Path) -> Optional[str]:
         if not path.exists() or not path.is_file():
             return None
-        try:
-            with open(path, "rb") as f:
-                h = hashlib.md5()
-                for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-        except Exception:
-            return None
+        return safe_file_md5(path)
 
     def _backup_src_to_cache(self, src: str, dest: str) -> None:
         """把当前磁盘上的源服版本备份进缓存，供切回源服时秒级恢复。"""

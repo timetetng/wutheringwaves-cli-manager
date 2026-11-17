@@ -21,6 +21,7 @@ from .incremental import (
     create_apply_progress,
     report_apply,
 )
+from .verify import check_files
 
 logger = logging.getLogger("WW_Manager")
 PLAN = ".incremental_download/packs/plan.json"
@@ -162,28 +163,46 @@ class PackIncrementalManager(IncrementalManager):
 
     def check_downloaded_files(self) -> None:
         """应用任一包之前，校验所有包的传输文件或已经就绪的正式文件。"""
-        for item in self.entry["index"].get("resource", []):
+        resources = self.entry["index"].get("resource", [])
+        plan = []
+        entries = []
+        for index, item in enumerate(resources):
             dest = item["dest"]
-            size, md5 = item["size"], item["md5"]
             if _is_diff_resource(dest):
                 candidates = [self.download_dir / _resource_rel_path(dest)]
-                url = self._build_krpdiff_url(dest)
             else:
                 candidates = [
                     self.game_folder / _resource_rel_path(dest),
                     self._get_staged_complete_path(self.download_dir, dest),
                 ]
-                url = self._build_resource_url(item, self._full_resource_base())
-            if not any(self._is_file_verified(p, size, md5) for p in candidates):
-                # 先按分块 md5 修坏块，不把用户挡去整包重下。
-                if item.get("chunkInfos") and url:
-                    for candidate in candidates:
-                        if candidate.is_file() and _repair_file(
-                            url, candidate, item["chunkInfos"], md5, cancelled=download_cancelled
-                        ):
-                            break
-            if not any(self._is_file_verified(p, size, md5) for p in candidates):
-                raise ConfigError(f"{self.pack_name} 下载缓存缺失或损坏: {dest}；请重跑 ww incremental")
+            entries += [(f"{index}-{slot}", path, item["size"], item["md5"]) for slot, path in enumerate(candidates)]
+            plan.append((item, candidates))
+
+        # 整批并发校验：原本每个候选文件都在循环里单线程现算 MD5。
+        status = check_files(entries, description=f"校验 {self.pack_name} 缓存")
+
+        def verified(index: int, candidates: list) -> bool:
+            return any(status.get(f"{index}-{slot}") == "ok" for slot in range(len(candidates)))
+
+        for index, (item, candidates) in enumerate(plan):
+            if verified(index, candidates):
+                continue
+            # 先按分块 md5 修坏块，不把用户挡去整包重下。
+            url = (
+                self._build_krpdiff_url(item["dest"])
+                if _is_diff_resource(item["dest"])
+                else self._build_resource_url(item, self._full_resource_base())
+            )
+            if item.get("chunkInfos") and url:
+                for slot, candidate in enumerate(candidates):
+                    if candidate.is_file() and _repair_file(
+                        url, candidate, item["chunkInfos"], item["md5"], cancelled=download_cancelled
+                    ):
+                        # _repair_file 返回 True 时已自行比对过整文件 MD5，不必再读一遍。
+                        status[f"{index}-{slot}"] = "ok"
+                        break
+            if not verified(index, candidates):
+                raise ConfigError(f"{self.pack_name} 下载缓存缺失或损坏: {item['dest']}；请重跑 ww incremental")
 
     def _update_local_version(self, version_or_data):
         version = self.entry["to_version"]

@@ -54,6 +54,7 @@ from ww_manager.download import (
     download_cancelled,
     download_single_file,
 )
+from ww_manager.verify import check_files, file_matches, file_md5
 
 logger = logging.getLogger("WW_Manager")
 
@@ -288,15 +289,11 @@ def _get_krpdiff_size(url: str) -> Optional[int]:
 
 
 def _calculate_file_md5(file_path: Path) -> str:
-    """计算文件 MD5"""
-    hash_md5 = hashlib.md5(usedforsecurity=False)
+    """计算文件 MD5（统一走 verify 模块，块大小与摘要构造只留一份）"""
     try:
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096 * 1024), b""):
-                hash_md5.update(chunk)
+        return file_md5(file_path)
     except OSError as e:
         raise IncrementalError(f"无法校验文件 {file_path}: {e}") from e
-    return hash_md5.hexdigest()
 
 
 def _repair_transport(path: Path, url: str, size: Optional[int], md5: Optional[str], info: Dict[str, Any]) -> bool:
@@ -753,9 +750,7 @@ class IncrementalManager:
 
     def _is_file_verified(self, path: Path, expected_size: int, expected_md5: str) -> bool:
         """检查本地文件是否符合预期大小和 MD5"""
-        if not path.exists() or path.stat().st_size != expected_size:
-            return False
-        return _calculate_file_md5(path) == expected_md5
+        return file_matches(path, expected_size, expected_md5)
 
     def _mark_staged_patch_verified(self, dest: str) -> None:
         """记录本次 apply 过程中已经完成 MD5 校验的增量输出缓存。"""
@@ -788,7 +783,7 @@ class IncrementalManager:
             raise IncrementalError("无法获取增量更新索引，未开始下载")
         resources = self._index_file.get("resource", [])
         by_dest = {item["dest"]: item for item in resources if item.get("dest")}
-        tasks = []
+        transfers = []
         for group in self.get_group_infos():
             dest = group.get("dest")
             if not dest:
@@ -797,22 +792,39 @@ class IncrementalManager:
             size = int(item.get("size") or 0)
             if not size:
                 size = _get_krpdiff_size(self._build_krpdiff_url(dest)) or 0
-            path = self.download_dir / _resource_rel_path(dest)
-            md5 = item.get("md5")
-            if path.is_file() and (not size or path.stat().st_size == size):
-                if md5 and _calculate_file_md5(path) == md5:
-                    continue
-                if size and not md5:
-                    continue
-            tasks.append({"path": path, "size": size or None})
+            transfers.append((self.download_dir / _resource_rel_path(dest), size, item.get("md5")))
+
+        targets = []
         for item in resources:
             if _is_diff_resource(item["dest"]):
                 continue
-            size, md5 = int(item["size"]), item["md5"]
-            game_path = self.game_folder / _resource_rel_path(item["dest"])
-            staged = self._get_staged_complete_path(self.download_dir, item["dest"])
-            if not self._is_file_verified(game_path, size, md5) and not self._is_file_verified(staged, size, md5):
-                tasks.append({"path": staged, "size": size})
+            targets.append(
+                (
+                    [
+                        self.game_folder / _resource_rel_path(item["dest"]),
+                        self._get_staged_complete_path(self.download_dir, item["dest"]),
+                    ],
+                    int(item["size"]),
+                    item["md5"],
+                )
+            )
+
+        # 传输文件和正式文件放在同一批里并发校验：原本逐个文件单线程算 MD5，
+        # 一个包几百个文件时这里能拉满磁盘。size 为 0 表示 HEAD 没拿到大小，按未知处理。
+        entries = [(f"t{index}", path, size or None, md5) for index, (path, size, md5) in enumerate(transfers)]
+        for index, (paths, size, md5) in enumerate(targets):
+            entries += [(f"f{index}-{slot}", path, size, md5) for slot, path in enumerate(paths)]
+        status = check_files(entries, description="预检增量文件")
+
+        tasks = []
+        for index, (path, size, _) in enumerate(transfers):
+            if status.get(f"t{index}") == "ok":
+                continue
+            tasks.append({"path": path, "size": size or None})
+        for index, (paths, size, _) in enumerate(targets):
+            if any(status.get(f"f{index}-{slot}") == "ok" for slot in range(len(paths))):
+                continue
+            tasks.append({"path": paths[1], "size": size})
         return tasks
 
     def plan_download(self) -> Optional[Dict[str, Any]]:
@@ -2116,37 +2128,27 @@ class IncrementalManager:
             expand=True,
             transient=True,
         ) as progress:
-            verify_task = progress.add_task("[cyan]校验文件...", total=len(game_files))
+            status = check_files(
+                [
+                    (
+                        item["dest"],
+                        self.game_folder / _resource_rel_path(item["dest"]),
+                        int(item["size"]),
+                        item["md5"],
+                    )
+                    for item in game_files
+                ],
+                progress=progress,
+                description="校验文件",
+            )
 
-            def check_resource(item):
-                dest_path = self.game_folder / _resource_rel_path(item["dest"])
-                expected_md5 = item["md5"]
-                expected_size = int(item["size"])
-
-                status = "ok"
-                if not dest_path.exists():
-                    status = "missing"
-                elif dest_path.stat().st_size != expected_size:
-                    status = "size_mismatch"
-                else:
-                    actual_md5 = _calculate_file_md5(dest_path)
-                    if actual_md5 != expected_md5:
-                        status = "md5_mismatch"
-                return status, item["dest"]
-
-            with ThreadPoolExecutor(max_workers=8) as executor:
-                futures = {executor.submit(check_resource, item): item for item in game_files}
-
-                for future in as_completed(futures):
-                    status, dest = future.result()
-                    progress.advance(verify_task)
-
-                    if status == "ok":
-                        ok_count += 1
-                    elif status == "missing":
-                        missing_files.append(dest)
-                    else:
-                        inconsistent_files.append(dest)
+        for dest, state in status.items():
+            if state == "ok":
+                ok_count += 1
+            elif state == "missing":
+                missing_files.append(dest)
+            else:
+                inconsistent_files.append(dest)
 
         logger.info(f"校验完成: 正常={ok_count}, 不一致={len(inconsistent_files)}, 缺失={len(missing_files)}")
 
