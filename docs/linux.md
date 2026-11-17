@@ -2,7 +2,7 @@
 
 [返回首页](../README.md)
 
-本工具只管理客户端文件，不负责启动游戏。本页整理启动说明和社区排障经验；相关环境与方案具有时效性，未必适用于所有版本。
+本工具只管理客户端文件，不负责启动游戏。本页整理启动说明和社区排障经验；相关环境与方案具有时效性，仅供参考。
 
 ## 启动参数
 
@@ -22,16 +22,16 @@
    ```text
    安装目录/Client/Binaries/Win64/Client-Win64-Shipping.exe
    ```
-2. 在游戏属性的兼容性设置中，选择合适的 Proton 版本。推荐 dwproton；是否适用取决于当前游戏与运行环境。
+2. 在游戏属性的兼容性设置中，选择合适的 Proton 版本。推荐 [dwproton](https://dawn.wine/dawn-winery/dwproton/releases)；是否适用取决于当前游戏与运行环境。
 3. 在启动选项中填写对应档位参数。例如 HD：
    ```text
-   # 曾经 steamdeck=1 参数也有用，仅参考
+   # 曾经 steamdeck=1/SteamOS=1 参数可能有用，仅参考
    -krqlv=hd
    ```
 
-也可以使用 Lutris，或直接调用 DWProton 自带 Wine（见下节）。
+也可以使用 Lutris，或直接调用 dwproton 自带 Wine（见下节）。
 
-## 一键安装（DWProton + 独立 prefix）
+## 一键安装（dwproton + 独立 prefix）
 
 不想经过 Steam 或 Lutris 时，用仓库里的一键部署环境脚本（实验性，仅在 Archlinux + niri 图形环境下测试可用）：
 
@@ -40,9 +40,7 @@
 scripts/setup-linux.sh --game-dir ~/Games/WutheringWaves
 ```
 
-脚本依次完成：下载并校验 DWProton、准备 riched20 UTF-8 补丁组件（修复登录协议正文乱码）、建立独立 prefix（DXVK、vkd3d-proton、dxvk-nvapi、NVIDIA 的 NGX 运行时、ICU、字体、DLL 覆盖），初始化后逐项自检并补装缺项，最后把启动器装到 `~/.local/bin/run_ww`，并写入桌面启动器入口 `ww.desktop`（图标从游戏自带启动器里提取）。
-
-DWProton 版本从 dawn.wine 的发布接口实时解析，默认取最新正式发布：已经装过就不再下载，出现新版本时重跑脚本即自动升级。升级后留下的旧版本目录与归档，脚本会在安装结束时列出体积并询问是否删除，默认保留（`-y` 或非交互运行时一律保留）。固定版本用 `--proton 11.0-17` 或环境变量 `WW_DWPROTON_VERSION`；离线时回退到本机已装版本，没装过才用内置兜底版本。校验值默认抓发布里的 `.sha512sum`，也可用 `WW_DWPROTON_SHA512` 指定。
+脚本依次完成：下载并校验 dwproton、准备 riched20 UTF-8 补丁组件（修复登录协议正文乱码）、建立独立 prefix（DXVK、vkd3d-proton、dxvk-nvapi、NVIDIA 的 NGX 运行时、ICU、字体、DLL 覆盖），初始化后逐项自检并补装缺项，最后把启动器装到 `~/.local/bin/run_ww`，并写入桌面启动器入口 `ww.desktop`（图标从游戏自带启动器里提取）。
 
 常用开关：
 
@@ -54,19 +52,14 @@ DWProton 版本从 dawn.wine 的发布接口实时解析，默认取最新正式
 | `--rebuild` | 忽略仓库内的预编译组件，从源码重编 riched20 |
 | `--proton <版本>` | 指定 DWProton 版本（如 `11.0-17`），默认 `latest` |
 
-安装时检查 gamemode（启动时默认启用，实测对帧率有提升）与 PE 交叉工具链（仅重编组件时需要，mingw-w64 或 clang+lld 任一即可），缺失则询问是否安装；选择跳过则不打补丁，登录协议等文本可能乱码，但游戏仍可正常启动。MangoHud 属可选项，默认不装。脚本支持断点续传，并会复用其它安装根里已下载的归档；下载长期失败时可设 `https_proxy` 重试，或用 `WW_WINE_SOURCE_URL`、`WW_DWPROTON_URL` 换镜像源。
+安装时检查 gamemode（启动时默认启用，实测对帧率有提升）与 PE 交叉工具链（仅重编组件时需要，mingw-w64 或 clang+lld 任一即可），缺失则询问是否安装；选择跳过则不打补丁，登录协议等文本可能乱码，但游戏仍可正常启动。MangoHud 属可选项，默认不装。脚本支持断点续传，并会复用其它安装根里已下载的归档；下载失败时可设 `https_proxy` 重试，或用 `WW_WINE_SOURCE_URL`、`WW_DWPROTON_URL` 换镜像源。
 
-补丁组件复用看溯源而不是哈希：wine 默认非可复现构建，每次编译都把当时时间写进 PE 头，同一份源码重编一次哈希就变，所以校验值只用于仓库随包的预编译产物。编过或装上组件后脚本会写 `~/.local/share/ww-linux/component/BUILD-INFO`（源码提交、补丁 sha256、产物哈希、构建时间）；溯源和当前脚本不一致时只警告并继续复用，要跟新基线请 `--rebuild`。
-
-已存在的同版本 DWProton（`$DWPROTON`、`~/.local/share/dwproton/`、Lutris/Steam 目录等）和已有 prefix 会被直接复用，不重复下载也不移动。
-
-安装后用 `run_ww` 启动（或点桌面图标），默认经 gamemoderun 启动（`WW_GAMEMODE=0` 关闭）。脚本的画质档位自动读取游戏目录的 `wwm_resource_state.json`，`run_ww --check` 只检查路径和档位。日志在 `~/.local/share/ww-linux/logs/game.log`。
+安装后用 `run_ww` 启动（或通过应用启动器），默认经 gamemoderun 启动。脚本的画质档位自动读取游戏目录的 `wwm_resource_state.json`，`run_ww --check` 只检查路径和档位。日志在 `~/.local/share/ww-linux/logs/game.log`。
 
 已知问题：`bilibili` 服在登录的 webview 框会固定弹出**网络请求失败，请重试**，但是不影响验证码登录，忽略即可。
 
 ### 安装额外的 Proton 版本
 - [dwproton](https://dawn.wine/dawn-winery/dwproton/releases)
-- [GE-Proton](https://github.com/GloriousEggroll/proton-ge-custom/releases/)
 将相应发布包解压到 `~/.local/share/Steam/steamapps/common/`，重新启动 Steam 后，在游戏的兼容性设置中选择。具体安装要求以对应项目文档为准。
 
 ## 常见问题
@@ -75,21 +68,13 @@ DWProton 版本从 dawn.wine 的发布接口实时解析，默认取最新正式
 
 ### 启动提示 `kuro: Use launcher to start game!`
 
-先检查启动参数是否包含有效且已安装的档位，例如 `-krqlv=hd`。原先记录的错误为：
-
-```text
-Fatal error: [File:Unknown] [Line: 54] kuro: Use launcher to start game!
-```
-
-若参数正确但仍然报错，不应直接认定是同一原因。
-
-### ACE 反作弊警告或上线后被踢下线
-
-原社区经验包括更换为 dwproton，或尝试上述 `steamdeck=1` 配置。这些方法不保证解决问题。
+先检查启动参数是否包含有效且已安装的档位，例如 `-krqlv=hd`。
 
 ### 上线约十分钟后需要重新登录
 
-引用 bilibili 用户 `@神麤詭末` 提供的官服方案：
+通常由 Kuro 增强 ACE 导致，更新 dwproton 到最新版本通常能解决。如未解决，请向 dwproton 提交 issue,比如 [dwproton issue #92](https://dawn.wine/dawn-winery/dwproton/issues/92)；
+
+或者引用 bilibili 用户 `@神麤詭末` 提供的官服方案：
 
 1. 先备份：
    ```text
@@ -98,7 +83,7 @@ Fatal error: [File:Unknown] [Line: 54] kuro: Use launcher to start game!
 2. 将 `KR_ChannelId` 从 `19` 修改为 `205`。
 3. 若启动时弹出“网络错误”，原方案建议点击“重试”。
 
-该方案已经长时间未验证。
+该方案最后验证有效时间 `2026-11-12`, 游戏版本 `3.8`。
 
 ### 剧情文本错误或素材缺失
 
