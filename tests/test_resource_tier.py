@@ -180,7 +180,7 @@ class ResourceTierTests(unittest.TestCase):
         cache.save()
         with patch.object(MD5Cache, "_calculate_md5", return_value=md5(GOOD)) as calc:
             self.manager.download_resource_tier("uhd", force_check_md5=True)
-        calc.assert_called_once_with(path)
+        calc.assert_called_once_with(path, on_bytes=None)  # 不带进度时签名不变，仍然只读一遍
 
     def test_cache_detects_change_with_restored_mtime(self):
         path = self.put(DEST, GOOD)

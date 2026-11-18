@@ -7,7 +7,7 @@ import re
 import shutil
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import quote, urljoin
 from urllib.request import Request, urlopen
 
@@ -125,7 +125,8 @@ class MD5Cache:
         except Exception as e:
             logger.error(f"保存 MD5 缓存失败: {e}")
 
-    def get(self, file_path: Path) -> Optional[str]:
+    def get(self, file_path: Path, *, on_bytes: Optional[Callable[[int], None]] = None) -> Optional[str]:
+        """取摘要：命中缓存直接返回，未命中则现算（现算时按块回报 on_bytes，供进度条使用）。"""
         if not file_path.exists():
             return None
 
@@ -148,7 +149,7 @@ class MD5Cache:
                 ):
                     return data.get("md5")
 
-        new_md5 = self._calculate_md5(file_path)
+        new_md5 = self._calculate_md5(file_path, on_bytes=on_bytes)
         if new_md5:
             with self._lock:
                 self.cache[rel_path] = {
@@ -161,9 +162,9 @@ class MD5Cache:
                 self._updated = True
         return new_md5
 
-    def _calculate_md5(self, file_path: Path) -> Optional[str]:
+    def _calculate_md5(self, file_path: Path, *, on_bytes: Optional[Callable[[int], None]] = None) -> Optional[str]:
         logger.debug(f"计算 MD5: {file_path.name}")
-        digest = safe_file_md5(file_path)
+        digest = safe_file_md5(file_path, on_bytes=on_bytes)
         if digest is None:
             logger.error(f"计算 MD5 错误 {file_path}")
         return digest

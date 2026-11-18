@@ -35,7 +35,7 @@ class CountingCache:
         self.computed = []
         self.hits = 0
 
-    def get(self, path: Path):
+    def get(self, path: Path, *, on_bytes=None):
         rel = Path(path).as_posix()
         if rel in self.values:
             self.hits += 1
@@ -123,6 +123,91 @@ class VerifyTests(unittest.TestCase):
         expected = {key: "ok" for key, _, _, _ in entries}
         self.assertEqual(verify.check_files(entries, workers=8), expected)
         self.assertEqual(verify.check_files(entries, workers=1), expected)
+
+    def test_check_files_advances_progress_as_each_file_finishes(self):
+        """进度必须在每项完成时就推进；等全部算完再统一推进，进度条会整段时间停在 0%。"""
+        events = []
+
+        class FakeProgress:
+            def add_task(self, description, total=None):
+                events.append("add")
+                return 0
+
+            def advance(self, task_id, advance=1):
+                events.append("advance")
+
+            def update(self, task_id, **kwargs):
+                pass
+
+        real_md5 = verify.safe_file_md5
+
+        def spy(path, *args, **kwargs):
+            events.append("hash")
+            return real_md5(path, *args, **kwargs)
+
+        entries = []
+        for index in range(3):
+            data = b"x" * (16 + index)
+            path = self.put(f"p{index}.bin", data)
+            entries.append((str(index), path, len(data), md5(data)))
+
+        with patch.object(verify, "safe_file_md5", spy):
+            verify.check_files(entries, progress=FakeProgress(), workers=1)
+
+        self.assertEqual(events, ["add", "hash", "advance", "hash", "advance", "hash", "advance"])
+
+    def test_check_files_advances_inside_one_large_file(self):
+        """单个大文件也要在读取过程中推进，而不是只在读完那一刻跳一次。"""
+        data = os.urandom(verify.BLOCK_SIZE * 3 + 7)
+        path = self.put("big.bin", data)
+        advances = []
+
+        class FakeProgress:
+            def add_task(self, description, total=None):
+                return 0
+
+            def advance(self, task_id, advance=1):
+                advances.append(advance)
+
+            def update(self, task_id, **kwargs):
+                pass
+
+        with patch.object(verify, "_PROGRESS_FLUSH", verify.BLOCK_SIZE):
+            verify.check_files([("big", path, len(data), md5(data))], progress=FakeProgress(), workers=1)
+
+        self.assertGreaterEqual(len(advances), 4)  # 3 个整块各推一次，尾部再补一次
+        self.assertEqual(sum(advances), len(data))
+
+    def test_check_files_progress_totals_match_expected_bytes(self):
+        """缓存命中、大小不符、文件缺失都不读盘，收尾时必须把差额补上，总推进量恰好等于清单字节。"""
+        cache = CountingCache()
+        entries = []
+        for index in range(4):
+            data = bytes([index]) * 2048
+            path = self.put(f"c{index}.bin", data)
+            cache.values[path.as_posix()] = md5(data)
+            entries.append((f"hit{index}", path, len(data), md5(data)))
+        short = self.put("short.bin", b"abc")
+        entries.append(("short", short, 999, md5(b"abc")))
+        entries.append(("gone", self.root / "gone.bin", 512, md5(b"x")))
+        expected_total = sum(size for _, _, size, _ in entries)
+        advances = []
+
+        class FakeProgress:
+            def add_task(self, description, total=None):
+                self.total = total
+                return 0
+
+            def advance(self, task_id, advance=1):
+                advances.append(advance)
+
+            def update(self, task_id, **kwargs):
+                pass
+
+        progress = FakeProgress()
+        verify.check_files(entries, cache=cache, progress=progress)
+        self.assertEqual(progress.total, expected_total)
+        self.assertEqual(sum(advances), expected_total)
 
     def test_chunk_digests_and_scan_agree(self):
         data = bytes(range(256)) * 20  # 5120 字节，正好 5 个 CHUNK

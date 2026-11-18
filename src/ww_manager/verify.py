@@ -32,6 +32,8 @@ BLOCK_SIZE = 4 * 1024 * 1024
 DEFAULT_WORKERS = 8
 MAX_WORKERS = 32
 WORKERS_ENV = "WWM_VERIFY_WORKERS"
+# 块级进度至少挣够这么多字节才动一次进度条：rich 的刷新率是 10 次/秒，更密只是白抢锁。
+_PROGRESS_FLUSH = 32 * 1024 * 1024
 
 
 def worker_count(workers: Optional[int] = None, pending: Optional[int] = None) -> int:
@@ -62,19 +64,26 @@ def digest_of(data: bytes) -> str:
     return digest.hexdigest()
 
 
-def file_md5(path: Path, block: int = BLOCK_SIZE) -> str:
-    """顺序计算整个文件的 MD5；读失败时抛 OSError，由调用方决定是否降级。"""
+def file_md5(path: Path, block: int = BLOCK_SIZE, *, on_bytes: Optional[Callable[[int], None]] = None) -> str:
+    """顺序计算整个文件的 MD5；读失败时抛 OSError，由调用方决定是否降级。
+
+    on_bytes 给出时每读完一块回报字节数：大文件校验期间进度条可以平滑推进，不再只在读完时跳一次。
+    """
     digest = new_digest()
     with open(path, "rb") as stream:
         for piece in iter(lambda: stream.read(block), b""):
             digest.update(piece)
+            if on_bytes is not None:
+                on_bytes(len(piece))
     return digest.hexdigest()
 
 
-def safe_file_md5(path: Path, block: int = BLOCK_SIZE) -> Optional[str]:
+def safe_file_md5(
+    path: Path, block: int = BLOCK_SIZE, *, on_bytes: Optional[Callable[[int], None]] = None
+) -> Optional[str]:
     """与 :func:`file_md5` 相同，但读失败返回 None 供「算不出来就别当通过」的调用点使用。"""
     try:
-        return file_md5(path, block)
+        return file_md5(path, block, on_bytes=on_bytes)
     except (OSError, ValueError):
         return None
 
@@ -215,12 +224,34 @@ def check_files(
         return {}
     status: Dict[object, str] = {}
     weights = [int(size or 0) for _, _, size, _ in jobs]
+    byte_mode = bool(sum(weights))
     task_id = None
     if progress is not None:
         task_id = progress.add_task(f"[cyan]{description}...", total=sum(weights) or len(jobs))
+    counters = [{"inline": 0, "pending": 0} for _ in jobs]
 
-    def one(job):
-        key, path, size, md5 = job
+    def ticker(index):
+        """返回该任务的「读完一块就报字节」回调。
+
+        撑够 _PROGRESS_FLUSH 才动一次进度条：块级推进否则每个 4 MiB 块都要抢一次 rich 的锁，
+        八个线程同时算哈希时会白白变成竞争点。rich Progress 自带 RLock，跨线程 advance 是安全的。
+        """
+        counter = counters[index]
+
+        def tick(count: int) -> None:
+            if task_id is None or not count:
+                return
+            counter["pending"] += count
+            if counter["pending"] >= _PROGRESS_FLUSH:
+                progress.advance(task_id, counter["pending"])
+                counter["inline"] += counter["pending"]
+                counter["pending"] = 0
+
+        return tick
+
+    def one(index):
+        key, path, size, md5 = jobs[index]
+        on_bytes = ticker(index) if task_id is not None and byte_mode else None
         try:
             if not path.is_file():
                 return key, "missing", int(size or 0)
@@ -232,26 +263,51 @@ def check_files(
         if md5 is None:
             return key, "ok", int(size or 0)
         expected = md5.lower()
-        digest = cache.get(path) if cache is not None else safe_file_md5(path)
+        if cache is not None:
+            digest = cache.get(path, on_bytes=on_bytes)
+        else:
+            digest = safe_file_md5(path, on_bytes=on_bytes)
         return key, ("ok" if digest == expected else "md5"), int(size or 0)
+
+    def note(index, result):
+        """一项收尾：先补齐「没被读到」的字节（缓存命中、大小不符、文件缺失），再刷新当前文件名。
+
+        不承这笔差额的话，命中缓存的部分永远不会被推进，进度条最终停在半途。
+        """
+        key, verdict, expected = result
+        status[key] = verdict
+        if task_id is None:
+            return
+        if byte_mode:
+            counter = counters[index]
+            bypassed = max((expected or 0) - counter["inline"] - counter["pending"], 0)
+            delta = counter["pending"] + bypassed
+            counter["pending"] = 0
+            if delta:
+                progress.advance(task_id, delta)
+        else:
+            progress.advance(task_id)
+        progress.update(task_id, description=f"[cyan]{description}: {getattr(key, 'name', key)}[/cyan]")
 
     # 重活（大文件）先提交：线程池做完一项立刻取下一项，小文件正好填进大文件留下的空档，
     # 比按清单顺序提交少一次「大文件排在最后、其余线程先空转」的等待。
     order = sorted(range(len(jobs)), key=lambda index: -weights[index])
+    results = [None] * len(jobs)
     if len(jobs) == 1 or worker_count(workers, len(jobs)) == 1:
-        results = [one(job) for job in jobs]
+        for index in range(len(jobs)):
+            results[index] = one(index)
+            note(index, results[index])
     else:
-        results = [None] * len(jobs)
         with ThreadPoolExecutor(max_workers=worker_count(workers, len(jobs))) as pool:
-            futures = {pool.submit(one, jobs[index]): index for index in order}
+            futures = {pool.submit(one, index): index for index in order}
+            # 边完成边推进：等 as_completed 全部收完再统一推进，进度条会整段时间停在 0%。
             for future in as_completed(futures):
-                results[futures[future]] = future.result()
+                index = futures[future]
+                results[index] = future.result()
+                note(index, results[index])
 
-    for key, state, done in results:
+    for key, state, _done in results:
         status[key] = state
-        if task_id is not None:
-            progress.advance(task_id, done or 1)
-            progress.update(task_id, description=f"[cyan]{description}: {getattr(key, 'name', key)}[/cyan]")
     return status
 
 
